@@ -56,8 +56,16 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # On failure, the failing tests are also shown as annotations on the run's summary page.
       - name: Tests
-        run: cargo test -p charon-core
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! cargo test -p charon-core 2>&1 | tee test-output.txt; then
+            grep -E "panicked|^error|^---- |left:|right:" test-output.txt | head -30 |
+              while IFS= read -r line; do echo "::error title=Test failure::$line"; done
+            exit 1
+          fi
 
       - name: Rust build cache
         uses: swatinem/rust-cache@v2
