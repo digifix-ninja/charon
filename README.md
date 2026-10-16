@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="ui/img/logo-dark.svg">
-    <img src="ui/img/logo-light.svg" width="260" alt="Charon: a boat with a lantern, carrying a folder">
-  </picture>
+  <img src="ui/img/logo-light.svg#gh-light-mode-only" width="200" alt="Charon: a boat with a lantern, carrying a folder">
+  <img src="ui/img/logo-dark.svg#gh-dark-mode-only" width="200" alt="Charon: a boat with a lantern, carrying a folder">
 </p>
 
 <h1 align="center">Charon</h1>
