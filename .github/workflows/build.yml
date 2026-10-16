@@ -4,7 +4,8 @@
 #   * Version tag pushed (git tag v0.1.0 && git push origin v0.1.0): installers are attached
 #     to a *draft* release, so nothing is public until you press "Publish" on GitHub.
 #   * Started by hand (Actions → Build Charon → Run workflow): installers are kept as downloadable
-#     "artifacts" of the run (no release is made).
+#     "artifacts" of the run. If a version is filled in (e.g. v0.1.0), the same draft release is
+#     made and GitHub creates that tag on the built commit (handy when git can't push tags).
 #
 # The installers get fixed names without the version (Charon-macOS-Apple-Silicon.dmg, …), so
 # https://github.com/digifix-ninja/charon/releases/latest/download/<name> always points to the
@@ -16,6 +17,11 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Make a draft release with this tag (e.g. v0.1.0). Leave empty for a test build."
+        required: false
+        default: ""
 
 permissions:
   contents: write # needed to create the draft release
@@ -170,10 +176,10 @@ jobs:
           path: installers/*
           if-no-files-found: error
 
-  # For version tags only: one draft release with all installers.
+  # For version tags (or a version given by hand): one draft release with all installers.
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.version != ''
     runs-on: ubuntu-latest
     steps:
       - name: Collect the installers
@@ -185,11 +191,18 @@ jobs:
       - name: Create the draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ inputs.version || github.ref_name }}
         run: |
           ls -l installers
+          # Publishing a release made by hand creates its tag, which starts this workflow again:
+          # that release is already there, so leave it as it is.
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists, nothing to do."
+            exit 0
+          fi
           gh release create "$TAG" installers/* \
             --repo "${{ github.repository }}" \
             --draft \
+            --target "${{ github.sha }}" \
             --title "Charon $TAG" \
             --notes "See the assets below for macOS, Windows and Linux."
