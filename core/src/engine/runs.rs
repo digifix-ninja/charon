@@ -110,20 +110,6 @@ impl Engine {
         let result = self.cross(&job, &cancel);
         let summary = Self::summarise(&result, started_at);
 
-        // Live state: the run is over.
-        let conflicts = result.as_ref().map(|(_, survey)| survey.plan.conflicts()).unwrap_or_default();
-        self.change_runtime(&id, |rt| {
-            rt.cancel = None;
-            rt.progress = None;
-            rt.finished_at = Some(Instant::now());
-            rt.last_checked = Some(Instant::now());
-            rt.problem = summary.error.clone();
-            if result.is_ok() {
-                rt.conflicts = conflicts;
-                rt.pending = None;
-            }
-        });
-
         // Stored state: the summary, and when it was last fully synced.
         let _ = self.change_job(&id, |job| {
             if summary.error.is_none() && !summary.cancelled {
@@ -144,6 +130,21 @@ impl Engine {
                 journal.warn(&id, &format!("{path}: {reason}"));
             }
         }
+
+        // Live state: the run is over. This comes last, after the summary and the log are
+        // written, so whoever sees the run end also finds its results.
+        let conflicts = result.as_ref().map(|(_, survey)| survey.plan.conflicts()).unwrap_or_default();
+        self.change_runtime(&id, |rt| {
+            rt.cancel = None;
+            rt.progress = None;
+            rt.finished_at = Some(Instant::now());
+            rt.last_checked = Some(Instant::now());
+            rt.problem = summary.error.clone();
+            if result.is_ok() {
+                rt.conflicts = conflicts;
+                rt.pending = None;
+            }
+        });
 
         self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name.clone(), summary }));
         self.publish(&id);
