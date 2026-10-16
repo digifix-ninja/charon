@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "src-tauri"]
+
+# The project lives on an external volume that may lack file-lock support (os error 45),
+# which incremental compilation needs. Builds still work without it.
+[profile.dev]
+incremental = false
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

@@ -1,0 +1,178 @@
+/* Charon: design tokens, reset, typography and the backdrop.
+   Dark, quiet and precise, with light used sparingly: the lantern on the river. */
+
+/* Dark is the default. Each colour that is also used see-through lives here twice:
+   as a colour and as an "r g b" triplet, so `rgb(var(--river-rgb) / 0.2)` works. */
+:root {
+  /* Surfaces */
+  --bg: #141417;
+  --bg-raised: #1a1a1e;
+  --bg-card: rgb(30 30 35 / 0.72);
+  --bg-card-hover: rgb(36 36 42 / 0.86);
+  --bg-input: rgb(255 255 255 / 0.04);
+  --panel-rgb: 22 22 26;       /* sheets, dialogs, menus, tiles */
+  --panel-hi-rgb: 30 30 36;    /* the same, hovered or chosen */
+  --scrim-rgb: 6 6 8;
+  --ink-rgb: 255 255 255;      /* faint tints and lines drawn over surfaces */
+  --line: rgb(255 255 255 / 0.07);
+  --line-strong: rgb(255 255 255 / 0.14);
+  --shadow: 1;                 /* how strong drop shadows are */
+
+  /* Text */
+  --text: #ecebe8;
+  --text-strong: #ffffff;
+  --text-dim: #9d9ca3;
+  --text-faint: #65646c;
+
+  /* Light: the lantern (warm) and the river (cold) */
+  --lantern: #ffb547;  --lantern-rgb: 255 181 71;
+  --river: #5ee6ff;    --river-rgb: 94 230 255;
+
+  /* Statuses: colour and icon always go together */
+  --in-sync: #3ddc97;  --in-sync-rgb: 61 220 151;
+  --syncing: #4da3ff;
+  --pending: #ffb547;
+  --paused: #8a8f98;
+  --conflict: #b388ff; --conflict-rgb: 179 136 255;
+  --error: #ff5d6c;    --error-rgb: 255 93 108;
+  --error-text: #ffd4d8;
+  --offline: #50535d;
+  --new: #5ee6ff;
+
+  /* Type */
+  --sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI Variable", "Segoe UI", "Inter", Ubuntu, sans-serif;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Mono", "Segoe UI Mono", Menlo, Consolas, monospace;
+
+  /* Shape and motion */
+  --radius: 14px;
+  --radius-sm: 9px;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+  --titlebar-left: 18px;
+
+  color-scheme: dark;
+}
+
+/* Light: paper instead of night water. Accents are deepened so they read on white. */
+:root[data-theme="light"] {
+  --bg: #f3f2ee;
+  --bg-raised: #ebeae5;
+  --bg-card: rgb(255 255 255 / 0.74);
+  --bg-card-hover: rgb(255 255 255 / 0.95);
+  --bg-input: rgb(0 0 0 / 0.035);
+  --panel-rgb: 252 252 250;
+  --panel-hi-rgb: 255 255 255;
+  --scrim-rgb: 60 58 52;
+  --ink-rgb: 20 20 24;
+  --line: rgb(20 20 24 / 0.09);
+  --line-strong: rgb(20 20 24 / 0.17);
+  --shadow: 0.28;
+
+  --text: #18181b;
+  --text-strong: #000000;
+  --text-dim: #5c5b62;
+  --text-faint: #9a99a0;
+
+  --lantern: #c97a06;  --lantern-rgb: 201 122 6;
+  --river: #0590b3;    --river-rgb: 5 144 179;
+
+  --in-sync: #13a067;  --in-sync-rgb: 19 160 103;
+  --syncing: #2673d9;
+  --pending: #c97a06;
+  --paused: #7b808a;
+  --conflict: #8456e8; --conflict-rgb: 132 86 232;
+  --error: #dc3346;    --error-rgb: 220 51 70;
+  --error-text: #a3192a;
+  --offline: #a6a9b1;
+  --new: #0590b3;
+
+  color-scheme: light;
+}
+
+/* macOS: room for the window buttons that float over the title bar */
+body.mac { --titlebar-left: 86px; }
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  -webkit-user-select: none;
+  overflow: hidden;
+}
+
+body {
+  display: grid;
+  grid-template-rows: auto auto auto 1fr;
+}
+
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+img { display: block; }
+::selection { background: rgb(var(--river-rgb) / 0.28); }
+
+.mono, kbd, code { font-family: var(--mono); }
+
+kbd {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+/* Small upper-case labels with a number, like chapter marks */
+.eyebrow {
+  font: 600 10.5px/1 var(--mono);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  display: inline-flex;
+  gap: 10px;
+  align-items: center;
+}
+.eyebrow .num { color: var(--text-faint); }
+
+/* Icons are inline SVG, coloured by currentColor */
+.ico { display: inline-grid; place-items: center; width: 16px; height: 16px; flex: none; }
+.ico svg { width: 100%; height: 100%; }
+
+/* ---------------------------------------------------------------- backdrop */
+
+.river {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2; /* over the list's faded end, under every panel */
+  pointer-events: none;
+}
+
+/* A faint grid and film grain give depth to the black */
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgb(var(--ink-rgb) / 0.022) 1px, transparent 1px),
+    linear-gradient(90deg, rgb(var(--ink-rgb) / 0.022) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: radial-gradient(ellipse 90% 70% at 50% 0%, #000 30%, transparent 100%);
+}
+
+body > header, body > section, body > main { position: relative; z-index: 1; }
+
+/* Scrollbars that stay out of the way */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: rgb(var(--ink-rgb) / 0.08); border-radius: 10px; border: 3px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background-color: rgb(var(--ink-rgb) / 0.16); }
+::-webkit-scrollbar-track { background: transparent; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}

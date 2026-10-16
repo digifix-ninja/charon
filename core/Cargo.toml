@@ -1,0 +1,22 @@
+[package]
+name = "charon-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["DigiFix S.à r.l.-S."]
+description = "Sync engine for Charon: scans two folders, plans the crossing and carries files over safely"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+filetime = "0.2"
+globset = "0.4"
+log = "0.4"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+walkdir = "2"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Charon</title>
+  <link rel="stylesheet" href="css/base.css">
+  <link rel="stylesheet" href="css/controls.css">
+  <link rel="stylesheet" href="css/layout.css">
+  <link rel="stylesheet" href="css/rows.css">
+  <link rel="stylesheet" href="css/overlays.css">
+</head>
+<body>
+  <!-- The river: an animated backdrop; its boat crosses as the jobs sync. -->
+  <canvas id="river" class="river" aria-hidden="true"></canvas>
+  <div class="grain" aria-hidden="true"></div>
+
+  <!-- Title bar: brand, overall status, main actions. Empty areas drag the window. -->
+  <header class="titlebar" data-tauri-drag-region>
+    <div class="brand" data-tauri-drag-region>
+      <span class="logo" aria-hidden="true"><img class="for-dark" src="img/logo-dark.svg" alt="" draggable="false"><img class="for-light" src="img/logo-light.svg" alt="" draggable="false"></span>
+      <span class="wordmark" data-tauri-drag-region>CHARON</span>
+    </div>
+    <div class="headline" id="headline" data-tauri-drag-region>
+      <span class="pulse"></span><span class="text"></span>
+    </div>
+    <div class="actions">
+      <button id="btn-sync-all" class="btn ghost" title="Sync every job now (⌘⇧S)">
+        <span class="ico" data-icon="sync"></span><span>Sync all</span>
+      </button>
+      <button id="btn-pause-all" class="btn ghost" title="Pause or resume every job">
+        <span class="ico" data-icon="pause"></span><span class="label">Pause all</span>
+      </button>
+      <button id="btn-new" class="btn primary" title="New sync job (⌘N)">
+        <span class="ico" data-icon="plus"></span><span>New job</span>
+      </button>
+      <button id="btn-settings" class="icon-btn" title="Settings (⌘,)"><span class="ico" data-icon="settings"></span></button>
+      <button id="btn-about" class="icon-btn" title="About Charon"><span class="ico" data-icon="info"></span></button>
+    </div>
+  </header>
+
+  <!-- Numbers at a glance; each tile filters the list. -->
+  <section class="stats" id="stats" aria-label="Overview"></section>
+
+  <!-- Search and the list label. -->
+  <section class="listbar">
+    <span class="eyebrow"><span class="num">01</span> Crossings</span>
+    <div class="search">
+      <span class="ico" data-icon="search"></span>
+      <input id="search" placeholder="Filter jobs" spellcheck="false" autocomplete="off">
+      <kbd>⌘F</kbd>
+    </div>
+  </section>
+
+  <main id="jobs" class="jobs" tabindex="-1"></main>
+
+  <div id="scrim" class="scrim"></div>
+  <aside id="editor" class="sheet" aria-hidden="true"></aside>
+  <aside id="settings" class="sheet" aria-hidden="true"></aside>
+  <aside id="about" class="sheet" aria-hidden="true"></aside>
+  <div id="preview" class="dialog" role="dialog" aria-modal="true" aria-hidden="true"></div>
+  <div id="menu" class="popmenu" role="menu" aria-hidden="true"></div>
+  <div id="toast" class="toast" role="status"></div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>

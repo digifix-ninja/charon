@@ -1,0 +1,53 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Charon",
+  "version": "0.1.0",
+  "identifier": "ninja.digifix.charon",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Charon",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 820,
+        "minHeight": 520,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 18, "y": 40 },
+        "backgroundColor": "#141417"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Utility",
+    "publisher": "DigiFix S.à r.l.-S.",
+    "copyright": "© 2026 DigiFix S.à r.l.-S. · MIT licence",
+    "shortDescription": "Ferries your files between folders: mirror, backup or two-way sync",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    },
+    "linux": {
+      "deb": {
+        "depends": ["libayatana-appindicator3-1"]
+      }
+    }
+  }
+}

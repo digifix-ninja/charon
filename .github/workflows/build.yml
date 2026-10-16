@@ -1,0 +1,187 @@
+# Builds Charon for macOS (Apple Silicon and Intel), Windows and Linux on GitHub's servers.
+#
+# Two ways it runs:
+#   * Version tag pushed (git tag v0.1.0 && git push origin v0.1.0): installers are attached
+#     to a *draft* release, so nothing is public until you press "Publish" on GitHub.
+#   * Started by hand (Actions → Build Charon → Run workflow): installers are kept as downloadable
+#     "artifacts" of the run (no release is made).
+#
+# The installers get fixed names without the version (Charon-macOS-Apple-Silicon.dmg, …), so
+# https://github.com/digifix-ninja/charon/releases/latest/download/<name> always points to the
+# newest published version.
+
+name: Build Charon
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # needed to create the draft release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-apple-silicon
+            platform: macos-latest
+            target: aarch64-apple-darwin
+          - name: macos-intel
+            platform: macos-latest
+            target: x86_64-apple-darwin
+          - name: windows
+            platform: windows-latest
+            target: ""
+          - name: linux
+            platform: ubuntu-22.04
+            target: ""
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf xdg-utils libdbus-1-dev pkg-config
+
+      - name: Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Tests
+        run: cargo test -p charon-core
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      # macOS: sign with the Developer ID certificate and notarise with Apple, if the
+      # repository has the secrets (see docs/DEVELOPMENT.md → Signing). Without them, the app
+      # still gets an ad-hoc signature so macOS offers "Open Anyway" instead of "damaged".
+      - name: Prepare macOS signing
+        if: runner.os == 'macOS'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "No Developer ID certificate: ad-hoc signature only."
+            echo "APPLE_SIGNING_IDENTITY=-" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # A temporary keychain that only lives for this build.
+          keychain="$RUNNER_TEMP/build.keychain"
+          keychain_password="$(openssl rand -base64 24)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+          security find-identity -v -p codesigning "$keychain"
+          echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY" >> "$GITHUB_ENV"
+
+          # Notarisation (Apple checks the app and approves it) when all three are set.
+          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
+            {
+              echo "APPLE_ID=$APPLE_ID"
+              echo "APPLE_PASSWORD=$APPLE_PASSWORD"
+              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+            } >> "$GITHUB_ENV"
+            echo "Signing and notarising with the Developer ID."
+          else
+            echo "Signing with the Developer ID (no notarisation: APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID missing)."
+          fi
+
+      - name: Build the installers
+        uses: tauri-apps/tauri-action@v1
+        with:
+          args: ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
+      # Gives every installer its fixed public name (no version in it).
+      - name: Name the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          if [ -n "${{ matrix.target }}" ]; then
+            bundle="target/${{ matrix.target }}/release/bundle"
+          else
+            bundle="target/release/bundle"
+          fi
+          mkdir -p installers
+
+          # Copies the single file matching a pattern to its public name (fails if none or several).
+          take() {
+            files=( $1 )
+            if [ "${#files[@]}" -ne 1 ]; then
+              echo "Expected exactly one file for $1, found ${#files[@]}" >&2
+              exit 1
+            fi
+            cp "${files[0]}" "installers/$2"
+            echo "$2  ←  ${files[0]}"
+          }
+
+          case "${{ matrix.name }}" in
+            macos-apple-silicon) take "$bundle/dmg/*.dmg" "Charon-macOS-Apple-Silicon.dmg" ;;
+            macos-intel)         take "$bundle/dmg/*.dmg" "Charon-macOS-Intel.dmg" ;;
+            windows)
+              take "$bundle/nsis/*-setup.exe" "Charon-Windows-Setup.exe"
+              take "$bundle/msi/*.msi"        "Charon-Windows.msi"
+              ;;
+            linux)
+              take "$bundle/appimage/*.AppImage" "Charon-Linux.AppImage"
+              take "$bundle/deb/*.deb"           "Charon-Linux.deb"
+              take "$bundle/rpm/*.rpm"           "Charon-Linux.rpm"
+              ;;
+          esac
+
+      - name: Keep the installers as run artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: charon-${{ matrix.name }}
+          path: installers/*
+          if-no-files-found: error
+
+  # For version tags only: one draft release with all installers.
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the installers
+        uses: actions/download-artifact@v4
+        with:
+          path: installers
+          merge-multiple: true
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l installers
+          gh release create "$TAG" installers/* \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --title "Charon $TAG" \
+            --notes "See the assets below for macOS, Windows and Linux."

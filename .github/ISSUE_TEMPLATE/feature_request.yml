@@ -1,0 +1,15 @@
+name: Feature idea
+description: Something Charon could do better
+labels: [idea]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: Describe the situation and the problem, not only the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could Charon help?

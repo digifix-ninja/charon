@@ -1,0 +1,28 @@
+name: Bug report
+description: Something doesn't work as it should
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Charon version and system
+      placeholder: "0.1.0 on macOS 15 (Apple Silicon)"
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Job mode
+      options: [Mirror, Backup, Two-way, Not about a job]
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Activity log
+      description: The relevant lines from the job's Activity tab, if any.
+      render: text
