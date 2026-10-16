@@ -139,7 +139,8 @@ src-tauri/src/              the desktop app (macOS, Windows, Linux)
   about.rs                    About: version, websites, developer, licence
 src-tauri/tauri.conf.json   app configuration
 ui/                         the interface (plain HTML/CSS/JS modules)
-  index.html, logo.png
+  index.html
+  img/                        logo-light.svg, logo-dark.svg (the logo without background)
   css/                        base (tokens), controls, layout, rows, overlays
   js/main.js                  App: creates the views, connects to Rust
   js/api.js                   Api: every command and event
