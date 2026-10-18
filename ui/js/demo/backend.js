@@ -114,7 +114,7 @@ export class DemoBackend {
     await new Promise(r => setTimeout(r, 30));
     switch (command) {
       case "get_state": return structuredClone({ jobs: this.jobs, settings: this.settings, overview: this.overview(), defaultExcludes: DEFAULT_EXCLUDES });
-      case "about": return { name: "Charon", version: "0.1.0", appWebsite: "https://charonsync.app", developer: "stean.ART", website: "https://stean.art", sourceCode: "https://github.com/steanart/charon", licence: "MIT", copyrightYear: "2026" };
+      case "about": return { name: "Charon", version: "0.1.1", appWebsite: "https://charonsync.app", developer: "stean.ART", website: "https://stean.art", sourceCode: "https://github.com/steanart/charon", licence: "MIT", copyrightYear: "2026" };
       case "sync_now": return this.simulateSync(args.id, 140 + Math.round(Math.random() * 400), 300_000_000 + Math.random() * 900_000_000);
       case "sync_all": return this.jobs.filter(j => !j.paused).forEach((j, i) => setTimeout(() => this.simulateSync(j.id, 200, 400_000_000), i * 300));
       case "cancel": {
