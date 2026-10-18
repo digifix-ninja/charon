@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Charon ferries your files between folders: mirror, backup or two-way sync"
 license = "MIT"
-authors = ["DigiFix S.à r.l.-S."]
+authors = ["stean.ART"]
 homepage = "https://charonsync.app"
 default-run = "charon"
 

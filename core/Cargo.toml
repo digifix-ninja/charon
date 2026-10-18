@@ -3,7 +3,7 @@ name = "charon-core"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["DigiFix S.à r.l.-S."]
+authors = ["stean.ART"]
 description = "Sync engine for Charon: scans two folders, plans the crossing and carries files over safely"
 
 [dependencies]

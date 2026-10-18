@@ -30,8 +30,8 @@
     "active": true,
     "targets": "all",
     "category": "Utility",
-    "publisher": "DigiFix S.à r.l.-S.",
-    "copyright": "© 2026 DigiFix S.à r.l.-S. · MIT licence",
+    "publisher": "stean.ART",
+    "copyright": "© 2026 stean.ART · MIT licence",
     "shortDescription": "Ferries your files between folders: mirror, backup or two-way sync",
     "icon": [
       "icons/32x32.png",

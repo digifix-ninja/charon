@@ -129,4 +129,4 @@ please open an issue first for bigger changes.
 
 ## Licence
 
-[MIT](LICENSE) © 2026 [DigiFix S.à r.l.-S.](https://digifix.ninja)
+[MIT](LICENSE) © 2026 [stean.ART](https://stean.art)

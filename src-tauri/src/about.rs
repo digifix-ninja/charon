@@ -5,11 +5,11 @@ use tauri::AppHandle;
 
 /// The app's own website.
 pub const APP_WEBSITE: &str = "https://charonsync.app";
-pub const DEVELOPER: &str = "DigiFix S.à r.l.-S.";
+pub const DEVELOPER: &str = "stean.ART";
 /// The developer's website.
-pub const WEBSITE: &str = "https://digifix.ninja";
+pub const WEBSITE: &str = "https://stean.art";
 /// Public source code on GitHub (an empty value hides the link).
-pub const SOURCE_CODE: &str = "https://github.com/digifix-ninja/charon";
+pub const SOURCE_CODE: &str = "https://github.com/steanart/charon";
 pub const LICENCE: &str = "MIT";
 pub const COPYRIGHT_YEAR: &str = "2026";
 

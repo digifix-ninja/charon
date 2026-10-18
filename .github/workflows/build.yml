@@ -8,7 +8,7 @@
 #     made and GitHub creates that tag on the built commit (handy when git can't push tags).
 #
 # The installers get fixed names without the version (Charon-macOS-Apple-Silicon.dmg, …), so
-# https://github.com/digifix-ninja/charon/releases/latest/download/<name> always points to the
+# https://github.com/steanart/charon/releases/latest/download/<name> always points to the
 # newest published version.
 
 name: Build Charon
