@@ -6,6 +6,7 @@ All notable changes to Charon are listed here.
 
 - Charon is now a stean.ART project: credits, copyright and the About panel point to [stean.art](https://stean.art).
 - Links point to the new GitHub home, [github.com/steanart/charon](https://github.com/steanart/charon).
+- The app identifier is now `dev.stean.charon`. Jobs and settings from 0.1.0 are moved over the first time 0.1.1 starts.
 
 ## 0.1.0 — first crossing
 

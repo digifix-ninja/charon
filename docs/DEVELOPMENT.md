@@ -158,9 +158,9 @@ Code style: small objects with one job each, and a short comment on every functi
 
 In the app's data folder:
 
-- macOS: `~/Library/Application Support/ninja.digifix.charon/`
-- Windows: `%APPDATA%\ninja.digifix.charon\`
-- Linux: `~/.local/share/ninja.digifix.charon/`
+- macOS: `~/Library/Application Support/dev.stean.charon/`
+- Windows: `%APPDATA%\dev.stean.charon\`
+- Linux: `~/.local/share/dev.stean.charon/`
 
 | File | What's in it |
 |---|---|

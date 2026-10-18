@@ -10,11 +10,13 @@
 //! * `login.rs`    – launch at login
 //! * `desktop.rs`  – showing folders and opening links, per operating system
 //! * `about.rs`    – name, version, developer and licence for the About panel
+//! * `data_folder.rs` – where jobs and settings live (and moving them from 0.1.0)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod about;
 mod commands;
+mod data_folder;
 mod desktop;
 mod events;
 mod login;
@@ -23,6 +25,7 @@ mod state;
 mod tray;
 
 use charon_core::{Autopilot, Engine};
+use data_folder::DataFolder;
 use state::AppState;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tray::Tray;
@@ -37,8 +40,7 @@ fn main() {
         ))
         .setup(|app| {
             let handle = app.handle().clone();
-            // macOS: ~/Library/Application Support/ninja.digifix.charon/
-            let data_folder = app.path().app_data_dir()?;
+            let data_folder = DataFolder::open(&handle)?;
             let engine = Engine::open(data_folder, events::forward_to(&handle))?;
             app.manage(AppState::new(engine.clone()));
             Tray::install(&handle, &engine.overview())?;
