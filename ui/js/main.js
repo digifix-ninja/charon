@@ -16,6 +16,7 @@ import { SettingsPanel } from "./views/settings-panel.js";
 import { AboutPanel } from "./views/about-panel.js";
 import { PopMenu } from "./views/pop-menu.js";
 import { Sheet } from "./views/sheet.js";
+import { Updates } from "./updates.js";
 
 class App {
   constructor() {
@@ -31,7 +32,8 @@ class App {
     this.editor = new JobEditor(this.store, this.toast, { saved: (view, info) => this.saved(view, info) });
     this.preview = new PreviewDialog(this.store, this.toast, { syncNow: id => this.syncNow(id) });
     this.settings = new SettingsPanel(this.store, this.toast);
-    this.about = new AboutPanel(this.toast);
+    this.updates = new Updates(this.toast);
+    this.about = new AboutPanel(this.updates, this.toast);
     this.store.subscribe(hint => this.render(hint));
   }
 
@@ -44,6 +46,7 @@ class App {
     this.bindShortcuts();
     await this.listenToRust();
     await this.reload();
+    await this.updates.start();
     setInterval(() => this.store.changed(), 30_000); // keeps "4 min ago" fresh
   }
 
@@ -168,6 +171,7 @@ class App {
     on("#btn-sync-all", "click", () => this.run(() => Api.syncAll()));
     on("#btn-pause-all", "click", () => this.run(() => Api.setAllPaused(!this.store.overview?.pausedAll)));
     on("#btn-settings", "click", () => this.settings.toggleOpen());
+    on("#btn-update", "click", () => this.about.show());
     on("#btn-about", "click", () => (this.about.isOpen ? this.about.close() : this.about.show()));
     on("#scrim", "click", () => this.closeOverlays());
     on("#search", "input", event => {

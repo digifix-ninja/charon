@@ -5,11 +5,12 @@ use tauri::AppHandle;
 
 /// The app's own website.
 pub const APP_WEBSITE: &str = "https://charonsync.app";
-pub const DEVELOPER: &str = "stean.ART";
-/// The developer's website.
-pub const WEBSITE: &str = "https://stean.art";
-/// Public source code on GitHub (an empty value hides the link).
+/// Public source code and releases on GitHub.
 pub const SOURCE_CODE: &str = "https://github.com/steanart/charon";
+/// Who makes Charon, their website and how to write to them.
+pub const DEVELOPER: &str = "stean.DEV";
+pub const DEVELOPER_WEBSITE: &str = "https://stean.dev";
+pub const DEVELOPER_EMAIL: &str = "a.s@stean.dev";
 pub const LICENCE: &str = "MIT";
 pub const COPYRIGHT_YEAR: &str = "2026";
 
@@ -20,9 +21,10 @@ pub struct About {
     name: String,
     version: String,
     app_website: &'static str,
+    source_code: &'static str,
     developer: &'static str,
-    website: &'static str,
-    source_code: Option<&'static str>,
+    developer_website: &'static str,
+    developer_email: &'static str,
     licence: &'static str,
     copyright_year: &'static str,
 }
@@ -35,20 +37,23 @@ impl About {
             name: info.name.clone(),
             version: info.version.to_string(),
             app_website: APP_WEBSITE,
+            source_code: SOURCE_CODE,
             developer: DEVELOPER,
-            website: WEBSITE,
-            source_code: (!SOURCE_CODE.is_empty()).then_some(SOURCE_CODE),
+            developer_website: DEVELOPER_WEBSITE,
+            developer_email: DEVELOPER_EMAIL,
             licence: LICENCE,
             copyright_year: COPYRIGHT_YEAR,
         }
     }
 
-    /// Websites the app may open in the browser: its own, the developer's, and the source code.
+    /// Links the app may open: its website, GitHub (releases included), the developer's
+    /// website, and an e-mail to the developer.
     pub fn may_open(url: &str) -> bool {
-        let allowed = [APP_WEBSITE, WEBSITE, SOURCE_CODE];
-        allowed
+        if url == format!("mailto:{DEVELOPER_EMAIL}") {
+            return true;
+        }
+        [APP_WEBSITE, SOURCE_CODE, DEVELOPER_WEBSITE]
             .iter()
-            .filter(|site| !site.is_empty())
             .any(|site| url == *site || url.starts_with(&format!("{site}/")))
     }
 }

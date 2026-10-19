@@ -31,6 +31,20 @@
 .btn.ghost:hover { color: var(--text); background: rgb(var(--ink-rgb) / 0.05); }
 .btn.ghost.on { color: var(--lantern); }
 
+/* "Update": a new version is out. Glows like the lantern so it's noticed without shouting. */
+.btn.update[hidden] { display: none; }
+.btn.update {
+  color: var(--lantern);
+  border-color: rgb(var(--lantern-rgb) / 0.45);
+  background: rgb(var(--lantern-rgb) / 0.08);
+  animation: lantern-glow 2.8s var(--ease) infinite;
+}
+.btn.update:hover { background: rgb(var(--lantern-rgb) / 0.16); border-color: var(--lantern); }
+@keyframes lantern-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgb(var(--lantern-rgb) / 0); }
+  50% { box-shadow: 0 0 18px 0 rgb(var(--lantern-rgb) / 0.28); }
+}
+
 .btn.danger { color: var(--error); border-color: rgb(var(--error-rgb) / 0.35); }
 .btn.danger:hover { background: rgb(var(--error-rgb) / 0.1); }
 

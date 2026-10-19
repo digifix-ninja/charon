@@ -10,6 +10,7 @@
 //! * `login.rs`    – launch at login
 //! * `desktop.rs`  – showing folders and opening links, per operating system
 //! * `about.rs`    – name, version, developer and licence for the About panel
+//! * `updates.rs`  – asks GitHub whether a newer version is out
 //! * `data_folder.rs` – where jobs and settings live (and moving them from 0.1.0)
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
@@ -23,12 +24,14 @@ mod login;
 mod notifier;
 mod state;
 mod tray;
+mod updates;
 
 use charon_core::{Autopilot, Engine};
 use data_folder::DataFolder;
 use state::AppState;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tray::Tray;
+use updates::Updates;
 
 fn main() {
     tauri::Builder::default()
@@ -46,6 +49,7 @@ fn main() {
             Tray::install(&handle, &engine.overview())?;
             login::LaunchAtLogin::apply(&handle, engine.settings().launch_at_login);
             Autopilot::start(engine);
+            Updates::start(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -62,6 +66,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_state,
             commands::about,
+            commands::check_updates,
+            commands::update_info,
             commands::add_job,
             commands::update_job,
             commands::duplicate_job,

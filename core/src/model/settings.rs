@@ -19,6 +19,8 @@ pub struct Settings {
     pub paused_all: bool,
     /// How often jobs that don't sync on change look for pending changes, in minutes.
     pub check_minutes: u32,
+    /// Ask GitHub at start-up and once a day whether a newer Charon is out.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -31,6 +33,7 @@ impl Default for Settings {
             trash_days: 30,
             paused_all: false,
             check_minutes: 15,
+            check_updates: true,
         }
     }
 }

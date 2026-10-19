@@ -2,6 +2,11 @@
 
 All notable changes to Charon are listed here.
 
+## 0.2.0
+
+- **Updates:** Charon asks GitHub at start-up and once a day whether a newer version is out. When one is, an **Update** button glows in the title bar, the menu bar / tray menu offers the download, and a notification says so (once per version). The download opens the installer for your computer. You can also check by hand from About or the tray menu ("Check for Updates…"), or turn the daily check off in Settings.
+- **About** now lists the app's website ([charonsync.app](https://charonsync.app)) and GitHub page, and the developer, **stean.DEV**, with its website ([stean.dev](https://stean.dev)) and e-mail ([a.s@stean.dev](mailto:a.s@stean.dev)).
+
 ## 0.1.1
 
 - Charon is now a stean.ART project: credits, copyright and the About panel point to [stean.art](https://stean.art).

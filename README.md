@@ -85,6 +85,8 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   everything*.
 - **Notifications** for errors, conflicts and big syncs. Small routine syncs stay silent.
 - **Launch at login**, and keeps running when the window is closed.
+- **Tells you when a new version is out**: it asks GitHub once a day, and an *Update* button
+  takes you to the installer for your computer. Nothing is downloaded without you.
 - A **per-job activity log**: what each run copied, and which files failed and why.
 - **macOS, Windows and Linux.**
 

@@ -40,7 +40,7 @@ export class DemoBackend {
 
   constructor() {
     this.listeners = {};
-    this.settings = { appearance: "system", launchAtLogin: true, runInBackground: true, notifications: true, trashDays: 30, pausedAll: false, checkMinutes: 15 };
+    this.settings = { appearance: "system", launchAtLogin: true, runInBackground: true, notifications: true, trashDays: 30, pausedAll: false, checkMinutes: 15, checkUpdates: true };
     this.jobs = [
       job("photos", { name: "Photos → Backup SSD", source: "/Users/andrei/Pictures/Photos", destination: "/Volumes/Backup SSD/Photos", trigger: { kind: "drive-connected" }, lastSynced: ago(26 * MIN) }),
       job("projects", { name: "Projects ⇄ NAS", source: "/Users/andrei/Projects", destination: "/Volumes/NAS/Projects", mode: "two-way", trigger: { kind: "on-change", settleSeconds: 5 } }),
@@ -114,7 +114,15 @@ export class DemoBackend {
     await new Promise(r => setTimeout(r, 30));
     switch (command) {
       case "get_state": return structuredClone({ jobs: this.jobs, settings: this.settings, overview: this.overview(), defaultExcludes: DEFAULT_EXCLUDES });
-      case "about": return { name: "Charon", version: "0.1.1", appWebsite: "https://charonsync.app", developer: "stean.ART", website: "https://stean.art", sourceCode: "https://github.com/steanart/charon", licence: "MIT", copyrightYear: "2026" };
+      case "about": return { name: "Charon", version: "0.2.0", appWebsite: "https://charonsync.app", sourceCode: "https://github.com/steanart/charon", developer: "stean.DEV", developerWebsite: "https://stean.dev", developerEmail: "a.s@stean.dev", licence: "MIT", copyrightYear: "2026" };
+      case "update_info": return null;
+      case "check_updates": {
+        // Pretends GitHub has a newer version, to show how it looks.
+        await new Promise(r => setTimeout(r, 900));
+        const info = { current: "0.2.0", latest: "0.2.1", available: true, page: "https://github.com/steanart/charon/releases/tag/v0.2.1", download: null };
+        this.emit("update", info);
+        return info;
+      }
       case "sync_now": return this.simulateSync(args.id, 140 + Math.round(Math.random() * 400), 300_000_000 + Math.random() * 900_000_000);
       case "sync_all": return this.jobs.filter(j => !j.paused).forEach((j, i) => setTimeout(() => this.simulateSync(j.id, 200, 400_000_000), i * 300));
       case "cancel": {
