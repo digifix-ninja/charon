@@ -1,4 +1,4 @@
-// Settings: appearance, start-up, background, notifications, trash and checks. Saved on every change.
+// Settings: appearance, start-up, background, notifications, trash, checks and updates. Saved on every change.
 
 import { Api } from "../api.js";
 import { Dom } from "../dom.js";
@@ -59,6 +59,7 @@ export class SettingsPanel extends Sheet {
         ${raw(toggle("pausedAll", "Pause everything", "No job runs by itself. Handy on a hotspot or while presenting."))}
         ${raw(number("trashDays", "Keep deleted files", "How long safe deletes stay in .charon-trash. 0 keeps them for ever.", "days", 0, 3650))}
         ${raw(number("checkMinutes", "Look for changes", "How often jobs check for pending changes, besides watching the folders.", "min", 1, 1440))}
+        ${raw(toggle("checkUpdates", "Look for new versions", "Charon asks GitHub at start-up and once a day. Nothing is downloaded without you."))}
       </div></div>`;
   }
 

@@ -82,8 +82,39 @@
 .about h2 { margin: 12px 0 0; font: 600 18px var(--mono); letter-spacing: 0.4em; }
 .about .version { color: var(--text-faint); font: 12px var(--mono); }
 .about p { color: var(--text-dim); max-width: 360px; margin: 6px 0; }
-.about .links { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 10px; }
 .about .legal { color: var(--text-faint); font-size: 11.5px; margin-top: 16px; }
+
+/* Version line: check for updates, or the news that a new version is out. */
+.update-line { display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px; min-height: 34px; }
+.update-line .note { display: inline-flex; align-items: center; gap: 8px; color: var(--text-dim); font: 12px var(--mono); }
+.update-line .note.news { color: var(--lantern); }
+.update-line .pulse {
+  --tone: var(--river);
+  width: 7px; height: 7px; border-radius: 50%; background: var(--river);
+  animation: pulse 1.6s var(--ease) infinite;
+}
+
+/* Links: the app's, then the developer's. Each row opens its link. */
+.about .links { display: grid; gap: 4px; width: min(380px, 100%); margin-top: 14px; text-align: left; }
+.about .links .eyebrow { padding: 0 12px 6px; }
+.link-row {
+  display: grid;
+  grid-template-columns: 16px 76px minmax(0, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgb(var(--ink-rgb) / 0.02);
+  color: var(--text);
+  text-align: left;
+  transition: background 0.2s var(--ease), border-color 0.2s var(--ease), box-shadow 0.3s var(--ease);
+}
+.link-row:hover { border-color: rgb(var(--river-rgb) / 0.4); background: rgb(var(--river-rgb) / 0.05); box-shadow: 0 0 22px rgb(var(--river-rgb) / 0.08); }
+.link-row .ico { color: var(--text-faint); }
+.link-row:hover .ico { color: var(--river); }
+.link-row .k { color: var(--text-faint); font: 600 10px var(--mono); letter-spacing: 0.12em; text-transform: uppercase; }
+.link-row .v { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12.5px var(--mono); }
 
 /* ---------------------------------------------------------------- preview dialog */
 

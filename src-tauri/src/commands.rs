@@ -7,6 +7,7 @@ use crate::about::About;
 use crate::desktop::Desktop;
 use crate::login::LaunchAtLogin;
 use crate::state::AppState;
+use crate::updates::{UpdateInfo, Updates};
 use charon_core::engine::Preview;
 use charon_core::store::LogLine;
 use charon_core::{ConflictChoice, JobId, JobSetup, JobView, Overview, Settings, SyncMode};
@@ -46,6 +47,20 @@ pub fn get_state(state: State<AppState>) -> WindowState {
 #[tauri::command]
 pub fn about(app: AppHandle) -> About {
     About::of(&app)
+}
+
+// ---------------------------------------------------------------- updates
+
+/// Asks GitHub whether a newer Charon is out.
+#[tauri::command]
+pub async fn check_updates(app: AppHandle) -> Answer<UpdateInfo> {
+    tauri::async_runtime::spawn_blocking(move || Updates::check(&app)).await.map_err(say)?
+}
+
+/// The last answer from GitHub, if Charon has asked yet.
+#[tauri::command]
+pub fn update_info(app: AppHandle) -> Option<UpdateInfo> {
+    Updates::last(&app)
 }
 
 // ---------------------------------------------------------------- jobs
@@ -167,7 +182,7 @@ pub fn reveal_path(path: PathBuf) -> Answer<()> {
 #[tauri::command]
 pub fn open_url(url: String) -> Answer<()> {
     if !About::may_open(&url) {
-        return Err("Charon only opens its own website and GitHub.".into());
+        return Err("Charon only opens its own links.".into());
     }
     Desktop::open_url(&url)
 }

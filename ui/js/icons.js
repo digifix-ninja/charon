@@ -21,6 +21,11 @@ export const Icons = {
   copy: stroke('<rect x="5" y="5" width="8.5" height="8.5" rx="1.5"/><path d="M11 5V3.7c0-.7-.5-1.2-1.2-1.2H3.7c-.7 0-1.2.5-1.2 1.2v6.1c0 .7.5 1.2 1.2 1.2H5"/>'),
   trash: stroke('<path d="M2.5 4.5h11M6.5 4.5V3c0-.3.2-.5.5-.5h2c.3 0 .5.2.5.5v1.5M4 4.5l.7 8.3c0 .4.4.7.8.7h5c.4 0 .8-.3.8-.7l.7-8.3"/>'),
   log: stroke('<path d="M3 3.5h10M3 6.5h10M3 9.5h7M3 12.5h5"/>'),
+  download: stroke('<path d="M8 2.5v8M4.8 7.4 8 10.6l3.2-3.2M2.8 13.5h10.4"/>'),
+  globe: stroke('<circle cx="8" cy="8" r="6"/><path d="M2 8h12M8 2c1.7 1.7 2.5 3.7 2.5 6S9.7 12.3 8 14C6.3 12.3 5.5 10.3 5.5 8S6.3 3.7 8 2z"/>'),
+  code: stroke('<path d="M5.5 4.5 2 8l3.5 3.5M10.5 4.5 14 8l-3.5 3.5M9 3l-2 10"/>'),
+  person: stroke('<circle cx="8" cy="5.3" r="2.7"/><path d="M2.8 13.8c.6-2.6 2.7-4.3 5.2-4.3s4.6 1.7 5.2 4.3"/>'),
+  mail: stroke('<rect x="2" y="3.5" width="12" height="9" rx="1.5"/><path d="m2.5 4.5 5.5 4.3 5.5-4.3"/>'),
 
   // Statuses: one icon each, always shown with its colour
   status: {

@@ -137,6 +137,7 @@ src-tauri/src/              the desktop app (macOS, Windows, Linux)
   login.rs                    LaunchAtLogin
   desktop.rs                  Desktop: show in Finder/Explorer, open links (per system)
   about.rs                    About: version, websites, developer, licence
+  updates.rs                  Updates: asks GitHub's latest release whether a newer version is out
 src-tauri/tauri.conf.json   app configuration
 ui/                         the interface (plain HTML/CSS/JS modules)
   index.html
@@ -145,6 +146,7 @@ ui/                         the interface (plain HTML/CSS/JS modules)
   js/main.js                  App: creates the views, connects to Rust
   js/api.js                   Api: every command and event
   js/store.js                 JobStore: jobs, filters, expanded rows
+  js/updates.js               Updates: the "Update" button and the answer from GitHub
   js/views/                   Header, JobList, JobRow, JobEditor, PreviewDialog, SettingsPanel, AboutPanel, PopMenu, Sheet
   js/effects/                 River (animated backdrop), PointerGlow, Counter
   js/demo/backend.js          simulated backend for working on the UI in a browser
@@ -170,5 +172,15 @@ In the app's data folder:
 
 ## Changing the About information
 
-Websites, developer and the link to the source code are constants in
+Websites, developer, e-mail and the link to the source code are constants in
 `src-tauri/src/about.rs`. The licence text is in `LICENSE`.
+
+## How the update check works
+
+`src-tauri/src/updates.rs` reads `https://api.github.com/repos/steanart/charon/releases/latest`
+ten seconds after start-up and then once a day (unless *Look for new versions* is off in
+Settings). Drafts don't count, so a new version reaches people only when its release is
+**published**. The tag (`v0.2.0`) is compared with the app's own version, and the download link
+is the release asset with the fixed name for this computer (`Charon-macOS-Apple-Silicon.dmg`,
+`Charon-macOS-Intel.dmg`, `Charon-Windows-Setup.exe`; on Linux the release page). Keep those
+names in `build.yml` and `updates.rs` the same.

@@ -1,6 +1,8 @@
 //! The menu-bar icon and its menu: the overall status at a glance, and the main actions.
 
+use crate::desktop::Desktop;
 use crate::state::AppState;
+use crate::updates::{UpdateInfo, Updates};
 use charon_core::Overview;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -16,10 +18,13 @@ const TRAY_ICON: &[u8] = include_bytes!("../icons/tray-white.png");
 
 const TRAY_ID: &str = "charon";
 
+const CHECK_FOR_UPDATES: &str = "Check for Updates…";
+
 /// The menu items whose text changes with the status.
 pub struct Tray {
     status: MenuItem<Wry>,
     pause: MenuItem<Wry>,
+    update: MenuItem<Wry>,
 }
 
 impl Tray {
@@ -27,6 +32,7 @@ impl Tray {
     pub fn install(app: &AppHandle, overview: &Overview) -> tauri::Result<()> {
         let status = MenuItem::with_id(app, "status", overview.headline(), false, None::<&str>)?;
         let pause = MenuItem::with_id(app, "pause", Self::pause_label(overview), true, None::<&str>)?;
+        let update = MenuItem::with_id(app, "update", CHECK_FOR_UPDATES, true, None::<&str>)?;
         let menu = Menu::with_items(
             app,
             &[
@@ -36,6 +42,7 @@ impl Tray {
                 &MenuItem::with_id(app, "sync", "Sync All Now", true, None::<&str>)?,
                 &pause,
                 &PredefinedMenuItem::separator(app)?,
+                &update,
                 &MenuItem::with_id(app, "quit", "Quit Charon", true, None::<&str>)?,
             ],
         )?;
@@ -47,7 +54,7 @@ impl Tray {
             .show_menu_on_left_click(true)
             .on_menu_event(Self::on_menu)
             .build(app)?;
-        app.manage(Tray { status, pause });
+        app.manage(Tray { status, pause, update });
         Ok(())
     }
 
@@ -59,6 +66,33 @@ impl Tray {
         if let Some(icon) = app.tray_by_id(TRAY_ID) {
             let _ = icon.set_tooltip(Some(format!("Charon · {}", overview.headline())));
         }
+    }
+
+    /// With a new version out, the update item becomes its download link.
+    pub fn show_update(app: &AppHandle, info: &UpdateInfo) {
+        let Some(tray) = app.try_state::<Tray>() else { return };
+        let text = if info.available {
+            format!("Download Charon {}…", info.latest)
+        } else {
+            CHECK_FOR_UPDATES.to_string()
+        };
+        let _ = tray.update.set_text(text);
+    }
+
+    /// Opens the download of a version found earlier, or asks GitHub and says what it found.
+    fn update_clicked(app: &AppHandle) {
+        if let Some(info) = Updates::last(app).filter(|info| info.available) {
+            if let Err(e) = Desktop::open_url(info.link()) {
+                log::warn!("{e}");
+            }
+            return;
+        }
+        let app = app.clone();
+        std::thread::spawn(move || match Updates::check(&app) {
+            Ok(info) if info.available => Updates::notify(&app, &info, true),
+            Ok(info) => Updates::show(&app, "Charon is up to date", &format!("You have the newest version, {}.", info.current)),
+            Err(e) => Updates::show(&app, "Couldn't check for updates", &e),
+        });
     }
 
     fn pause_label(overview: &Overview) -> &'static str {
@@ -79,6 +113,7 @@ impl Tray {
                 let paused = engine.settings().paused_all;
                 let _ = engine.set_all_paused(!paused);
             }
+            "update" => Self::update_clicked(app),
             "quit" => app.exit(0),
             _ => {}
         }

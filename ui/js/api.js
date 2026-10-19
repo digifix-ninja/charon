@@ -27,6 +27,8 @@ export class Api {
   // ---- reading
   static getState() { return this.call("get_state"); }
   static about() { return this.call("about"); }
+  static updateInfo() { return this.call("update_info"); }
+  static checkUpdates() { return this.call("check_updates"); }
   static jobLog(id) { return this.call("job_log", { id }); }
   static suggestName(source, destination, mode) { return this.call("suggest_name", { source, destination, mode }); }
 
