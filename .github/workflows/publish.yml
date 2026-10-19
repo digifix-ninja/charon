@@ -1,0 +1,41 @@
+# Publishes a draft release made by "Build Charon": sets its notes and makes it public.
+#
+# Started by hand (Actions → Publish Charon → Run workflow) with the version (e.g. v0.2.0) and,
+# if wanted, the release notes in Markdown. Publishing creates the tag, so from then on
+# https://github.com/steanart/charon/releases/latest points to this version and the apps
+# already out there see it as an update.
+
+name: Publish Charon
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The draft release to publish (e.g. v0.2.0)"
+        required: true
+      notes:
+        description: "Release notes in Markdown (leave empty to keep the draft's notes)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write # needed to edit and publish the release
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.version }}
+          NOTES: ${{ inputs.notes }}
+        run: |
+          set -euo pipefail
+          repo="${{ github.repository }}"
+          if [ -n "$NOTES" ]; then
+            printf '%s\n' "$NOTES" > notes.md
+            gh release edit "$TAG" --repo "$repo" --notes-file notes.md
+          fi
+          gh release edit "$TAG" --repo "$repo" --draft=false --latest
+          gh release view "$TAG" --repo "$repo" --json url,isDraft,tagName
