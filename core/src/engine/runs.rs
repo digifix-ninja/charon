@@ -385,11 +385,11 @@ impl Engine {
         let two_way = survey.setup.mode.is_two_way();
         let resolving = crossing.kind == ReviewKind::Resolve;
         let shores = Shores { source: survey.setup.source.clone(), destination: survey.setup.destination.clone() };
-        let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving };
+        let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving, two_way };
         let observer = |progress: &Progress| self.report_progress(id, progress);
         let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
         let executor = Executor::new(&shores, &survey.source, &survey.destination, care, cancel);
-        let outcome = executor.run(&survey.plan, &mut meter);
+        let mut outcome = executor.run(&survey.plan, &mut meter);
 
         // The housekeeping the list named, only after a run that went all the way.
         let complete = !outcome.cancelled && outcome.stopped.is_none();
@@ -399,7 +399,7 @@ impl Engine {
                 tidied += executor.tidy(*side, leftovers);
             }
         }
-        let flushed = executor.flush();
+        let flushed = executor.flush(&mut outcome);
         // Old trash goes only after a list that said so was confirmed. A run nobody looked at
         // never empties it: the originals in there may be the only good copies of files a
         // broken app is slowly damaging (see `Guard::since_confirmed`).
@@ -433,6 +433,10 @@ impl Engine {
                     false
                 }
             },
+            Err(Error::Undone(reason)) => {
+                problems.push(format!("{reason} Charon recorded nothing of this sync: its next look compares both folders afresh and waits for your OK."));
+                false
+            }
             Err(e) => {
                 problems.push(format!("Charon couldn't make sure the changes reached the drive ({e}). Its next look compares both folders afresh."));
                 false
@@ -454,6 +458,14 @@ impl Engine {
                     "{path}: changed on both sides; Newest wins kept the {} version, and the {}'s is in .charon-trash",
                     to.opposite().word(),
                     to.word()
+                ),
+            );
+        }
+        for path in outcome.unrecorded.iter().take(LOGGED_ITEMS) {
+            journal.info(
+                id,
+                &format!(
+                    "{path}: copied, but by the end of the sync its original was gone or an older version (moved or removed meanwhile, or a change its drive lost), so Charon doesn't count it as synced and compares it afresh next time"
                 ),
             );
         }

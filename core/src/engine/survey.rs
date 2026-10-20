@@ -359,7 +359,14 @@ impl Engine {
             }
         }
 
-        let removals = plan.removed_on(Side::Source) + plan.removed_on(Side::Destination);
+        // What makes room for an item of another kind goes into .charon-trash whatever the
+        // setting (see `Executor::delete`).
+        let clearings = plan.clearings();
+        let removals = plan
+            .actions
+            .iter()
+            .filter(|a| matches!(a, Action::Delete { item, .. } if *item != EntryKind::Dir) && !clearings.iter().any(|clearing| clearing.holds(a)))
+            .count() as u64;
         let replacements: u64 = plan
             .actions
             .iter()

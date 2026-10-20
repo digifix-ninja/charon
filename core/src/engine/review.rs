@@ -14,7 +14,7 @@ use crate::model::{
     Cluster, ConflictChoice, ConflictItem, JobId, Level, ReviewKind, Review, ReviewNote, ReviewStep, Shore, StepFilter, StepKind,
     Tally, VolumeLabel, Warning,
 };
-use crate::plan::{Action, NoteKind, Resolution, Side, Unit};
+use crate::plan::{Action, Clearing, NoteKind, Resolution, Side, Unit};
 use crate::run::Markers;
 use crate::scan::{Entry, EntryKind, Keys, RootId};
 use chrono::{DateTime, Duration, Utc};
@@ -312,7 +312,8 @@ impl Engine {
     /// Keeps a review of `survey` for the job (replacing any other) and returns it.
     fn keep_review(&self, job: &crate::model::Job, survey: Survey, kind: ReviewKind, title: Option<String>, resolving: Option<String>) -> Result<Review> {
         let prepared_at = Utc::now();
-        let steps: Vec<ReviewStep> = survey.plan.for_review().into_iter().map(|action| Self::step_of(&survey, action, kind)).collect();
+        let clearings = survey.plan.clearings();
+        let steps: Vec<ReviewStep> = survey.plan.for_review().into_iter().map(|action| Self::step_of(&survey, action, kind, &clearings)).collect();
         let notes: Vec<ReviewNote> = survey
             .plan
             .notes
@@ -465,8 +466,9 @@ impl Engine {
         clusters
     }
 
-    /// One step as the review shows it, with why it happens.
-    fn step_of(survey: &Survey, action: &Action, kind: ReviewKind) -> ReviewStep {
+    /// One step as the review shows it, with why it happens. `clearings`: the plan's places
+    /// where an item of another kind takes an item's place.
+    fn step_of(survey: &Survey, action: &Action, kind: ReviewKind, clearings: &[Clearing]) -> ReviewStep {
         let two_way = survey.setup.mode.is_two_way();
         let resolving = kind == ReviewKind::Resolve;
         let kept = survey.setup.safe_delete || resolving;
@@ -519,7 +521,10 @@ impl Engine {
                 ReviewStep { kind: step, side: Some(*to), path, item: *item, bytes: *bytes, reason, danger: *replaces }
             }
             Action::Delete { side, item, other, .. } => {
-                let fate = if kept { "goes to .charon-trash" } else { "gone for good" };
+                // What makes room for an item of another kind is kept whatever the setting
+                // (see `Executor::delete`).
+                let makes_room = clearings.iter().any(|clearing| clearing.holds(action));
+                let fate = if kept || makes_room { "goes to .charon-trash" } else { "gone for good" };
                 let why = if resolving {
                     chosen(*side)
                 } else if let Some(other) = other {

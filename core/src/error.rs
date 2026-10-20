@@ -69,6 +69,12 @@ pub enum Error {
     #[error("{0}")]
     LandedElsewhere(String),
 
+    /// A change of a run turned out undone at its end, once flushed to the drive (an item
+    /// it synced is missing, one it removed is back): the drive may have come back without
+    /// it. Nothing of the run is recorded.
+    #[error("{0}")]
+    Undone(String),
+
     #[error("Stopped.")]
     Cancelled,
 }

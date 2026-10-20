@@ -11,10 +11,11 @@
 //! and reported.
 //!
 //! Every finished step is recorded (`Settled`), so the two-way memory can be updated with
-//! what really happened.
+//! what really happened. Before any of it is written down, `flush` makes the run's changes
+//! durable and looks once more at what each finished step left (see `retrace`).
 
 use crate::error::{Error, Result};
-use crate::plan::{Action, Pair, Plan, Settled, Side, Unit};
+use crate::plan::{Action, Clearing, Pair, Plan, Settled, Side, Step, Unit};
 use crate::run::durable;
 use crate::run::names;
 use crate::run::rename::{rename_new, swap};
@@ -28,6 +29,7 @@ use std::io;
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 use unicode_normalization::UnicodeNormalization;
 
 /// The two folders of a job.
@@ -46,7 +48,7 @@ impl Shores {
     }
 }
 
-/// How a run treats what it removes and replaces.
+/// How a run treats what it removes and replaces, and what its record is used for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Care {
     /// Removed items go into the trash instead of being deleted for good.
@@ -54,6 +56,9 @@ pub struct Care {
     /// Replaced files are kept in the trash even without safe deletes. Two-way jobs always
     /// do this: the replaced version may be someone's last copy of their own work.
     pub keep_replaced: bool,
+    /// The run is recorded in a two-way memory, where an item missing on one side next time
+    /// reads as removed there on purpose (see `Executor::retrace`).
+    pub two_way: bool,
 }
 
 /// What a run achieved.
@@ -85,6 +90,10 @@ pub struct Outcome {
     pub unkept: Vec<(String, String)>,
     /// Items a drive refused to take.
     pub refused: Vec<Refused>,
+    /// Two-way: items copied in this run whose original was gone, or an older version, by
+    /// its end (moved, renamed or removed meanwhile, or a change its drive lost). They aren't
+    /// recorded as synced, so the next look compares them afresh (see `Executor::retrace`).
+    pub unrecorded: Vec<String>,
 }
 
 /// An item a drive refused to take (see `Refusal`): the side it was to go to, its key, why,
@@ -154,6 +163,151 @@ impl Identity {
 struct Swapped {
     checked: Option<Identity>,
     copy: Option<Identity>,
+}
+
+/// What a finished step left at its item on each side, and when, for the last look before
+/// the run is recorded (see `Executor::retrace`).
+struct Footprint {
+    key: String,
+    source: Trace,
+    destination: Trace,
+    at: Instant,
+}
+
+/// What a finished step left at its item on one side.
+#[derive(Debug, Clone, Copy)]
+enum Trace {
+    /// An item the step copied or created there; `replaced` is the version a copy took the
+    /// place of.
+    Left { item: Entry, replaced: Option<Entry> },
+    /// The item a copy or a new folder was made after, on the side it came from.
+    Original(Entry),
+    /// The item the step removed from there (or found gone already).
+    Removed(Entry),
+    /// The other side of a removal, which had nothing there and wasn't touched: whatever is
+    /// there now is new, and can't be a lost change of the run.
+    Untouched,
+}
+
+/// How an item found at the end of a run shows that a finished step's change was lost.
+#[derive(Debug)]
+enum Loss {
+    /// What the step left or copied from isn't there, or something of another kind is.
+    Missing,
+    /// The version a copy replaced is back in its place.
+    Replaced,
+    /// A version from before the step is back: older than the one a copy replaced, or than
+    /// the original it copied.
+    Older,
+    /// The item the step removed is back.
+    Back,
+}
+
+impl Trace {
+    /// How `now`, the item at the step's place now, shows that the step's change was lost,
+    /// if it does. Only what a lost change leaves counts: the item missing, an older version
+    /// back in its place, a removed item back. An item changed in any other way was changed
+    /// after the step: an app saved it again, a drive with coarse times rounded its time, a
+    /// rename moved its change time. That is a change for the next look, not a lost one, so
+    /// a person who goes on working during a long run doesn't make it fail.
+    ///
+    /// The change time tells versions apart that have the same size and time (an encrypted
+    /// container keeps its time when it's edited): only the drive sets it, and it only moves
+    /// forward. So the version a copy replaced, or an older one, still has the change time
+    /// the scan saw, or an earlier one. This is only used where the scan trusted the drive's
+    /// change times (`changed` isn't 0), and never when the copy has that very change time
+    /// too (a drive that keeps it in whole seconds).
+    fn lost(&self, now: Option<&Entry>) -> Option<Loss> {
+        let Some(now) = now else {
+            return matches!(self, Trace::Left { .. } | Trace::Original(_)).then_some(Loss::Missing);
+        };
+        match *self {
+            Trace::Left { item, .. } | Trace::Original(item) if now.kind != item.kind => Some(Loss::Missing),
+            Trace::Left { item, replaced: Some(replaced) } => {
+                let timed = replaced.changed != 0 && now.changed != 0 && now.changed != item.changed;
+                if (now.same_as(&replaced) && !now.same_as(&item)) || (timed && now.changed == replaced.changed) {
+                    Some(Loss::Replaced)
+                } else if timed && now.changed < replaced.changed {
+                    Some(Loss::Older)
+                } else {
+                    None
+                }
+            }
+            Trace::Original(copied) if Self::older(now, &copied) => Some(Loss::Older),
+            Trace::Removed(removed) if now.same_as(&removed) => Some(Loss::Back),
+            _ => None,
+        }
+    }
+
+    /// Whether the file `now` is a version from before `copied`, the original a copy was
+    /// made from, as its change time tells where the scan trusted the drive's: an earlier
+    /// one, or the same one with another size or time (a drive keeps change times in steps
+    /// of a few milliseconds, and a save after the copy comes steps later). Saving a file
+    /// again moves it forward. Where change times aren't trusted, the next look takes a file
+    /// whose modification time went back for a conflict anyway (see `TwoWayPlanner`).
+    fn older(now: &Entry, copied: &Entry) -> bool {
+        let differs = (now.size, now.modified) != (copied.size, copied.modified);
+        now.is_file()
+            && copied.is_file()
+            && copied.changed != 0
+            && now.changed != 0
+            && (now.changed < copied.changed || (now.changed == copied.changed && differs))
+    }
+}
+
+/// The removals a run holds back on a side where something it was to bring there didn't
+/// arrive: a removal could take the last copy there of what didn't arrive, like the old
+/// copy of a file in a renamed folder whose new copy wasn't made.
+#[derive(Default)]
+struct Holds {
+    /// Sides where a copy failed or a drive refused an item: every removal there waits.
+    sides: HashSet<Side>,
+    /// Copies left for the next sync because their item changed during the run (or their
+    /// place couldn't be cleared): the side each was going to, its key and the item as
+    /// planned. Only the removals there that could be an old copy of one of them wait: an
+    /// item with the same name, or with the same size and time. Holding every removal there
+    /// would keep a job from ever removing anything while an app keeps writing to one file.
+    changed: Vec<(Side, String, Entry)>,
+}
+
+/// Why a removal waits (see `Holds`).
+enum Held<'h> {
+    /// Copies to its side failed.
+    Failed,
+    /// It may be an old copy of the item at this key, which changed during the run.
+    OldCopyOf(&'h str),
+}
+
+impl Holds {
+    /// Notes what a step's result holds back: a copy that didn't land, the removals on its
+    /// side.
+    fn note(&mut self, action: &Action, result: &Result<Done>) {
+        match (action, result) {
+            (_, Ok(Done::Copied(..))) => {}
+            // The person sees what a drive refused left out in the next list before anything
+            // goes.
+            (_, Err(Error::Refused { .. })) => self.sides.extend(Executor::receiving(action)),
+            (Action::Copy { to, path, from, .. }, Ok(Done::Skipped(_)) | Err(Error::Changed(_))) => self.changed.push((*to, path.clone(), *from)),
+            (Action::KeepBoth { path, source, destination, .. }, Ok(Done::Skipped(_)) | Err(Error::Changed(_))) => {
+                self.changed.push((Side::Destination, path.clone(), *source));
+                self.changed.push((Side::Source, path.clone(), *destination));
+            }
+            (Action::Copy { .. } | Action::KeepBoth { .. }, _) => self.sides.extend(Executor::receiving(action)),
+            _ => {}
+        }
+    }
+
+    /// Why the step `action`, when it's a removal, waits, if it does.
+    fn of(&self, action: &Action) -> Option<Held<'_>> {
+        let Action::Delete { side, path, entry, .. } = action else { return None };
+        if self.sides.contains(side) {
+            return Some(Held::Failed);
+        }
+        self.changed
+            .iter()
+            .find(|(to, key, item)| to == side && (Keys::name(key) == Keys::name(path) || item.same_as(entry)))
+            .map(|(_, key, _)| Held::OldCopyOf(key))
+    }
 }
 
 /// What the folders above an item are.
@@ -228,7 +382,11 @@ pub struct Executor<'a> {
     real_folders: RefCell<HashSet<PathBuf>>,
     /// Folders whose list of names this run changed (flushed to the drive at the end).
     touched: RefCell<BTreeSet<PathBuf>>,
+    /// Folders this run removed.
+    removed_folders: RefCell<HashSet<PathBuf>>,
     settled: RefCell<Vec<Settled>>,
+    /// What each finished step left, for the last look before the run is recorded.
+    footprints: RefCell<Vec<Footprint>>,
     destroyed: RefCell<(Vec<String>, Vec<String>)>,
     unkept: RefCell<Vec<(String, String)>>,
 }
@@ -246,7 +404,9 @@ impl<'a> Executor<'a> {
             roots: (source.root(), destination.root()),
             real_folders: RefCell::new(HashSet::new()),
             touched: RefCell::new(BTreeSet::new()),
+            removed_folders: RefCell::default(),
             settled: RefCell::new(Vec::new()),
+            footprints: RefCell::default(),
             destroyed: RefCell::default(),
             unkept: RefCell::default(),
         }
@@ -266,12 +426,16 @@ impl<'a> Executor<'a> {
     /// when the first of them comes up (see `carry_database`).
     pub fn run(&self, plan: &Plan, meter: &mut ProgressMeter) -> Outcome {
         let mut outcome = Outcome::default();
-        // A side where copies failed keeps everything this run would remove there: the
-        // removal could take the last copy of something that didn't arrive.
-        let mut copies_failed: HashSet<Side> = HashSet::new();
+        // A side where a copy didn't land keeps what this run would remove there that could
+        // be the last copy of what didn't arrive.
+        let mut holds = Holds::default();
+        // The places cleared for an item of another kind: nothing goes into a place whose
+        // item couldn't go first.
+        let mut cleared: HashSet<Clearing> = HashSet::new();
         let databases = self.databases(plan);
         let mut carried: HashSet<String> = HashSet::new();
-        'steps: for (action, makes_room) in plan.ordered_steps() {
+        'steps: for step in plan.ordered_steps() {
+            let action = step.action;
             if self.cancel.load(Ordering::Relaxed) {
                 outcome.cancelled = true;
                 break;
@@ -283,28 +447,37 @@ impl<'a> Executor<'a> {
                 outcome.stopped = Some(reason);
                 break;
             }
-            if let Some((database, steps)) = self.database_of(action, makes_room).and_then(|database| databases.get_key_value(&database)) {
-                if carried.insert(database.clone()) {
-                    for (step, result) in self.carry_database(steps, &copies_failed, meter) {
-                        if self.record(&mut outcome, &mut copies_failed, step, result).is_break() {
-                            break 'steps;
+            let still_taken = step.clearing.filter(|clearing| step.takes_place() && !cleared.contains(clearing));
+            if still_taken.is_none() {
+                if let Some((database, steps)) = self.database_of(&step).and_then(|database| databases.get_key_value(&database)) {
+                    if carried.insert(database.clone()) {
+                        for (step, result) in self.carry_database(steps, &holds, meter) {
+                            if self.record(&mut outcome, &mut holds, step, result).is_break() {
+                                break 'steps;
+                            }
                         }
                     }
+                    continue;
                 }
-                continue;
             }
             meter.start(&self.spellings.disk(Self::shown_side(action), action.path()));
-            let result = match action {
-                Action::Delete { side, .. } if !makes_room && copies_failed.contains(side) => Ok(Done::Skipped(format!(
-                    "kept for now: some items couldn't be copied to the {} in this run",
-                    side.word()
+            let result = match (action, still_taken, holds.of(action)) {
+                (_, Some(clearing), _) => Ok(Done::Skipped(format!(
+                    "left for the next sync: the item of another kind in its place on the {} couldn't go first",
+                    clearing.side.word()
                 ))),
-                Action::Copy { to, item: EntryKind::Link, .. } if outcome.no_links.contains(to) => {
+                (Action::Delete { side, .. }, None, Some(held)) => Ok(Done::Skipped(self.why_held(held, *side))),
+                (Action::Copy { to, item: EntryKind::Link, .. }, None, _) if outcome.no_links.contains(to) => {
                     Ok(Done::LeftOut(format!("left out: the {}'s drive can't hold symbolic links", to.word())))
                 }
-                _ => self.apply(action, meter),
+                _ => self.apply(action, step.makes_room(), meter),
             };
-            if self.record(&mut outcome, &mut copies_failed, action, result).is_break() {
+            if let Some(clearing) = step.clearing.filter(|clearing| step.makes_room() && clearing.key == action.path()) {
+                if matches!(result, Ok(Done::Deleted | Done::Nothing)) {
+                    cleared.insert(clearing);
+                }
+            }
+            if self.record(&mut outcome, &mut holds, action, result).is_break() {
                 break;
             }
             meter.finish_item();
@@ -316,8 +489,10 @@ impl<'a> Executor<'a> {
         outcome
     }
 
-    /// Adds what one step did to the outcome. `Break` when the whole run stops there.
-    fn record(&self, outcome: &mut Outcome, copies_failed: &mut HashSet<Side>, action: &Action, result: Result<Done>) -> ControlFlow<()> {
+    /// Adds what one step did to the outcome, and what it holds back (see `Holds`). `Break`
+    /// when the whole run stops there.
+    fn record(&self, outcome: &mut Outcome, holds: &mut Holds, action: &Action, result: Result<Done>) -> ControlFlow<()> {
+        holds.note(action, &result);
         match result {
             Ok(Done::Copied(files, bytes)) => {
                 outcome.copied += files;
@@ -350,9 +525,6 @@ impl<'a> Executor<'a> {
             }
             Err(Error::Refused { path, why }) => {
                 log::info!("{}: {} refused: {}", action.path(), path.display(), why.reason("drive"));
-                // Like a failed copy, this keeps the run's removals on that side: the
-                // person sees the item left out in the next list before anything goes.
-                copies_failed.extend(Self::receiving(action));
                 let place = self.locate(action, &path);
                 outcome.left_out.push((action.path().to_string(), self.refusal_reason(action.path(), place.as_ref(), why)));
                 if let Some(refused) = place.and_then(|(side, key)| self.refused_item(side, key, why)) {
@@ -363,13 +535,22 @@ impl<'a> Executor<'a> {
             }
             Err(e) => {
                 log::warn!("{}: {e}", action.path());
-                if matches!(action, Action::Copy { .. } | Action::KeepBoth { .. }) {
-                    copies_failed.extend(Self::receiving(action));
-                }
                 outcome.failed.push((action.path().to_string(), e.to_string()));
             }
         }
         ControlFlow::Continue(())
+    }
+
+    /// What the person reads about a removal from `side` that waits (see `Holds`).
+    fn why_held(&self, held: Held, side: Side) -> String {
+        match held {
+            Held::Failed => format!("kept for now: some items couldn't be copied to the {} in this run", side.word()),
+            Held::OldCopyOf(key) => format!(
+                "kept for now: it may be the old copy of “{}”, which changed during the sync and wasn't copied to the {} yet",
+                self.spellings.disk(side.opposite(), key),
+                side.word()
+            ),
+        }
     }
 
     /// The sides a step brings items to.
@@ -421,22 +602,22 @@ impl<'a> Executor<'a> {
 
     /// The database a step's file belongs to, when the step can be carried with the rest of
     /// the database: copies and plain removals of files.
-    fn database_of(&self, action: &Action, makes_room: bool) -> Option<String> {
-        let groupable = match action {
+    fn database_of(&self, step: &Step) -> Option<String> {
+        let groupable = match step.action {
             Action::Copy { item: EntryKind::File, .. } => true,
-            Action::Delete { item: EntryKind::File, other: None, .. } => !makes_room,
+            Action::Delete { item: EntryKind::File, other: None, .. } => !step.makes_room(),
             _ => false,
         };
         let exists = |key: &str| self.spellings.snapshot(Side::Source).contains(key) || self.spellings.snapshot(Side::Destination).contains(key);
-        groupable.then(|| Unit::database_of(action.path(), exists)).flatten()
+        groupable.then(|| Unit::database_of(step.action.path(), exists)).flatten()
     }
 
     /// The databases with more than one file to carry in this plan, with their steps.
     fn databases<'p>(&self, plan: &'p Plan) -> HashMap<String, Vec<&'p Action>> {
         let mut databases: HashMap<String, Vec<&'p Action>> = HashMap::new();
-        for (action, makes_room) in plan.ordered_steps() {
-            if let Some(database) = self.database_of(action, makes_room) {
-                databases.entry(database).or_default().push(action);
+        for step in plan.ordered_steps() {
+            if let Some(database) = self.database_of(&step) {
+                databases.entry(database).or_default().push(step.action);
             }
         }
         databases.retain(|_, steps| steps.len() > 1);
@@ -449,11 +630,11 @@ impl<'a> Executor<'a> {
     /// is checked again, and only then do the old journals go and the new files take their
     /// places, one right after the other. If any file can't be carried or changed meanwhile,
     /// none is, and the next sync tries again.
-    fn carry_database<'p>(&self, steps: &[&'p Action], copies_failed: &HashSet<Side>, meter: &mut ProgressMeter) -> Vec<(&'p Action, Result<Done>)> {
+    fn carry_database<'p>(&self, steps: &[&'p Action], holds: &Holds, meter: &mut ProgressMeter) -> Vec<(&'p Action, Result<Done>)> {
         let all_wait = |why: &str| steps.iter().map(|step| (*step, Ok(Done::Skipped(why.to_string())))).collect::<Vec<_>>();
         let removals: Vec<&Action> = steps.iter().copied().filter(|step| matches!(step, Action::Delete { .. })).collect();
-        if removals.iter().any(|step| matches!(step, Action::Delete { side, .. } if copies_failed.contains(side))) {
-            return all_wait("kept for now: other copies failed in this run, and a database's files are only synced together");
+        if removals.iter().any(|step| holds.of(step).is_some()) {
+            return all_wait("kept for now: other copies didn't land in this run, and a database's files are only synced together");
         }
 
         // Every new version, written and checked next to its target.
@@ -496,7 +677,7 @@ impl<'a> Executor<'a> {
         let mut broken = false;
         for step in removals {
             meter.start(&self.spellings.disk(Self::shown_side(step), step.path()));
-            let result = if broken { Ok(Done::Skipped(Self::NOT_MIXED.into())) } else { self.apply(step, meter) };
+            let result = if broken { Ok(Done::Skipped(Self::NOT_MIXED.into())) } else { self.apply(step, false, meter) };
             meter.finish_item();
             broken |= !matches!(result, Ok(Done::Deleted | Done::Nothing));
             results.push((step, result));
@@ -507,10 +688,10 @@ impl<'a> Executor<'a> {
                 results.push((step, Ok(Done::Skipped(Self::NOT_MIXED.into()))));
                 continue;
             }
-            let (to, key, from) = (ready.to, ready.key.clone(), ready.from);
+            let (to, key, from, existing) = (ready.to, ready.key.clone(), ready.from, ready.existing);
             let result = match self.commit(ready) {
                 Ok(Some((bytes, landed))) => {
-                    self.settle(&key, Some(Self::pair(to, landed, from)));
+                    self.settle_copy(to, &key, from, landed, existing);
                     Ok(Done::Copied(1, bytes))
                 }
                 Ok(None) => Ok(Done::Skipped(format!("changed on the {} side since the scan", to.word()))),
@@ -566,62 +747,184 @@ impl<'a> Executor<'a> {
     }
 
     /// Makes everything this run changed durable: every folder it touched (and the trash's
-    /// lists of what went in), then each drive. Until this succeeds, nothing about the run
-    /// may be recorded as done.
-    pub fn flush(&self) -> Result<()> {
+    /// lists of what went in), then each drive. Then it looks once more at what the finished
+    /// steps left (see `retrace`) and at both folders. Until all of this succeeds, nothing
+    /// about the run may be recorded as done; `Error::Undone` says what was found undone.
+    /// In a two-way job, an item whose original went away meanwhile is left out of what
+    /// `outcome` records (see `Outcome::unrecorded`).
+    pub fn flush(&self, outcome: &mut Outcome) -> Result<()> {
         self.trash.write_lists();
         self.touched.borrow_mut().extend(self.trash.folders());
         for folder in self.touched.borrow().iter() {
             match durable::sync_folder(folder) {
                 Ok(()) => {}
                 // A folder this run removed afterwards.
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound && self.removed_folders.borrow().contains(folder) => {}
+                // Any other folder this run changed must still be there: one that's gone took
+                // the run's changes inside it along.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(Self::undone(format!("The folder {} isn't there anymore, although this sync had just made changes in it.", folder.display())))
+                }
                 Err(e) => return Err(Error::file(folder, e)),
             }
         }
-        if let Err(reason) = self.check_roots() {
-            return Err(Error::Invalid(reason));
-        }
+        self.roots_still_there()?;
         for side in [Side::Source, Side::Destination] {
             let root = self.shores.root(side);
             durable::sync_drive(root).map_err(|e| Error::file(root, e))?;
         }
+        let unrecorded = self.retrace()?;
+        // The look took a while: the folders must still be the same after it.
+        self.roots_still_there()?;
+        for step in outcome.settled.iter_mut().filter(|step| unrecorded.contains(&step.path)) {
+            step.pair = None;
+        }
+        outcome.unrecorded = unrecorded.into_iter().collect();
         Ok(())
+    }
+
+    /// How long the client of a network share or of a drive run by a program may answer a
+    /// look from the details it keeps of an item (an NFS client keeps them for up to a
+    /// minute).
+    const CACHED_DETAILS: Duration = Duration::from_secs(60);
+
+    /// The last look before a run is recorded, once its changes were flushed to the drives:
+    /// what each finished step left must still be there, and what it removed must still be
+    /// gone. A drive pulled out and plugged in again during the run, or a network share whose
+    /// server restarted, can come back under the same folder numbers without the run's last
+    /// changes, which never reached it. Recorded as done, such a run would make the next sync
+    /// take a copy that never arrived for an item removed since, and remove the original. So
+    /// any of this fails the whole run, with `Error::Undone`: the drive may have lost more.
+    ///
+    /// In a two-way job the original a copy was made from must still be there too, as it was
+    /// copied: a file whose drive came back without the person's last change to it would
+    /// read as removed or changed on purpose, and the next sync would remove or replace the
+    /// copy just made, the only one left. A person who moves, renames or removes a synced
+    /// item during the run looks just the same, and that must not fail the run. So only such
+    /// an item is left out of the record (returned here): the next look compares it afresh
+    /// and copies it back rather than remove it. Mirror and Backup keep no such memory, so
+    /// there the originals aren't looked at.
+    ///
+    /// Only what a lost change leaves counts (see `Trace::lost`). And only the items' details
+    /// are read, one look per item and side (see `look_again`), so the look stays quick for
+    /// runs of many files, on network shares too. A stop asked for meanwhile doesn't cut it
+    /// short: a run that wasn't looked at to the end couldn't be recorded at all, and the
+    /// next look would distrust the memory of the last sync.
+    fn retrace(&self) -> Result<BTreeSet<String>> {
+        let mut unrecorded = BTreeSet::new();
+        for footprint in self.footprints.borrow().iter() {
+            for (side, trace) in [(Side::Source, footprint.source), (Side::Destination, footprint.destination)] {
+                match trace {
+                    Trace::Untouched => {}
+                    Trace::Original(_) if !self.care.two_way => {}
+                    // An original that can't be seen can't be vouched for either.
+                    Trace::Original(_) => {
+                        if !matches!(self.look_again(side, footprint), Ok(now) if trace.lost(now.as_ref()).is_none()) {
+                            unrecorded.insert(footprint.key.clone());
+                        }
+                    }
+                    Trace::Left { .. } | Trace::Removed(_) => {
+                        let now = self.look_again(side, footprint)?;
+                        if let Some(loss) = trace.lost(now.as_ref()) {
+                            return Err(self.undone_step(side, &footprint.key, loss));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(unrecorded)
+    }
+
+    /// The item at a finished step's place on `side`, as it is now. Only its details are
+    /// read: on a network share that's one question to the server. A file whose drive may
+    /// still answer from what its client kept is opened instead, so the drive itself answers
+    /// (see `look_fresh`): a server that lost the file wouldn't show it.
+    fn look_again(&self, side: Side, footprint: &Footprint) -> Result<Option<Entry>> {
+        let path = self.path(side, &footprint.key);
+        if self.may_answer_from_cache(side, footprint.at.elapsed()) {
+            self.look_fresh(side, &path)
+        } else {
+            Self::look(&path)
+        }
+    }
+
+    /// Whether `side`'s drive may still answer a look at an item a step finished `ago` from
+    /// what its client kept: a drive that may show changes late, and a step finished less
+    /// than `CACHED_DETAILS` ago. Older items are asked for afresh anyway, so a long run on
+    /// a network share opens only the files of its last minute.
+    fn may_answer_from_cache(&self, side: Side, ago: Duration) -> bool {
+        self.shows_changes_late(side) && ago < Self::CACHED_DETAILS
+    }
+
+    /// The error for a finished step on `side` found undone at the end of the run.
+    fn undone_step(&self, side: Side, key: &str, loss: Loss) -> Error {
+        let (item, place) = (self.spellings.disk(side, key), side.word());
+        Self::undone(match loss {
+            Loss::Missing => format!("“{item}” isn't on the {place} anymore, although this sync had just synced it."),
+            Loss::Replaced => format!("“{item}” on the {place} is the version this sync replaced, back in place of the new one."),
+            Loss::Older => format!("“{item}” on the {place} is a version older than the one this sync replaced, back in place of the new one."),
+            Loss::Back => format!("“{item}”, which this sync removed from the {place}, is back."),
+        })
+    }
+
+    /// The error for a change of this run found undone at its end; `what` says which. It may
+    /// also be someone's doing during the run, which the message leaves open.
+    fn undone(what: String) -> Error {
+        Error::Undone(format!(
+            "{what} If nobody did this on purpose, the drive may have been disconnected for a moment and come back without this sync's last changes."
+        ))
     }
 
     /// Both folders must still be the ones the plan was made for.
     fn check_roots(&self) -> std::result::Result<(), String> {
-        for (side, expected) in [(Side::Source, self.roots.0), (Side::Destination, self.roots.1)] {
-            let root = self.shores.root(side);
-            let same = match (RootId::of(root), expected) {
+        match self.moved_root() {
+            Some(side) => Err(format!(
+                "The {} folder went away or was replaced during the sync (was a drive disconnected?). Charon stopped there.",
+                side.word()
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// `check_roots` at the end of a run: a folder that went away may have taken the run's
+    /// last changes along.
+    fn roots_still_there(&self) -> Result<()> {
+        match self.moved_root() {
+            Some(side) => Err(Error::Undone(format!(
+                "The {} folder went away or was replaced before this sync's changes were all written to its drive (was the drive disconnected?).",
+                side.word()
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The side whose folder isn't the one the plan was made for anymore, if there is one.
+    fn moved_root(&self) -> Option<Side> {
+        [(Side::Source, self.roots.0), (Side::Destination, self.roots.1)].into_iter().find_map(|(side, expected)| {
+            let same = match (RootId::of(self.shores.root(side)), expected) {
                 (Ok(Some(now)), Some(expected)) => now.same_folder(&expected),
                 (Ok(_), _) => true,
                 (Err(_), _) => false,
             };
-            if !same {
-                return Err(format!(
-                    "The {} folder went away or was replaced during the sync (was a drive disconnected?). Charon stopped there.",
-                    side.word()
-                ));
-            }
-        }
-        Ok(())
+            (!same).then_some(side)
+        })
     }
 
-    /// Carries out one step.
-    fn apply(&self, action: &Action, meter: &mut ProgressMeter) -> Result<Done> {
+    /// Carries out one step. `makes_room`: a removal that clears the way for an item of
+    /// another kind.
+    fn apply(&self, action: &Action, makes_room: bool, meter: &mut ProgressMeter) -> Result<Done> {
         match action {
             Action::CreateDir { side, path } => self.create_dir(*side, path),
             Action::Copy { to, path, from, existing, settles_conflict, .. } => {
                 match self.copy(*to, path, from, existing.as_ref(), *settles_conflict, meter)? {
                     Some((bytes, landed)) => {
-                        self.settle(path, Some(Self::pair(*to, landed, *from)));
+                        self.settle_copy(*to, path, *from, landed, *existing);
                         Ok(Done::Copied(1, bytes))
                     }
                     None => Ok(Done::Skipped(format!("changed on the {} side since the scan", to.word()))),
                 }
             }
-            Action::Delete { side, path, entry, other, .. } => self.delete(*side, path, entry, other.as_ref()),
+            Action::Delete { side, path, entry, other, .. } => self.delete(*side, path, entry, other.as_ref(), makes_room),
             Action::KeepBoth { path, source, destination, .. } => self.keep_both(path, source, destination, meter),
             Action::Conflict { .. } => Ok(Done::Nothing),
         }
@@ -639,7 +942,8 @@ impl<'a> Executor<'a> {
         self.prepare_parents(side, key)?;
         self.ensure_folder(side, key)?;
         self.on_its_drive(side, &self.path(side, key))?;
-        self.settle(key, Some(Pair::new(Entry::dir(), Entry::dir())));
+        let traces = Self::on_sides(side, Trace::Left { item: Entry::dir(), replaced: None }, Trace::Original(Entry::dir()));
+        self.settle(key, Some(Pair::new(Entry::dir(), Entry::dir())), traces);
         Ok(Done::Created)
     }
 
@@ -964,8 +1268,10 @@ impl<'a> Executor<'a> {
     /// Removes an item that must still be what the plan saw, while the other side still has
     /// what the plan saw there (`other`, usually nothing): a file restored on the other side
     /// meanwhile stops the removal. A folder only goes when nothing but system clutter is
-    /// left in it.
-    fn delete(&self, side: Side, key: &str, planned: &Entry, other: Option<&Entry>) -> Result<Done> {
+    /// left in it. An item that makes room for one of another kind (`makes_room`) goes into
+    /// the trash even without safe deletes: until the new item has landed in its place, the
+    /// trash may hold the only copy of what was there.
+    fn delete(&self, side: Side, key: &str, planned: &Entry, other: Option<&Entry>, makes_room: bool) -> Result<Done> {
         let there = self.path(side.opposite(), key);
         if !Entry::still(self.look_fresh(side.opposite(), &there)?.as_ref(), other) {
             return Ok(Done::Skipped(format!("changed on the {} side since the scan", side.opposite().word())));
@@ -979,7 +1285,7 @@ impl<'a> Executor<'a> {
             Parents::Real => {}
             Parents::Missing => {
                 if settles {
-                    self.settle(key, None);
+                    self.settle_removal(side, key, planned);
                 }
                 return Ok(Done::Nothing);
             }
@@ -989,7 +1295,7 @@ impl<'a> Executor<'a> {
         match self.look_fresh(side, &target)? {
             None => {
                 if settles {
-                    self.settle(key, None);
+                    self.settle_removal(side, key, planned);
                 }
                 return Ok(Done::Nothing);
             }
@@ -1000,7 +1306,7 @@ impl<'a> Executor<'a> {
         }
         let done = if planned.is_dir() {
             self.remove_folder(side, &relative, &target)?
-        } else if self.remove(side, &relative, &target, self.care.safe_delete, Some(planned))? {
+        } else if self.remove(side, &relative, &target, self.care.safe_delete || makes_room, Some(planned))? {
             self.destroyed_on(side, key);
             Done::Deleted
         } else {
@@ -1009,7 +1315,7 @@ impl<'a> Executor<'a> {
         if matches!(done, Done::Deleted) {
             self.touch(&target);
             if settles {
-                self.settle(key, None);
+                self.settle_removal(side, key, planned);
             }
         }
         Ok(done)
@@ -1033,13 +1339,18 @@ impl<'a> Executor<'a> {
         self.touch(&destination_path);
         let moved = Self::look(&aside)?.ok_or_else(|| Error::Invalid(format!("{} vanished", aside.display())))?;
 
+        // Should the rename and the copy be lost, the destination's version would be back
+        // under the original name: that is the version this copy replaced.
         let carried = self.copy(Side::Destination, key, source, None, false, meter)?;
         if let Some((_, landed)) = carried {
-            self.settle(key, Some(Pair::new(*source, landed)));
+            self.settle_copy(Side::Destination, key, *source, landed, Some(*destination));
         }
         let back = self.copy(Side::Source, &conflict_key, &moved, None, false, meter)?;
         if let Some((_, landed)) = back {
-            self.settle(&conflict_key, Some(Pair::new(landed, moved)));
+            // Both sides of the conflict copy are this run's doing: the copy on the source,
+            // and the destination's version renamed aside.
+            let traces = (Trace::Left { item: landed, replaced: None }, Trace::Left { item: moved, replaced: None });
+            self.settle(&conflict_key, Some(Pair::new(landed, moved)), traces);
         }
         match (carried, back) {
             (Some((a, _)), Some((b, _))) => Ok(Done::Copied(2, a + b)),
@@ -1158,7 +1469,10 @@ impl<'a> Executor<'a> {
         self.real_folders.borrow_mut().clear();
         Self::make_writable(target);
         match fs::remove_dir(target) {
-            Ok(()) => Ok(Done::Deleted),
+            Ok(()) => {
+                self.removed_folders.borrow_mut().insert(target.to_path_buf());
+                Ok(Done::Deleted)
+            }
             // Something appeared inside at the last moment: the folder stays.
             Err(e) if fs::read_dir(target).is_ok_and(|mut items| items.next().is_some()) => {
                 log::info!("kept {}: {e}", target.display());
@@ -1170,8 +1484,30 @@ impl<'a> Executor<'a> {
 
     // ---------------------------------------------------------------- records
 
-    fn settle(&self, key: &str, pair: Option<Pair>) {
+    /// Records what a finished step left at `key`: the pair for the two-way memory, and what
+    /// it left on the source and on the destination for the last look (see `retrace`).
+    fn settle(&self, key: &str, pair: Option<Pair>, (source, destination): (Trace, Trace)) {
         self.settled.borrow_mut().push(Settled { path: key.to_string(), pair });
+        self.footprints.borrow_mut().push(Footprint { key: key.to_string(), source, destination, at: Instant::now() });
+    }
+
+    /// A copy onto `to` of `from`, which landed there as `landed` in the place of `replaced`.
+    fn settle_copy(&self, to: Side, key: &str, from: Entry, landed: Entry, replaced: Option<Entry>) {
+        let traces = Self::on_sides(to, Trace::Left { item: landed, replaced }, Trace::Original(from));
+        self.settle(key, Some(Self::pair(to, landed, from)), traces);
+    }
+
+    /// The item `removed`, gone from `side`, while the other side has nothing there.
+    fn settle_removal(&self, side: Side, key: &str, removed: &Entry) {
+        self.settle(key, None, Self::on_sides(side, Trace::Removed(*removed), Trace::Untouched));
+    }
+
+    /// `here` on `side` and `there` on the other side, as (source, destination).
+    fn on_sides(side: Side, here: Trace, there: Trace) -> (Trace, Trace) {
+        match side {
+            Side::Source => (here, there),
+            Side::Destination => (there, here),
+        }
     }
 
     /// The pair for a copy onto `to`: what landed there, and what came from the other side.
@@ -1207,10 +1543,8 @@ impl<'a> Executor<'a> {
     /// `look`, but on a drive that may show changes late (a network share, a cloud drive) a
     /// file is opened and asked directly: its listing can show another computer's change late.
     fn look_fresh(&self, side: Side, path: &Path) -> Result<Option<Entry>> {
-        let seen = Self::look(path)?;
-        let late = self.spellings.snapshot(side).volume().is_some_and(|v| v.shows_changes_late());
-        match seen {
-            Some(entry) if late && entry.is_file() => match fs::File::open(path).and_then(|file| file.metadata()) {
+        match Self::look(path)? {
+            Some(entry) if self.shows_changes_late(side) && entry.is_file() => match fs::File::open(path).and_then(|file| file.metadata()) {
                 Ok(meta) if meta.is_file() => Ok(Some(Entry::file(meta.len(), Scanner::modified_ms(&meta)).changed_at(Scanner::change_time(&meta)))),
                 Ok(_) => Err(Error::Changed("changed since the scan".into())),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -1218,6 +1552,11 @@ impl<'a> Executor<'a> {
             },
             other => Ok(other),
         }
+    }
+
+    /// Whether `side`'s drive may show changes late (a network share, a cloud drive).
+    fn shows_changes_late(&self, side: Side) -> bool {
+        self.spellings.snapshot(side).volume().is_some_and(|v| v.shows_changes_late())
     }
 
     /// Whether extended attributes are worth copying onto `side`'s drive.
@@ -1455,7 +1794,7 @@ mod tests {
         assert_eq!(spell.disk(Side::Destination, "caf\u{e9}/menu.txt"), "caf\u{e9}/menu.txt");
     }
 
-    const KEEP: Care = Care { safe_delete: true, keep_replaced: true };
+    const KEEP: Care = Care { safe_delete: true, keep_replaced: true, two_way: true };
 
     /// Two empty folders for an executor to work in.
     fn shores() -> (tempfile::TempDir, Shores) {
@@ -1571,7 +1910,7 @@ mod tests {
     fn a_removal_leaves_a_file_that_changed_at_the_last_moment() {
         let empty = Snapshot::new();
         let cancel = AtomicBool::new(false);
-        for (care, keep) in [(KEEP, true), (Care { safe_delete: false, keep_replaced: false }, false)] {
+        for (care, keep) in [(KEEP, true), (Care { safe_delete: false, keep_replaced: false, two_way: false }, false)] {
             let (_tmp, shores) = shores();
             let executor = Executor::new(&shores, &empty, &empty, care, &cancel);
             let target = shores.destination.join("plan.txt");
@@ -1601,7 +1940,7 @@ mod tests {
         }
         let empty = Snapshot::new();
         let cancel = AtomicBool::new(false);
-        for care in [KEEP, Care { safe_delete: false, keep_replaced: false }] {
+        for care in [KEEP, Care { safe_delete: false, keep_replaced: false, two_way: false }] {
             let (_tmp, shores) = shores();
             let executor = Executor::new(&shores, &empty, &empty, care, &cancel);
             let folder = (0..6).map(|i| format!("{i}{}", "x".repeat(50))).collect::<Vec<_>>().join("/");
@@ -1654,6 +1993,122 @@ mod tests {
         // An item that's simply new since the scan is listed under its own name.
         assert!(executor.not_taken(Side::Destination, "new.txt").is_ok());
         assert!(executor.not_taken(Side::Destination, "missing.txt").is_ok());
+    }
+
+    /// Only what a lost change leaves counts against a finished step: changes made after it
+    /// (an edit, a time a drive rounded, a change time a rename moved, a new file under a
+    /// removed name) are for the next look.
+    #[test]
+    fn only_what_a_lost_change_leaves_counts_against_a_step() {
+        let old = Entry::file(3, 1_600_000_000_000);
+        let copy = Entry::file(11, 1_700_000_000_000).changed_at(5);
+        let left = Trace::Left { item: copy, replaced: Some(old) };
+        assert!(matches!(left.lost(None), Some(Loss::Missing)));
+        assert!(matches!(left.lost(Some(&Entry::dir())), Some(Loss::Missing)));
+        assert!(matches!(left.lost(Some(&old)), Some(Loss::Replaced)));
+        assert!(left.lost(Some(&copy)).is_none());
+        assert!(left.lost(Some(&copy.changed_at(9))).is_none(), "a rename moved its change time");
+        assert!(left.lost(Some(&Entry::file(11, 1_700_000_001_000))).is_none(), "a drive rounded its time");
+        assert!(left.lost(Some(&Entry::file(40, 1_800_000_000_000))).is_none(), "edited after it landed");
+        // A copy that looks just like the version it replaced, on a drive without trusted
+        // change times: only its presence tells.
+        let alike = Trace::Left { item: Entry::file(3, 1_600_000_000_000), replaced: Some(old) };
+        assert!(alike.lost(Some(&old)).is_none());
+
+        let removed = Trace::Removed(old);
+        assert!(removed.lost(None).is_none());
+        assert!(matches!(removed.lost(Some(&old.changed_at(7))), Some(Loss::Back)));
+        assert!(removed.lost(Some(&Entry::file(20, 1_800_000_000_000))).is_none(), "a new file under the old name");
+        assert!(matches!(Trace::Removed(Entry::dir()).lost(Some(&Entry::dir())), Some(Loss::Back)));
+        assert!(Trace::Untouched.lost(Some(&old)).is_none());
+    }
+
+    /// An encrypted container keeps its size and time when it's edited: where the scan
+    /// trusted the drive's change times, the replaced version is told from the copy by its
+    /// change time, which only moves forward.
+    #[test]
+    fn a_replaced_version_with_the_same_size_and_time_is_told_by_its_change_time() {
+        let (size, time) = (4_096, 1_600_000_000_000);
+        let replaced = Entry::file(size, time).changed_at(100);
+        let copy = Entry::file(size, time).changed_at(300);
+        let left = Trace::Left { item: copy, replaced: Some(replaced) };
+        assert!(matches!(left.lost(Some(&replaced)), Some(Loss::Replaced)), "the replaced version, untouched");
+        assert!(matches!(left.lost(Some(&Entry::file(size, time).changed_at(50))), Some(Loss::Older)), "a version from before it");
+        assert!(left.lost(Some(&copy)).is_none());
+        assert!(left.lost(Some(&copy.changed_at(400))).is_none(), "edited after it landed, or renamed");
+        // The copy has the replaced version's change time (a drive that keeps it in whole
+        // seconds): the change time tells nothing.
+        let same_second = Trace::Left { item: replaced, replaced: Some(replaced) };
+        assert!(same_second.lost(Some(&replaced)).is_none());
+        // Without a change time the scan trusted (FAT, exFAT, network shares), it isn't used.
+        let untimed = Trace::Left { item: copy, replaced: Some(replaced.changed_at(0)) };
+        assert!(untimed.lost(Some(&replaced)).is_none());
+    }
+
+    /// The original a copy was made from: gone, of another kind, or a version from before
+    /// the one copied counts; saved again after the copy doesn't.
+    #[test]
+    fn an_original_counts_as_lost_when_gone_or_older_than_what_was_copied() {
+        let copied = Entry::file(10, 1_600_000_000_000).changed_at(200);
+        let original = Trace::Original(copied);
+        assert!(matches!(original.lost(None), Some(Loss::Missing)));
+        assert!(matches!(original.lost(Some(&Entry::dir())), Some(Loss::Missing)));
+        assert!(matches!(original.lost(Some(&Entry::file(8, 1_500_000_000_000).changed_at(100))), Some(Loss::Older)));
+        assert!(matches!(original.lost(Some(&Entry::file(8, 1_500_000_000_000).changed_at(200))), Some(Loss::Older)), "saved in the same step of the drive's clock");
+        assert!(matches!(original.lost(Some(&copied.changed_at(150))), Some(Loss::Older)), "a look-alike version from before");
+        assert!(original.lost(Some(&copied)).is_none());
+        assert!(original.lost(Some(&Entry::file(12, 1_500_000_000_000).changed_at(300))).is_none(), "saved again with an old time");
+        // Without a change time the scan trusted, only a missing original counts.
+        let untimed = Trace::Original(copied.changed_at(0));
+        assert!(untimed.lost(Some(&Entry::file(8, 1_500_000_000_000).changed_at(100))).is_none());
+        assert!(matches!(untimed.lost(None), Some(Loss::Missing)));
+        assert!(Trace::Original(Entry::dir()).lost(Some(&Entry::dir())).is_none());
+    }
+
+    /// A copy that failed holds every removal on its side. One left for the next sync
+    /// because its file changed holds only the removals there that could be its old copy:
+    /// the same name, or the same size and time.
+    #[test]
+    fn a_copy_that_changed_holds_only_what_could_be_its_old_copy() {
+        let photo = Entry::file(100, 1_600_000_000_000);
+        let removal = |side: Side, path: &str, entry: Entry| Action::Delete { side, path: path.into(), item: entry.kind, entry, other: None };
+        let mut holds = Holds::default();
+        let edited = Action::copy(Side::Destination, "Photos 2025/d.jpg", photo, None);
+        holds.note(&edited, &Ok(Done::Skipped("changed on the destination side since the scan".into())));
+        holds.note(&Action::copy(Side::Destination, "app/activity.log", Entry::file(7, 1), None), &Err(Error::Changed("changed".into())));
+        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/d.jpg", Entry::file(1, 1))), Some(Held::OldCopyOf("Photos 2025/d.jpg"))));
+        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/renamed.jpg", photo)), Some(Held::OldCopyOf("Photos 2025/d.jpg"))));
+        assert!(holds.of(&removal(Side::Destination, "old-project/big.mov", Entry::file(9_000, 5))).is_none());
+        assert!(holds.of(&removal(Side::Destination, "old-project", Entry::dir())).is_none());
+        assert!(holds.of(&removal(Side::Source, "Photos/d.jpg", photo)).is_none(), "the other side");
+        assert!(holds.of(&edited).is_none(), "only removals wait");
+
+        holds.note(&Action::copy(Side::Destination, "a.jpg", photo, None), &Err(Error::Invalid("the drive failed".into())));
+        assert!(matches!(holds.of(&removal(Side::Destination, "old-project/big.mov", Entry::file(9_000, 5))), Some(Held::Failed)));
+        assert!(holds.of(&removal(Side::Source, "old-project/big.mov", Entry::file(9_000, 5))).is_none());
+    }
+
+    /// The last look opens a file only where its drive may still answer from what its
+    /// client kept: a drive that shows changes late, for an item settled in the last minute.
+    #[test]
+    fn the_last_look_opens_only_recent_files_on_drives_that_show_changes_late() {
+        let (_tmp, shores) = shores();
+        let mut share = Snapshot::new();
+        share.facts_mut().volume = Some(Volume {
+            kind: FsKind::Smb,
+            fs: "smbfs".into(),
+            mount: "/Volumes/share".into(),
+            name: "share".into(),
+            network: true,
+            case_sensitive: false,
+            refuses_links: false,
+        });
+        let local = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &local, &share, KEEP, &cancel);
+        assert!(executor.may_answer_from_cache(Side::Destination, Duration::from_secs(5)));
+        assert!(!executor.may_answer_from_cache(Side::Destination, Duration::from_secs(120)));
+        assert!(!executor.may_answer_from_cache(Side::Source, Duration::from_secs(5)));
     }
 
     #[test]

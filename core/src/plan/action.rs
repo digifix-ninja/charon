@@ -127,16 +127,12 @@ impl Action {
         }
     }
 
-    /// The order steps run in (see `Plan::ordered`). `makes_room`: a removal that clears the
-    /// way for an item of another kind.
-    fn stage(&self, makes_room: bool) -> (u8, isize) {
-        let depth = Keys::depth(self.path()) as isize;
+    /// The side a step changes, for the steps that change one side only.
+    fn side(&self) -> Option<Side> {
         match self {
-            Action::Delete { .. } if makes_room => (0, -depth),
-            Action::CreateDir { .. } => (1, depth),
-            Action::Copy { .. } | Action::KeepBoth { .. } => (2, 0),
-            Action::Delete { .. } => (3, -depth),
-            Action::Conflict { .. } => (4, 0),
+            Action::CreateDir { side, .. } | Action::Delete { side, .. } => Some(*side),
+            Action::Copy { to, .. } => Some(*to),
+            Action::KeepBoth { .. } | Action::Conflict { .. } => None,
         }
     }
 
@@ -150,6 +146,59 @@ impl Action {
             Action::Conflict { .. } => 4,
             Action::CreateDir { .. } => 5,
             Action::Copy { .. } => 6,
+        }
+    }
+}
+
+/// A place where an item of another kind takes an item's place (a folder that became a
+/// file, a file where a new folder goes): the item there has to go first, with everything
+/// inside it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Clearing<'a> {
+    pub side: Side,
+    pub key: &'a str,
+}
+
+impl Clearing<'_> {
+    /// Whether `action` changes this place: a removal at or inside it, or a new folder or a
+    /// copy that goes there.
+    pub fn holds(&self, action: &Action) -> bool {
+        action.side() == Some(self.side) && Keys::is_within(action.path(), self.key)
+    }
+}
+
+/// One step of a plan in the order it runs (see `Plan::ordered`).
+#[derive(Debug, Clone, Copy)]
+pub struct Step<'a> {
+    pub action: &'a Action,
+    /// The place the step clears or fills, when an item of another kind takes an item's
+    /// place there.
+    pub clearing: Option<Clearing<'a>>,
+}
+
+impl<'a> Step<'a> {
+    /// A removal that clears the way for an item of another kind.
+    pub fn makes_room(&self) -> bool {
+        self.clearing.is_some() && matches!(self.action, Action::Delete { .. })
+    }
+
+    /// A new folder or a copy that goes where an item of another kind has to go first.
+    pub fn takes_place(&self) -> bool {
+        self.clearing.is_some() && !matches!(self.action, Action::Delete { .. })
+    }
+
+    /// Where the step goes in the order of `Plan::ordered`: its stage, then, in a place that
+    /// changes kind, the place and the step's part there, then its depth.
+    fn rank(&self) -> (u8, &'a str, Option<Side>, u8, isize) {
+        let depth = Keys::depth(self.action.path()) as isize;
+        match (self.action, self.clearing) {
+            (Action::CreateDir { .. }, None) => (0, "", None, 0, depth),
+            (Action::Copy { .. } | Action::KeepBoth { .. }, None) => (1, "", None, 0, 0),
+            (Action::Delete { .. }, Some(clearing)) => (2, clearing.key, Some(clearing.side), 0, -depth),
+            (Action::CreateDir { .. }, Some(clearing)) => (2, clearing.key, Some(clearing.side), 1, depth),
+            (_, Some(clearing)) => (2, clearing.key, Some(clearing.side), 2, 0),
+            (Action::Delete { .. }, None) => (3, "", None, 0, -depth),
+            (Action::Conflict { .. }, None) => (4, "", None, 0, 0),
         }
     }
 }
@@ -199,45 +248,46 @@ impl Plan {
 
     /// The steps in the order they must run:
     ///
-    /// 1. removals that make room for an item of another kind (a folder that became a file),
-    ///    with everything inside them, deepest first;
-    /// 2. new folders, from the top down;
-    /// 3. copies;
+    /// 1. new folders, from the top down;
+    /// 2. copies;
+    /// 3. each place where an item of another kind takes an item's place (a folder that
+    ///    became a file, a file where a new folder goes), one place after the other: the
+    ///    item there with everything inside it, deepest first, then the new folders and the
+    ///    copies that take its place;
     /// 4. every other removal, deepest first.
     ///
     /// Removing last means that a run which stops halfway (cancelled, a drive pulled out, a
     /// full disk) never leaves an item that was moved or renamed on one side with only one
-    /// copy: the new place is filled before the old one is cleared.
+    /// copy: the new place is filled before the old one is cleared. An item that has to
+    /// make room goes as late as it can for the same reason: after every other copy, right
+    /// before what takes its place (and `Executor::run` holds it back like any removal when
+    /// copies failed).
     pub fn ordered(&self) -> Vec<&Action> {
-        self.ordered_steps().into_iter().map(|(action, _)| action).collect()
+        self.ordered_steps().into_iter().map(|step| step.action).collect()
     }
 
-    /// `ordered`, with whether each step is a removal that makes room for an item of
-    /// another kind (step 1 above).
-    pub fn ordered_steps(&self) -> Vec<(&Action, bool)> {
-        let clearing: Vec<(Side, &str)> = self
+    /// `ordered`, with the place each step clears or fills when an item of another kind
+    /// takes an item's place (stage 3 above).
+    pub fn ordered_steps(&self) -> Vec<Step<'_>> {
+        let clearings = self.clearings();
+        let mut steps: Vec<Step<'_>> = self
             .actions
+            .iter()
+            .map(|action| Step { action, clearing: clearings.iter().copied().find(|clearing| clearing.holds(action)) })
+            .collect();
+        steps.sort_by_key(Step::rank); // stable: keeps path order within a stage
+        steps
+    }
+
+    /// The places where an item of another kind takes an item's place.
+    pub fn clearings(&self) -> Vec<Clearing<'_>> {
+        self.actions
             .iter()
             .filter_map(|a| match a {
-                Action::Delete { side, path, other: Some(_), .. } => Some((*side, path.as_str())),
+                Action::Delete { side, path, other: Some(_), .. } => Some(Clearing { side: *side, key: path }),
                 _ => None,
             })
-            .collect();
-        let makes_room = |a: &Action| match a {
-            Action::Delete { side, path, .. } => clearing.iter().any(|(s, top)| s == side && Keys::is_within(path, top)),
-            _ => false,
-        };
-        let mut steps: Vec<(u8, isize, &Action, bool)> = self
-            .actions
-            .iter()
-            .map(|a| {
-                let room = makes_room(a);
-                let (stage, depth) = a.stage(room);
-                (stage, depth, a, room)
-            })
-            .collect();
-        steps.sort_by_key(|(stage, depth, _, _)| (*stage, *depth)); // stable: keeps path order within a stage
-        steps.into_iter().map(|(_, _, a, room)| (a, room)).collect()
+            .collect()
     }
 
     /// The steps in the order a review shows them.
@@ -360,5 +410,68 @@ impl PlanSummary {
     /// Items that would change (what "pending" counts).
     pub fn changes(&self) -> u64 {
         self.copies + self.new_folders + self.deletes + self.kept_both
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn order(plan: &Plan) -> Vec<String> {
+        plan.ordered()
+            .iter()
+            .map(|action| {
+                let kind = match action {
+                    Action::CreateDir { .. } => "new folder",
+                    Action::Copy { .. } => "copy",
+                    Action::Delete { .. } => "remove",
+                    Action::KeepBoth { .. } => "keep both",
+                    Action::Conflict { .. } => "conflict",
+                };
+                format!("{kind} {}", action.path())
+            })
+            .collect()
+    }
+
+    /// `Photos` renamed to `Photos 2025` in the source, and a file named `Photos` put in its
+    /// place: the folder's items go after every other copy, right before the file takes
+    /// their folder's place, and every other removal comes last.
+    #[test]
+    fn an_item_of_another_kind_takes_its_place_after_every_other_copy() {
+        let photo = Entry::file(1, 1);
+        let mut plan = Plan::default();
+        plan.push(Action::delete(Side::Destination, "Photos", Entry::dir(), Some(photo)));
+        plan.push(Action::copy(Side::Destination, "Photos", photo, None));
+        plan.push(Action::delete(Side::Destination, "Photos/a.jpg", photo, None));
+        plan.push(Action::delete(Side::Destination, "old.txt", photo, None));
+        plan.push(Action::CreateDir { side: Side::Destination, path: "Photos 2025".into() });
+        plan.push(Action::copy(Side::Destination, "Photos 2025/a.jpg", photo, None));
+        assert_eq!(
+            order(&plan),
+            vec!["new folder Photos 2025", "copy Photos 2025/a.jpg", "remove Photos/a.jpg", "remove Photos", "copy Photos", "remove old.txt"]
+        );
+        let steps = plan.ordered_steps();
+        let roles: Vec<(bool, bool)> = steps.iter().map(|step| (step.makes_room(), step.takes_place())).collect();
+        assert_eq!(roles, vec![(false, false), (false, false), (true, false), (true, false), (false, true), (false, false)]);
+    }
+
+    /// A file where a new folder goes: the file goes first, then the folder is made, then
+    /// what goes into it is copied.
+    #[test]
+    fn a_new_folder_in_a_files_place_is_made_once_the_file_is_gone() {
+        let note = Entry::file(1, 1);
+        let mut plan = Plan::default();
+        plan.push(Action::CreateDir { side: Side::Source, path: "notes".into() });
+        plan.push(Action::CreateDir { side: Side::Source, path: "notes/2025".into() });
+        plan.push(Action::copy(Side::Source, "notes/2025/june.txt", note, None));
+        plan.push(Action::copy(Side::Source, "notes/todo.txt", note, None));
+        plan.push(Action::delete(Side::Source, "notes", note, Some(Entry::dir())));
+        plan.push(Action::copy(Side::Source, "readme.txt", note, None));
+        assert_eq!(
+            order(&plan),
+            vec!["copy readme.txt", "remove notes", "new folder notes", "new folder notes/2025", "copy notes/2025/june.txt", "copy notes/todo.txt"]
+        );
+        // The other side's steps never belong to this side's place.
+        assert!(!Clearing { side: Side::Destination, key: "notes" }.holds(&plan.actions[0]));
     }
 }

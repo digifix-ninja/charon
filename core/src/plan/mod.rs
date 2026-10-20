@@ -1,6 +1,7 @@
 //! Deciding what has to cross, and which way.
 //!
-//! * `action.rs`  – one step (`Action`), a `Note`, a whole `Plan` and its `PlanSummary`
+//! * `action.rs`  – one step (`Action`), a `Note`, a whole `Plan`, the order its steps run in
+//!   (`Step`) and its `PlanSummary`
 //! * `ground.rs`  – the places a plan must not touch, shared by both planners
 //! * `one_way.rs` – `OneWayPlanner` for Mirror and Backup
 //! * `two_way.rs` – `TwoWayPlanner`, which compares both sides with the last synced state
@@ -18,7 +19,7 @@ mod resolve;
 mod two_way;
 mod units;
 
-pub use action::{Action, Note, NoteKind, Plan, PlanSummary, Side};
+pub use action::{Action, Clearing, Note, NoteKind, Plan, PlanSummary, Side, Step};
 pub use baseline::{Baseline, Pair, Settled};
 pub use guard::{Footprints, Guard, LongCount, Recent};
 pub use one_way::OneWayPlanner;
