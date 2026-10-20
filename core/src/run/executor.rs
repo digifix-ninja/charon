@@ -24,7 +24,7 @@ use crate::run::{Copier, ProgressMeter, Room, Trash};
 use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
@@ -313,6 +313,9 @@ struct UnitSteps<'p> {
     sides: BTreeSet<Side>,
     /// The folders the plan makes in it, with the side each is made on.
     made: BTreeSet<(Side, &'p str)>,
+    /// Whether the plan removes something of it, or clears a place in it for an item of
+    /// another kind (see `Executor::starts_carry`).
+    removes: bool,
 }
 
 /// What carrying an app library or database did to each of its carried steps, and why its
@@ -456,8 +459,9 @@ impl<'a> Executor<'a> {
     }
 
     /// Runs every step of `plan` in order. The files of an app library or a database are
-    /// carried together, when its first step other than a new folder comes up (see
-    /// `carry_unit`); its other steps wait when they couldn't be.
+    /// carried together (see `carry_unit`): when its first step other than a new folder comes
+    /// up, or after the plan's copies when the plan removes something of it (see
+    /// `starts_carry`). Its other steps wait when they couldn't be.
     pub fn run(&self, plan: &Plan, meter: &mut ProgressMeter) -> Outcome {
         let mut outcome = Outcome::default();
         // A side where a copy didn't land keeps what this run would remove there that could
@@ -482,17 +486,30 @@ impl<'a> Executor<'a> {
                 outcome.stopped = Some(reason);
                 break;
             }
+            // The libraries and databases still to be carried go before the plan's first plain
+            // removal: what it removes could be the other copy of what they bring (see
+            // `starts_carry`).
+            if matches!(action, Action::Delete { .. }) && step.clearing.is_none() {
+                let waiting: Vec<(&Unit, &UnitSteps)> = units.iter().filter(|(unit, steps)| steps.removes && !carried.contains_key(unit)).collect();
+                for (unit, steps) in waiting {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        outcome.cancelled = true;
+                        break 'steps;
+                    }
+                    if let Err(reason) = self.check_roots() {
+                        outcome.stopped = Some(reason);
+                        break 'steps;
+                    }
+                    if self.carry(unit, steps, &mut carried, &mut outcome, &mut holds, meter).is_break() {
+                        break 'steps;
+                    }
+                }
+            }
             let still_taken = step.clearing.filter(|clearing| step.takes_place() && !cleared.contains(clearing));
             let mut waits = None;
             if let Some((unit, steps)) = self.unit_of(action).and_then(|unit| units.get_key_value(&unit)) {
-                if !carried.contains_key(unit) && Self::starts_carry(&step) {
-                    let (results, why) = self.carry_unit(unit, steps, &holds, meter);
-                    carried.insert(unit, why);
-                    for (step, result) in results {
-                        if self.record(&mut outcome, &mut holds, step, result).is_break() {
-                            break 'steps;
-                        }
-                    }
+                if !carried.contains_key(unit) && Self::starts_carry(&step, steps) && self.carry(unit, steps, &mut carried, &mut outcome, &mut holds, meter).is_break() {
+                    break;
                 }
                 if Self::carried_along(&step) {
                     continue;
@@ -675,8 +692,8 @@ impl<'a> Executor<'a> {
     }
 
     /// The app libraries and databases this plan changes, each with its steps.
-    fn units<'p>(&self, plan: &'p Plan) -> HashMap<Unit, UnitSteps<'p>> {
-        let mut units: HashMap<Unit, UnitSteps<'p>> = HashMap::new();
+    fn units<'p>(&self, plan: &'p Plan) -> BTreeMap<Unit, UnitSteps<'p>> {
+        let mut units: BTreeMap<Unit, UnitSteps<'p>> = BTreeMap::new();
         for step in plan.ordered_steps() {
             let action = step.action;
             if matches!(action, Action::Conflict { .. }) {
@@ -695,6 +712,7 @@ impl<'a> Executor<'a> {
             if let Action::Delete { side, .. } = action {
                 steps.sides.insert(*side);
             }
+            steps.removes |= matches!(action, Action::Delete { .. }) || step.clearing.is_some();
             if Self::carried_along(&step) {
                 steps.carried.push(action);
             }
@@ -714,10 +732,31 @@ impl<'a> Executor<'a> {
             )
     }
 
-    /// Whether an app library or database is carried when this step of it comes up: any
-    /// step but a plain new folder, which its files may need first.
-    fn starts_carry(step: &Step) -> bool {
-        !matches!(step.action, Action::CreateDir { .. }) || step.clearing.is_some()
+    /// Whether an app library or database is carried when this step of it comes up. One the
+    /// plan only copies into is carried at its first step but a plain new folder, which its
+    /// files may need first. One the plan removes something of, or clears a place in, waits
+    /// for every plain copy of the plan, like any removal (see `Plan::ordered`): it's carried
+    /// at its first removal or step in a cleared place, or before the plan's first plain
+    /// removal if that comes sooner (see `run`). So a copy that failed or changed holds back
+    /// what it removes (see `Holds`), a run stopped before then leaves it as it was, and what
+    /// it brings still lands before anything else goes that could be its other copy.
+    fn starts_carry(step: &Step, steps: &UnitSteps) -> bool {
+        if steps.removes {
+            matches!(step.action, Action::Delete { .. }) || step.clearing.is_some()
+        } else {
+            !matches!(step.action, Action::CreateDir { .. })
+        }
+    }
+
+    /// Carries `unit` (see `carry_unit`), notes that it was, and adds what each of its steps
+    /// did to the outcome. `Break` when the whole run stops there.
+    fn carry<'u>(&self, unit: &'u Unit, steps: &UnitSteps, carried: &mut HashMap<&'u Unit, Option<String>>, outcome: &mut Outcome, holds: &mut Holds, meter: &mut ProgressMeter) -> ControlFlow<()> {
+        let (results, why) = self.carry_unit(unit, steps, holds, meter);
+        carried.insert(unit, why);
+        for (step, result) in results {
+            self.record(outcome, holds, step, result)?;
+        }
+        ControlFlow::Continue(())
     }
 
     /// Carries the files of one app library or database together (see `Unit`): a mix of two
