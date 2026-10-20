@@ -745,7 +745,8 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   record; `Baselines::tokens` keeps each memory file's header, its folders and tokens, once read
   or saved, so a memory file is read at most once while Charon runs, not at every other job's
   look), so the first sync of such a job isn't refused. Either way it's the survey's
-  **refusal**: the list can't be confirmed, and an automatic run is held.
+  **refusal**: the list can't be confirmed, and an automatic run is held. A list that settles one
+  conflict (`prepare_resolution`) keeps it too, whichever way it was found.
 - **Copies of a `.charon` folder.** A marker found where it doesn't belong may be a copy: the
   person copied a job's folder, hidden `.charon` folder and all (restoring a backup, say).
   `Marker::origin` reads both markers again: two different ones are two folders. Two identical
@@ -829,16 +830,20 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   dialog's toast says "Confirmed. “job” syncs as soon as “X” is done." `start_confirmed` tries it
   again at once when a sync of this Charon ends (`start_waiting_confirmed`), and from the
   autopilot every 5 seconds (`CONFIRMED_RETRY`), since another Charon says nothing when it's
-  done; *Pause everything* doesn't hold it back, as the person confirmed it. A list that waited
-  goes through every check of *Confirm* except its age and the changes made in the folders
-  since: it was confirmed in time, and each step still checks its items. A folder away for the
-  moment, the job's own sync, or another sync still at work keeps it waiting. One that fails any
-  other check (a folder that isn't the one the list was made for, the job changed or synced, an
-  older Charon at work) is dropped, and the row says why ("The list you confirmed couldn't be
-  carried out after all." followed by the reason). *Stop* and pausing the job (`cancel`, which
-  drops `JobRuntime::confirmed` but keeps the list) and discarding the list (`discard_review`)
-  call it off, and the job's log says so. Editing the job, *Leave this folder out* or a newer
-  list also call it off (`JobRuntime::forget_review`), without a log line of their own about it.
+  done. A list that waited goes through every check of *Confirm* except its age and the changes
+  made in the folders since: it was confirmed in time, and each step still checks its items. A
+  folder away for the moment, the job's own sync, or another sync still at work keeps it
+  waiting. One that fails any other check (a folder that isn't the one the list was made for, the
+  job changed or synced, an older Charon at work) is dropped, and the row says why ("The list you
+  confirmed couldn't be carried out after all." followed by the reason). *Stop* and pausing the
+  job (`cancel`, which drops `JobRuntime::confirmed` but keeps the list), *Pause everything*
+  (`call_off_all_confirmed`: the person now wants nothing to start without them) and discarding
+  the list (`discard_review`) call it off, and the job's log says so. A list confirmed while
+  *Pause everything* is on still syncs, like any list the person confirms. Editing the job,
+  *Leave this folder out* or a newer list also call it off (`JobRuntime::forget_review`), without
+  a log line of their own about it. Calling off wins even when it comes just as the sync starts:
+  `carry_out` starts a list that waited only if it's still `JobRuntime::confirmed`, checked under
+  the same lock that `cancel` takes.
   It lives only in `JobRuntime`: quitting Charon drops it, and after a restart the job is where
   it was before the list was confirmed. While it waits, runs nobody looks at are refused, and
   the row (`JobView::confirmed`) has no `waiting`: it shows *Pending* when its look found changes,

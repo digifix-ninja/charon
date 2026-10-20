@@ -119,21 +119,38 @@ impl Engine {
     /// Stops a running sync (what's already carried stays), or calls off a confirmed one
     /// that waits for another sync. The next sync of the job waits for the person's OK.
     pub fn cancel(&self, id: &JobId) {
+        // Under one lock: a confirmed sync that starts now either sees it called off, or
+        // runs with its stop flag set.
         let called_off = self.runtime().get_mut(id).is_some_and(|rt| {
             if let Some(cancel) = &rt.cancel {
                 cancel.store(true, Ordering::Relaxed);
                 rt.stopped_by_person = true;
             }
-            let waited = rt.confirmed.take().is_some();
-            if waited {
-                rt.waiting_for = None;
-            }
-            waited
+            rt.call_off_confirmed()
         });
         if called_off {
-            self.inner.journal.info(id, "the confirmed sync that waited for another sync was called off");
-            self.publish(id);
+            self.called_off(id, "");
         }
+    }
+
+    /// Calls off every confirmed sync that waits for another sync (*Pause everything*: the
+    /// person wants nothing to start without them now). A sync that already started isn't
+    /// stopped, as *Pause everything* doesn't stop syncs at work.
+    pub(crate) fn call_off_all_confirmed(&self, why: &str) {
+        let called_off: Vec<JobId> = self
+            .runtime()
+            .iter_mut()
+            .filter_map(|(id, rt)| (!rt.is_running() && rt.call_off_confirmed()).then(|| id.clone()))
+            .collect();
+        for id in called_off {
+            self.called_off(&id, why);
+        }
+    }
+
+    /// Says in the job's log, and on its row, that its confirmed sync was called off.
+    fn called_off(&self, id: &JobId, why: &str) {
+        self.inner.journal.info(id, &format!("the confirmed sync that waited for another sync was called off{why}"));
+        self.publish(id);
     }
 
     /// Whether runs nobody looks at are refused for this job until the person confirms a

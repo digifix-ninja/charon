@@ -189,6 +189,35 @@ fn busy_notes(root: &Path) -> usize {
         .unwrap_or(0)
 }
 
+/// Whether file permissions bite in this process (not root with CAP_DAC_OVERRIDE). If not,
+/// the test says so where everyone sees it and skips, or fails when
+/// CHARON_REQUIRE_PERMISSION_TESTS=1.
+#[cfg(unix)]
+fn permissions_bite(test: &str) -> bool {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let probe = tmp.path().join("x");
+    fs::create_dir(&probe).unwrap();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o555)).unwrap();
+    let bites = fs::write(probe.join("y"), "y").is_err();
+    fs::set_permissions(&probe, fs::Permissions::from_mode(0o755)).unwrap();
+    if bites {
+        return true;
+    }
+    let how = "capsh --drop=cap_dac_override,cap_dac_read_search -- -c \"cargo test -p charon-core --test overlapping_jobs\"";
+    let why = "this process can write into read-only folders (root with CAP_DAC_OVERRIDE), so the test would prove nothing";
+    if std::env::var("CHARON_REQUIRE_PERMISSION_TESTS").is_ok_and(|v| v == "1") {
+        panic!("{test} can't run: {why}. CHARON_REQUIRE_PERMISSION_TESTS=1 forbids skipping it. Run it with: {how}");
+    }
+    // Straight to stderr: the test harness swallows the output of a test that passes.
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIPPED {test}: {why}. It did NOT run. Run it with: {how} (or set CHARON_REQUIRE_PERMISSION_TESTS=1 to fail instead of skipping)"
+    );
+    false
+}
+
 /// Whether the review warns, as a danger, about the job named `other`.
 fn warns_about(review: &Review, other: &str) -> bool {
     review.warnings.iter().any(|warning| warning.level == Level::Danger && warning.text.contains(&format!("“{other}”")))
@@ -334,6 +363,50 @@ fn a_link_made_after_two_jobs_were_saved_cannot_let_them_undo_each_other_unnotic
     assert!(!warns_about(&review, "Docs"), "{:?}", review.warnings);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_conflict_cannot_be_settled_while_charon_cannot_tell_whether_the_folders_are_one() {
+    use charon_core::ConflictChoice;
+    use std::os::unix::fs::PermissionsExt;
+    if !permissions_bite("a_conflict_cannot_be_settled_while_charon_cannot_tell_whether_the_folders_are_one") {
+        return;
+    }
+    let chmod = |folder: &Path, mode: u32| fs::set_permissions(folder, fs::Permissions::from_mode(mode)).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (laptop, nas) = (tmp.path().join("Docs"), tmp.path().join("NAS/Docs"));
+    write(&laptop.join("report.txt"), "report");
+    let mut setup = job_setup("Docs", &laptop, &nas, SyncMode::TwoWay);
+    setup.conflict = ConflictRule::Ask;
+    let docs = add(&engine, setup);
+    confirm(&engine, &docs);
+    write(&laptop.join("report.txt"), "edited on the laptop");
+    write(&nas.join("report.txt"), "edited on the share, longer");
+    let review = engine.prepare_review(&docs).unwrap();
+    engine.discard_review(&docs, &review.review_id);
+    let conflict = view(&engine, &docs).conflicts.first().cloned().expect("a conflict");
+
+    // The share's marker turns up inside the laptop's folder, and neither Charon folder takes
+    // a file, so Charon can't tell a copy from the share reached under a second name.
+    let found = laptop.join("NAS copy");
+    copy_folder(&nas.join(".charon"), &found.join(".charon"));
+    for folder in [nas.join(".charon"), found.join(".charon")] {
+        chmod(&folder, 0o555);
+    }
+    let review = engine.prepare_review(&docs).unwrap();
+    assert!(review.blocked.as_deref().is_some_and(|text| text.contains("couldn't tell")), "{:?}", review.blocked);
+    engine.discard_review(&docs, &review.review_id);
+
+    // Settling the conflict is refused just the same.
+    let settle = engine.prepare_resolution(&docs, &conflict, ConflictChoice::KeepSource).unwrap();
+    assert!(settle.blocked.as_deref().is_some_and(|text| text.contains("couldn't tell")), "{:?}", settle.blocked);
+    assert!(engine.approve(&docs, &settle.review_id, true).is_err());
+    assert_eq!(fs::read_to_string(nas.join("report.txt")).unwrap(), "edited on the share, longer", "nothing changed");
+    for folder in [nas.join(".charon"), found.join(".charon")] {
+        chmod(&folder, 0o755);
+    }
+}
+
 // ==================================================================== copies of Charon's hidden folder
 
 #[test]
@@ -477,6 +550,35 @@ fn a_waiting_confirmed_sync_is_called_off_by_stop_or_by_closing_its_list() {
     fs::remove_file(&note).unwrap();
     assert!(!engine.start_confirmed(&id));
     assert!(!engine.is_running(&id) && !dst.join("a.txt").exists(), "nothing ran");
+}
+
+#[test]
+fn pausing_everything_calls_off_a_waiting_confirmed_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+
+    let review = engine.prepare_review(&id).unwrap();
+    let note = another_charons_note(&dst, None);
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+    engine.set_all_paused(true).unwrap();
+    let row = view(&engine, &id);
+    assert!(!row.confirmed && row.waiting_for.is_none());
+    assert!(engine.log(&id, 20).iter().any(|line| line.text.contains("called off (Pause everything)")));
+
+    // The other sync ends, and everything is resumed: nothing starts by itself.
+    fs::remove_file(&note).unwrap();
+    engine.set_all_paused(false).unwrap();
+    assert!(!engine.start_confirmed(&id));
+    assert!(!engine.is_running(&id) && !dst.join("a.txt").exists(), "nothing ran");
+
+    // Confirmed again, the list syncs, paused or not: the person asked for it.
+    engine.set_all_paused(true).unwrap();
+    assert_eq!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Started);
+    wait_idle(&engine, &id);
+    assert!(dst.join("a.txt").exists());
 }
 
 #[test]

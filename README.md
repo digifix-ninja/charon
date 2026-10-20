@@ -300,10 +300,10 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   tells you *Confirmed. “Docs” syncs as soon as “Photos” is done.*, and the row says
   *Confirmed: starts as soon as “Photos” finishes syncing*. While Charon runs, the list stays
   good however long it waits, and each step still checks the disk when its turn comes. *Stop*,
-  pausing or editing the job calls it off, and so does quitting Charon, which doesn't ask first:
-  the job then waits for your OK again. If a drive is swapped meanwhile, the list is dropped and
-  the row says why. The waiting sync starts the moment a sync of this Charon ends, and within
-  seconds of another Charon's.
+  pausing the job or everything, or editing the job calls it off, and so does quitting Charon,
+  which doesn't ask first: the job then waits for your OK again. If a drive is swapped meanwhile,
+  the list is dropped and the row says why. The waiting sync starts the moment a sync of this
+  Charon ends, and within seconds of another Charon's.
 - **If Charon can't save its jobs and settings** (a full disk, say), nothing syncs, since Charon
   couldn't record what a sync did: *Sync now* says so instead of starting, and a list you confirm
   changes nothing (the row says why). The header and the tray say *Charon needs your attention*,

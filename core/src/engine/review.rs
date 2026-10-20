@@ -278,6 +278,11 @@ impl Engine {
             )));
         }
         let (job, cancel) = self.begin_run(id, |job, rt| {
+            // Stopped, paused or edited while it waited: the person called it off, even if
+            // that came after `start_confirmed` picked it up.
+            if waited && !rt.confirmed.as_ref().is_some_and(|confirmed| confirmed.review_id == review_id) {
+                return Err(Error::Cancelled);
+            }
             let current = rt.review.as_ref().filter(|r| r.id == review_id).ok_or_else(Self::gone)?;
             if !waited && Utc::now() > current.expires_at {
                 return Err(Error::ReviewOutdated(format!("This list was made more than {VALID_FOR_MINUTES} minutes ago. Look again.")));
@@ -352,8 +357,9 @@ impl Engine {
             }
         );
         survey.plan = plan;
-        // Folders one inside the other can't settle anything either.
-        survey.refusal = Self::nested(&survey.setup);
+        // Folders one inside the other can't settle anything either, whether their paths
+        // show it or only Charon's markers do.
+        survey.refusal = self.overlaps(&job, &survey.source, &survey.destination).refusal;
         survey.holds.clear();
         survey.needs_tick = false;
         survey.agreed = 0;
@@ -838,5 +844,54 @@ impl Look {
             not_synced_count,
             volumes,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ConflictRule, JobSetup, SyncMode, Trigger};
+    use std::fs;
+    use std::thread;
+
+    #[test]
+    fn a_confirmed_sync_stopped_after_it_was_picked_up_never_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_| {})).unwrap();
+        let setup = JobSetup {
+            name: "Photos".into(),
+            source: src.clone(),
+            destination: dst.clone(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: JobSetup::default_excludes(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        let review = engine.prepare_review(&id).unwrap();
+        // Confirmed while another sync used the folders, as `queue_confirmed` keeps it.
+        let waiting = Confirmed { review_id: review.review_id.clone(), acknowledged: true };
+        engine.change_runtime(&id, |rt| rt.confirmed = Some(waiting.clone()));
+
+        // `start_confirmed` picks it up, and the person presses Stop before its sync begins.
+        let picked = engine.runtime().get(&id).and_then(|rt| rt.confirmed.clone()).unwrap();
+        engine.cancel(&id);
+        assert!(matches!(engine.carry_out(&id, &picked.review_id, picked.acknowledged, true), Err(Error::Cancelled)));
+        assert!(!engine.is_running(&id));
+        assert!(!dst.join("a.txt").exists(), "nothing ran");
+
+        // The same list, not called off, starts.
+        engine.change_runtime(&id, |rt| rt.confirmed = Some(waiting.clone()));
+        engine.carry_out(&id, &waiting.review_id, waiting.acknowledged, true).unwrap();
+        while engine.is_running(&id) {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(dst.join("a.txt").exists());
     }
 }

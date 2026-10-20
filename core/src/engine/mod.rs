@@ -100,8 +100,9 @@ struct Inner {
     /// `run::BusyWatch`).
     busy: Arc<BusyWatch>,
     /// When the last save of the state file failed, if it did (a full disk?): runs nobody
-    /// looks at wait until a save works again (see `can_save`). Its lock is taken last, and
-    /// no other lock is taken while it's held.
+    /// looks at are refused until a save works again (see `can_save`), and a run the person
+    /// starts fails before it changes anything. Its lock is taken last, and no other lock is
+    /// taken while it's held.
     cannot_save: Mutex<Option<Instant>>,
     /// When Charon 0.2's state file last changed, as found when the engine opened (it was
     /// moved aside then, so usually it isn't there).
@@ -299,6 +300,11 @@ impl Engine {
 
     /// Pauses or resumes every job at once.
     pub fn set_all_paused(&self, paused: bool) -> Result<()> {
+        // A list confirmed before doesn't start by itself later on, even when the setting
+        // can't be saved.
+        if paused {
+            self.call_off_all_confirmed(" (Pause everything)");
+        }
         self.change_state(|state| state.settings.paused_all = paused)?;
         self.emit(EngineEvent::Settings(self.settings()));
         self.publish_all();

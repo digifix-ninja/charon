@@ -227,16 +227,20 @@ impl BusyWatch {
     }
 
     /// Where notes are looked for: the roots, every folder above them as they really are
-    /// (whatever name they're reached under), and the folders `inside` them.
+    /// (whatever name they're reached under), and the folders `inside` them. Each folder is
+    /// there once, by its real path where it has one: under two names (a link such as macOS'
+    /// /var, or Windows' \\?\ form), its notes would count twice.
     fn places(roots: &[&Path], inside: &[PathBuf]) -> BTreeSet<PathBuf> {
         let mut places: BTreeSet<PathBuf> = BTreeSet::new();
         for root in roots {
-            places.insert(root.to_path_buf());
-            if let Ok(real) = fs::canonicalize(root) {
-                places.extend(real.ancestors().map(Path::to_path_buf));
+            match fs::canonicalize(root) {
+                Ok(real) => places.extend(real.ancestors().map(Path::to_path_buf)),
+                Err(_) => {
+                    places.insert(root.to_path_buf());
+                }
             }
         }
-        places.extend(inside.iter().cloned());
+        places.extend(inside.iter().map(|folder| fs::canonicalize(folder).unwrap_or_else(|_| folder.clone())));
         places
     }
 

@@ -1111,13 +1111,15 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let first = engine.survey(&job, &cancel, Purpose::Review).unwrap();
         // What a sync records when the destination's drive finds "Report final.pdf" under the
-        // short name REPORT~1.PDF. This test's drive has no short names: the refused place
-        // is that other item's own.
+        // short name REPORT~1.PDF. The refused place is that other item's own. (Keys are
+        // spelled as the snapshot spells them: folded where the drive ignores case. Notes
+        // name the item as it's spelled on the disk.)
+        let key = first.source.key_for("REPORT~1.PDF");
         let refused = Refused {
             side: Side::Destination,
-            key: "REPORT~1.PDF".into(),
+            key: key.clone(),
             why: Refusal::TakenName,
-            item: *first.source.get("REPORT~1.PDF").unwrap(),
+            item: *first.source.get(&key).unwrap(),
             at: theirs.clone(),
         };
         let remember = |refused: &Refused| {
@@ -1125,7 +1127,7 @@ mod tests {
             engine.change_runtime(&id, |rt| rt.refused.insert((refused.side, refused.key.clone()), (refused.clone(), drive)));
         };
         let copies = |survey: &Survey| {
-            survey.plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Destination, path, .. } if path == "REPORT~1.PDF"))
+            survey.plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Destination, path, .. } if *path == key))
         };
         remember(&refused);
 
@@ -1139,7 +1141,11 @@ mod tests {
         assert!(copies(&free), "{:?}", free.plan.actions);
         assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()), "the refusal lapsed for good");
 
-        // Nor does it hold once the item is there under its own name.
+        // Nor does it hold once the item is there under its own name. (Not on Windows, where
+        // that name would reach the renamed item through its own short name.)
+        if cfg!(windows) {
+            return;
+        }
         remember(&Refused { at: dst.join("Report final (old).pdf"), ..refused });
         fs::write(dst.join("REPORT~1.PDF"), "ours").unwrap();
         engine.survey(&job, &cancel, Purpose::Check).unwrap();

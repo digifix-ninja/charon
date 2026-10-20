@@ -109,9 +109,17 @@ impl JobRuntime {
     /// Forgets the list waiting for the person's OK, and a confirmed run waiting to start.
     pub fn forget_review(&mut self) {
         self.review = None;
-        if self.confirmed.take().is_some() {
+        self.call_off_confirmed();
+    }
+
+    /// Calls off the confirmed list that waits for another sync, keeping the list itself.
+    /// Returns whether there was one.
+    pub fn call_off_confirmed(&mut self) -> bool {
+        let waited = self.confirmed.take().is_some();
+        if waited {
             self.waiting_for = None;
         }
+        waited
     }
 
     /// Forgets everything learned about the folders (the job's folders or mode changed).
