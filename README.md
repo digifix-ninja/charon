@@ -90,7 +90,7 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
 | Needs your OK | pink, a checklist | Changes wait for you to look at the list and confirm it, or a full-automation run was held back for your OK. |
 | Ready | cyan, a spark | A new job that hasn't synced yet. Nothing crosses until you confirm its first list. |
 | Looking | no colour yet, a magnifying glass | Charon hasn't finished a new look at this job yet, so it doesn't claim the folders match. |
-| Pending | amber, an up arrow | Full automation only: changes were found and cross at the job's next run, or removals were left for a later sync. |
+| Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run, or removals were left for a later sync. |
 | Paused | grey, two bars | Doesn't sync by itself. Charon still looks and shows what waits, and you can still sync it from its row. |
 | Conflict | violet, a fork | A file changed on both sides and waits for you to choose which version to keep. |
 | Error | red, an exclamation mark | The last look or sync failed, or some files couldn't be copied. The row says why and names what failed. |
@@ -158,6 +158,37 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   remove nothing. In a Mirror or Backup job, a missing or foreign marker on either side, or a
   source older than at the last sync, needs a tick before *Confirm* and holds full automation
   back. If a drive goes away mid-sync, the sync stops.
+- **No job undoes its own work, or another's unnoticed.** A job whose two folders are one
+  folder, or one inside the other, would copy its own copies into itself, so Charon refuses it.
+  It checks when you save the job, and again at every look by the folders themselves and by its
+  markers, since a link, a drive or share reachable under two names, or a folder made later can
+  hide what the paths don't show; a list that finds it says why and can't be confirmed. A Mirror
+  job removes whatever isn't in its source, so its destination must not overlap a folder another
+  job writes into: the other job's files would be removed, and a two-way job would carry those
+  removals back. Charon won't save two such jobs (so *Duplicate* never copies a Mirror job).
+  Where it finds them anyway (through another name, or saved by Charon 0.2, which didn't check),
+  the list warns about it, needs a tick before *Confirm* and holds full automation back; an edit
+  that keeps the job's folders and mode, such as a new name, still saves. A copy of a hidden
+  `.charon` folder (in files restored from a backup, say) does no harm: the list only mentions
+  it, so you can delete it. Where Charon can't tell whether it is a copy (when it can't write to
+  either `.charon` folder, say), the list says so. Until you delete the copy, the job then doesn't
+  sync if it holds the job's own marker, and needs the tick if it holds that of a job it could
+  undo.
+- **One sync at a time in any folder.** Two syncs of Charon 0.3 never work in the same folders
+  at once, or in one folder inside the other: not two jobs of this Charon, nor Charon on another
+  computer that syncs the same share, nor a second copy of Charon 0.3 on this one. Jobs that
+  share a folder without undoing each other's work (two backups of one folder, say) are fine,
+  and simply take turns. Before a sync changes anything, it leaves a note in the hidden `.charon`
+  folder at the top of both its folders, then looks for other syncs' notes in its folders, in
+  the folders above them and in the synced folders inside them. Another Charon knows of a sync
+  only by its note, and a folder Charon can't write to (a card, a read-only share) can't hold
+  one. Charon 0.2 leaves no notes at all, so quit it first (see *Upgrading from 0.2*). If another
+  sync is at work there, a sync that starts by itself, or a list you have already confirmed,
+  waits for it (see *When a sync waits for another one* below); *Review and sync* and *Sync now*
+  say instead which sync is at work in these folders, and to look again when it's done. A note
+  that hasn't changed for two minutes, as this computer sees it, belongs to a Charon that
+  stopped (it crashed, or its computer was switched off): it no longer counts and is cleared
+  away. The notes Charon itself left before a crash count for nothing once it starts again.
 - **A sync counts only once the drives have it.** At the end of every sync Charon makes sure its
   changes reached the drives, then looks once more at what it wrote. A drive that dropped out
   for a moment can come back without a sync's last changes: if a copy is gone, or a replaced or
@@ -262,6 +293,23 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   go by size and date, so they don't copy such a change at all. Where there's no change time,
   the last look at the end of a sync also can't notice a drive that dropped out mid-sync and
   came back without a container's new version.
+- **When a sync waits for another one.** A sync that would start by itself while another sync
+  is at work in its folders waits, and its row says for which: *Waits for “Photos” to finish
+  syncing, then starts by itself*, naming another job, *another Charon* or *Charon on* the other
+  computer. So does a list you made before that sync began and confirm while it works: Charon
+  tells you *Confirmed. “Docs” syncs as soon as “Photos” is done.*, and the row says
+  *Confirmed: starts as soon as “Photos” finishes syncing*. While Charon runs, the list stays
+  good however long it waits, and each step still checks the disk when its turn comes. *Stop*,
+  pausing or editing the job calls it off, and so does quitting Charon, which doesn't ask first:
+  the job then waits for your OK again. If a drive is swapped meanwhile, the list is dropped and
+  the row says why. The waiting sync starts the moment a sync of this Charon ends, and within
+  seconds of another Charon's.
+- **If Charon can't save its jobs and settings** (a full disk, say), nothing syncs, since Charon
+  couldn't record what a sync did: *Sync now* says so instead of starting, and a list you confirm
+  changes nothing (the row says why). The header and the tray say *Charon needs your attention*,
+  with the reason under the title bar. Charon tries a save again every minute. Once one works, jobs
+  sync by themselves again from their next trigger: a scheduled sync that came due meanwhile waits
+  for its next time.
 
 ## More
 
@@ -315,6 +363,12 @@ Charon 0.3 takes over your jobs and settings the first time it starts. What you 
   a list that names them. If one of them is yours, rename it before you confirm.
 - **The old settings file becomes `charon.json.moved-to-0.3`**, so a copy of 0.2 started by
   mistake finds no jobs to run.
+- **Quit Charon 0.2 before you start 0.3.** A 0.2 that is still running keeps syncing its jobs
+  by itself, without 0.3's checks, until you quit it. Charon 0.3 notices it only once the older
+  one saves its jobs again, after one of its syncs. From then on 0.3 syncs nothing, not even a
+  list you confirm, until you reopen Charon: the header and the tray say *Charon needs your
+  attention*, and the line under the title bar says what to do. Quit the older Charon from its
+  icon in the menu bar or system tray, then quit and reopen Charon.
 
 ## Privacy
 
@@ -323,7 +377,9 @@ online is to ask GitHub whether a new version is out, which you can turn off (*L
 versions* in Settings). Your jobs and settings, what each job remembers of its last sync and
 the activity logs stay in the app's data folder on your computer. In your synced folders,
 Charon adds its `.charon` marker and its `.charon-trash`, and while it works, short-lived
-temporary files named `.charon-….part`.
+temporary files named `.charon-….part` and a note in `.charon` with the job's name, the
+computer's name, the time and random ids, so that other syncs of those folders wait. A note
+left by a sync that was cut short stays until a later sync there clears it.
 
 ## Build from source
 
