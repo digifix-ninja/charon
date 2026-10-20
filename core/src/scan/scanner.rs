@@ -19,18 +19,19 @@ const COUNT_EVERY: u64 = 500;
 /// Reads folders into snapshots. Symbolic links are recorded as links, never followed.
 pub struct Scanner<'a> {
     filter: &'a ExcludeFilter,
-    cancel: Option<&'a AtomicBool>,
+    /// The scan stops early as soon as one of these becomes true.
+    stops: Vec<&'a AtomicBool>,
     counter: Option<&'a (dyn Fn(u64) + Sync)>,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(filter: &'a ExcludeFilter) -> Self {
-        Self { filter, cancel: None, counter: None }
+        Self { filter, stops: Vec::new(), counter: None }
     }
 
-    /// Stops the scan early when `cancel` becomes true.
+    /// Stops the scan early when `cancel` becomes true (any of them, when called again).
     pub fn cancellable(mut self, cancel: &'a AtomicBool) -> Self {
-        self.cancel = Some(cancel);
+        self.stops.push(cancel);
         self
     }
 
@@ -55,7 +56,7 @@ impl<'a> Scanner<'a> {
         let mut seen: u64 = 0;
 
         while let Some(item) = walker.next() {
-            if self.cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+            if self.stops.iter().any(|stop| stop.load(Ordering::Relaxed)) {
                 return Err(Error::Cancelled);
             }
             seen += 1;

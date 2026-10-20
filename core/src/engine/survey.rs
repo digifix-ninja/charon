@@ -13,7 +13,7 @@ use crate::scan::{never_download_on_this_thread, partial_started, Contents, Entr
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
@@ -438,9 +438,12 @@ impl Engine {
     }
 
     /// Scans both folders at once (they're usually on different drives), each on its own
-    /// thread, which never downloads files that are only in the cloud.
+    /// thread, which never downloads files that are only in the cloud. When one side can't
+    /// be scanned, the other stops too: the look fails either way, and a big folder or a
+    /// share isn't read to the end for nothing.
     fn scan_both(&self, job: &Job, filter: &ExcludeFilter, volumes: (Volume, Volume), cancel: &AtomicBool, report: bool) -> Result<(Snapshot, Snapshot)> {
         let (source_volume, destination_volume) = volumes;
+        let failed = AtomicBool::new(false);
         let scan = |side: Side, volume: Volume| {
             let counter = |items: u64| {
                 if report {
@@ -451,7 +454,11 @@ impl Engine {
                 Side::Source => &job.setup.source,
                 Side::Destination => &job.setup.destination,
             };
-            Scanner::new(filter).cancellable(cancel).counting(&counter).scan(root, volume)
+            let scanned = Scanner::new(filter).cancellable(cancel).cancellable(&failed).counting(&counter).scan(root, volume);
+            if scanned.is_err() {
+                failed.store(true, Ordering::Relaxed);
+            }
+            scanned
         };
         let (source, destination) = std::thread::scope(|scope| {
             let source = std::thread::Builder::new().name("charon-scan".into()).spawn_scoped(scope, || {
@@ -465,7 +472,12 @@ impl Engine {
             };
             (source, destination)
         });
-        Ok((source?, destination?))
+        match (source, destination) {
+            (Ok(source), Ok(destination)) => Ok((source, destination)),
+            // The side that failed first says why; the other one only stopped because of it.
+            (Err(Error::Cancelled), Err(e)) | (Err(e), Err(Error::Cancelled)) if !cancel.load(Ordering::Relaxed) => Err(e),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        }
     }
 
     /// Runs `work` on a thread of its own that never downloads files that are only in the

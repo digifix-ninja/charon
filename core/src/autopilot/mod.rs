@@ -99,8 +99,12 @@ impl Autopilot {
             let was_reachable = self.reachable.insert(id.clone(), reachable);
             if was_reachable.is_some() && was_reachable != Some(reachable) {
                 // A drive went away or came (maybe another one under the same name): a list
-                // made before can't be confirmed anymore.
+                // made before can't be confirmed anymore, and what was found before it left
+                // says nothing about it now.
                 self.engine.mark_review_stale(id);
+                if reachable {
+                    self.engine.forget_look(id);
+                }
                 self.engine.publish(id); // the row turns offline / back online
             }
             let automatic = !settings.paused_all && !job.paused;

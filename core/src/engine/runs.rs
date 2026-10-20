@@ -87,7 +87,7 @@ impl Engine {
             if job.paused || !job.setup.source.is_dir() || !job.setup.destination.is_dir() || self.is_running(&job.id) {
                 continue;
             }
-            if job.runs_by_itself() {
+            if job.runs_by_itself() && !self.must_ask(&job.id) {
                 // Another job using the folders makes it wait, not give up (see `start_wanted`).
                 self.want(&job.id, "started with Sync all");
                 self.start_wanted(&job.id);
@@ -107,6 +107,12 @@ impl Engine {
                 rt.stopped_by_person = true;
             }
         }
+    }
+
+    /// Whether runs nobody looks at are refused for this job until the person confirms a
+    /// list (see `JobRuntime::must_ask`).
+    pub(crate) fn must_ask(&self, id: &JobId) -> bool {
+        self.runtime().get(id).is_some_and(|rt| rt.must_ask)
     }
 
     /// Whether a sync of this job is running.
@@ -474,7 +480,17 @@ impl Engine {
                 baseline.record(&outcome.settled);
                 baseline
             }
-            ReviewKind::Resolve => return Ok(()),
+            // Without a memory it can trust (a sync didn't finish, a marker changed), settling
+            // one item can't be recorded. And the memory from before must never be trusted
+            // again: a file restored since the interrupted sync would look removed on its
+            // side, and the next sync would remove its only copy. So it is forgotten: until
+            // a whole list is confirmed, each look compares both folders afresh and removes
+            // nothing.
+            ReviewKind::Resolve => {
+                return self.inner.baselines.forget(id).map_err(|e| {
+                    format!("The item was settled, but Charon couldn't put aside what it remembers of the last sync ({e}), so it waits for your OK before the next sync.")
+                });
+            }
         };
         let (tokens, generation) = match (&memory.tokens, survey.trusted) {
             (Some(tokens), true) => (tokens.clone(), memory.generation + 1),
@@ -565,7 +581,7 @@ impl Engine {
         let unrecorded = recorded.as_ref().is_some_and(|recorded| !recorded.recorded);
         summary.finished_at = Utc::now();
         let finished_at = summary.finished_at;
-        let saved = self.change_job(id, |stored| {
+        let saved = self.change_job_anyway(id, |stored| {
             stored.last_run = Some(summary.clone());
             if summary.error.is_none() && !summary.cancelled {
                 stored.last_synced = Some(finished_at);
@@ -605,6 +621,7 @@ impl Engine {
         });
         if let Err(e) = saved {
             log::error!("couldn't save the result of a sync of {}: {e}", job.setup.name);
+            self.inner.journal.error(id, &format!("Charon couldn't save the result of this sync ({e}); it holds while Charon runs"));
         }
         let line = summary.describe();
         match (&summary.error, summary.failed) {
@@ -634,6 +651,13 @@ impl Engine {
             rt.progress = None;
             rt.finished_at = Some(Instant::now());
             rt.problem = summary.error.clone();
+            // An automatic run that never got to carry anything: the changes its look found
+            // wait for a newer look before a run tries them again (see `has_pending`).
+            if !carried && !crossing.approved {
+                rt.tried = rt.look.as_ref().map(|look| look.at);
+            } else if carried {
+                rt.tried = None;
+            }
             match crossing.kind {
                 // A run that never got to carry anything leaves the last look as it was.
                 _ if !carried => {}
@@ -685,11 +709,12 @@ impl Engine {
             reason.push_str(&format!(" ({} more {} in the list.)", more, if more == 1 { "reason" } else { "reasons" }));
         }
         self.inner.journal.warn(id, &format!("held back for your OK: {reason}"));
-        if let Err(e) = self.change_job(id, |job| {
+        if let Err(e) = self.change_job_anyway(id, |job| {
             job.needs_review = true;
             job.held = Some(reason.clone());
         }) {
             log::error!("couldn't save that {} was held back: {e}", job.setup.name);
+            self.inner.journal.error(id, &format!("Charon couldn't save that this job waits for your OK ({e}); it keeps waiting while Charon runs"));
         }
         self.note_look(job, survey);
         self.change_runtime(id, |rt| {

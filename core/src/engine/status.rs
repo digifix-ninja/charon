@@ -13,6 +13,10 @@ use std::sync::atomic::Ordering;
 pub(crate) struct Snapshot {
     job: Job,
     running: bool,
+    /// A look at the folders runs now (in the background, or for a list).
+    looking: bool,
+    /// Runs nobody looks at are refused until the person confirms a list.
+    must_ask: bool,
     progress: Option<Progress>,
     look: Option<Look>,
     problem: Option<String>,
@@ -24,12 +28,18 @@ impl Engine {
     /// Takes a job's row state. Called with the state lock and then the runtime lock held
     /// (the documented order).
     pub(crate) fn snapshot(&self, job: &Job, rt: Option<&JobRuntime>) -> Snapshot {
-        let (running, progress, look, problem, waiting_for) = match rt {
-            Some(rt) => (rt.is_running(), rt.progress.clone(), rt.look.clone(), rt.problem.clone(), rt.waiting_for.clone()),
-            None => (false, None, None, None, None),
+        let snapshot = Snapshot {
+            job: job.clone(),
+            running: rt.is_some_and(|rt| rt.is_running()),
+            looking: rt.is_some_and(|rt| rt.is_checking() || rt.preparing.is_some()),
+            must_ask: rt.is_some_and(|rt| rt.must_ask),
+            progress: rt.and_then(|rt| rt.progress.clone()),
+            look: rt.and_then(|rt| rt.look.clone()),
+            problem: rt.and_then(|rt| rt.problem.clone()),
+            waiting_for: rt.and_then(|rt| rt.waiting_for.clone()),
+            rev: 0,
         };
-        let rev = self.inner.rev.fetch_add(1, Ordering::Relaxed) + 1;
-        Snapshot { job: job.clone(), running, progress, look, problem, waiting_for, rev }
+        Snapshot { rev: self.inner.rev.fetch_add(1, Ordering::Relaxed) + 1, ..snapshot }
     }
 
     /// The side whose folder is now on another drive than at the last sync, with that
@@ -44,7 +54,7 @@ impl Engine {
 
     /// The row the window shows, made outside the locks (it asks the disk).
     pub(crate) fn view_of(&self, snapshot: Snapshot, settings: &Settings) -> JobView {
-        let Snapshot { job, running, progress, look, problem, waiting_for, rev } = snapshot;
+        let Snapshot { job, running, looking, must_ask, progress, look, problem, waiting_for, rev } = snapshot;
         let waiting_since = job.waiting_since;
         // A look made with another setup says nothing about this one.
         let look = look.filter(|look| look.setup == job.setup);
@@ -54,7 +64,9 @@ impl Engine {
         // offline: its row says why, and a sync still shows the list with that warning.
         let moved = (source_online && destination_online).then(|| Self::drive_moved(&job)).flatten();
         let paused = job.paused || settings.paused_all;
-        let runs_by_itself = job.runs_by_itself();
+        // A run nobody looks at is refused while the job must ask, even when its record
+        // couldn't be saved to say so: the row, the tray and Sync all go by the same rule.
+        let runs_by_itself = job.runs_by_itself() && !must_ask;
 
         let work = look.as_ref().filter(|look| look.items > 0);
         let waiting = match (work, &job.held) {
@@ -66,6 +78,7 @@ impl Engine {
                 conflicts: look.conflicts.len() as u64,
                 held: held.clone(),
                 since: waiting_since.unwrap_or(look.at),
+                counted: true,
             }),
             (None, Some(held)) => Some(Waiting {
                 items: 0,
@@ -75,6 +88,20 @@ impl Engine {
                 conflicts: look.as_ref().map_or(0, |l| l.conflicts.len() as u64),
                 held: Some(held.clone()),
                 since: waiting_since.or(job.last_scheduled).unwrap_or_else(Utc::now),
+                counted: look.is_some(),
+            }),
+            // Not looked at since Charon started (or since a folder came back), but changes
+            // waited for an OK when it last looked: they still wait until a look says
+            // otherwise, never "In sync".
+            (None, None) if look.is_none() && !runs_by_itself => waiting_since.map(|since| Waiting {
+                items: 0,
+                bytes: 0,
+                removals: Default::default(),
+                replacements: Default::default(),
+                conflicts: 0,
+                held: None,
+                since,
+                counted: false,
             }),
             _ => None,
         };
@@ -104,6 +131,10 @@ impl Engine {
             JobStatus::New
         } else if pending.is_some() {
             JobStatus::Pending
+        } else if look.is_none() {
+            // No look since Charon started, or since a folder came back: "In sync" would be
+            // a guess.
+            JobStatus::Looking
         } else {
             JobStatus::InSync
         };
@@ -133,6 +164,7 @@ impl Engine {
             rev,
             status,
             runs_by_itself,
+            looking: looking && !running,
             waiting,
             pending,
             progress: if running { progress } else { None },

@@ -220,6 +220,12 @@ impl Engine {
         survey.housekeeping = Default::default();
         // What's said about the drives themselves still holds (another drive, a missing marker).
         survey.warnings.retain(|warning| warning.level == Level::Danger);
+        if !survey.trusted && survey.memory.as_ref().is_some_and(|memory| memory.tokens.is_some()) {
+            survey.warnings.push(Warning::caution(
+                "Charon doesn't trust its memory of the last sync right now, so settling this item lets go of that memory. \
+                 Until you confirm a whole list of this job's changes, Charon compares both folders afresh and removes nothing.",
+            ));
+        }
         survey.warnings.push(Warning::info(
             "Only this item changes. The version that is replaced or removed goes to .charon-trash, even when safe deletes are off.",
         ));
@@ -318,7 +324,7 @@ impl Engine {
         self.change_runtime(&job.id, |rt| {
             rt.review = Some(stored);
             // The person is looking at the list: the next reminder can wait.
-            rt.reminder.last = Some(std::time::Instant::now());
+            rt.reminder.last = Some(Utc::now());
             rt.reminder.count = rt.reminder.count.max(1);
         });
         Ok(review)

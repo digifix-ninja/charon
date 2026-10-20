@@ -73,9 +73,12 @@ impl Engine {
         })
     }
 
-    /// Whether the last look found changes a job that runs by itself would carry.
+    /// Whether the last look found changes a job that runs by itself would carry, and no
+    /// automatic run has tried them yet and ended before carrying anything.
     pub fn has_pending(&self, id: &JobId) -> bool {
-        self.runtime().get(id).and_then(|rt| rt.look.as_ref()).is_some_and(|look| look.items > 0)
+        self.runtime().get(id).is_some_and(|rt| {
+            rt.look.as_ref().is_some_and(|look| look.items > 0 && rt.tried.is_none_or(|tried| look.at > tried))
+        })
     }
 
     /// Whether a list of the job's changes is being prepared or waits for the person's OK
@@ -166,9 +169,11 @@ impl Engine {
                     1 => SECOND_NOTICE,
                     _ => LATER_NOTICES,
                 };
-                let tell = rt.reminder.last.is_none_or(|last| last.elapsed() >= gap);
+                let now = Utc::now();
+                // A clock set back counts as time gone by: a reminder is never put off for good.
+                let tell = rt.reminder.last.is_none_or(|last| now < last || (now - last).to_std().is_ok_and(|gone| gone >= gap));
                 if tell {
-                    rt.reminder.last = Some(Instant::now());
+                    rt.reminder.last = Some(now);
                     rt.reminder.count += 1;
                 }
                 tell
@@ -193,5 +198,16 @@ impl Engine {
     /// (the person may be about to eject the drive again).
     pub fn mention_next_look(&self, id: &JobId) {
         self.change_runtime(id, |rt| rt.reminder.last = None);
+    }
+
+    /// A folder of the job came back (a drive plugged in again, a share reconnected). What
+    /// the last look found, it found before: the row mustn't say "In sync" from then. The
+    /// look is put aside, and the job is looked at again at once.
+    pub fn forget_look(&self, id: &JobId) {
+        self.change_runtime(id, |rt| {
+            rt.look = None;
+            rt.tried = None;
+            rt.last_checked = None;
+        });
     }
 }

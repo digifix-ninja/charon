@@ -457,14 +457,16 @@ fn items_waiting(engine: &Engine, id: &String) -> u64 {
 }
 
 /// Asks for a look at the job now (as the autopilot does) and waits until its row shows what
-/// waits; returns how many items that is. The job's row must show nothing waiting before.
+/// waits; returns how many items that is. The job's row must show nothing counted as waiting
+/// before.
 /// From the moment the look starts, the autopilot's regular look isn't due for this job for
 /// many minutes (`check_due`), so any later look can only come from a trigger.
 fn look_now(engine: &Engine, id: &String) -> u64 {
-    assert!(view(engine, id).waiting.is_none(), "no look of this setup yet: {}", describe(engine, id));
+    // Changes that waited before a restart still show, but uncounted until a look counts them.
+    assert!(view(engine, id).waiting.is_none_or(|waiting| !waiting.counted), "no look of this setup yet: {}", describe(engine, id));
     engine.check(id);
     assert!(!engine.check_due(id, 1), "the look started");
-    eventually("the look finished", || view(engine, id).waiting.is_some());
+    eventually("the look finished", || view(engine, id).waiting.is_some_and(|waiting| waiting.counted));
     items_waiting(engine, id)
 }
 

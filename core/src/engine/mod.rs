@@ -285,6 +285,20 @@ impl Engine {
             .ok_or_else(|| Error::UnknownJob(id.clone()))
     }
 
+    /// Changes one stored job and saves, like `change_job`, but when the save fails (a full
+    /// system disk, a state file another program holds open) the change still holds while
+    /// Charon runs, and the next save that works writes it too. For what a job waits for
+    /// after a run (held back, stopped, not recorded): every part of Charon must keep
+    /// seeing that the job waits for an OK, whether or not the disk took it.
+    fn change_job_anyway(&self, id: &JobId, change: impl FnOnce(&mut Job)) -> Result<()> {
+        let mut state = self.state();
+        let mut next = state.clone();
+        next.jobs.iter_mut().find(|job| &job.id == id).map(change).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+        let saved = self.inner.state_file.save(&next);
+        *state = next;
+        saved
+    }
+
     /// Changes the stored state and the job's live state together, but only while the job
     /// isn't syncing (refused with `busy`). The stored change is saved before it counts.
     fn with_job_at_rest(&self, id: &JobId, busy: &str, change: impl FnOnce(&mut StoredState, &mut JobRuntime) -> Result<()>) -> Result<()> {

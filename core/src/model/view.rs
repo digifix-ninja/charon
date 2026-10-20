@@ -14,6 +14,9 @@ pub enum JobStatus {
     New,
     /// Green check: both folders match.
     InSync,
+    /// Charon hasn't looked at the folders since it started (or since a folder came back),
+    /// and a look is on its way: whether they match isn't known yet.
+    Looking,
     /// Amber: changes are waiting to cross, and the job will carry them by itself
     /// (full automation).
     Pending,
@@ -284,6 +287,10 @@ pub struct Waiting {
     pub held: Option<String>,
     /// Since when changes have been waiting.
     pub since: DateTime<Utc>,
+    /// False when the numbers above aren't known yet: changes waited for an OK when Charon
+    /// last looked, before it was closed (or before a folder went away), and it hasn't
+    /// looked again since.
+    pub counted: bool,
 }
 
 /// A place the last look couldn't read or had to leave out: nothing there is synced.
@@ -330,6 +337,9 @@ pub struct JobView {
     pub status: JobStatus,
     /// Full automation is on and nothing waits for a look first.
     pub runs_by_itself: bool,
+    /// Charon is looking at the folders right now (a background look, or a list being
+    /// made); what the row says may change when it's done.
+    pub looking: bool,
     pub waiting: Option<Waiting>,
     /// Changes the job will carry by itself (full automation).
     pub pending: Option<Pending>,
@@ -366,6 +376,8 @@ pub struct Overview {
     pub waiting: usize,
     pub attention: usize,
     pub offline: usize,
+    /// Jobs Charon hasn't looked at since it started or since a folder came back.
+    pub looking: usize,
     /// Jobs that sync, but leave places out (unreadable, left out, name clashes).
     pub incomplete: usize,
     pub paused_all: bool,
@@ -382,6 +394,7 @@ impl Overview {
             waiting: views.iter().filter(|v| v.waiting.is_some()).count(),
             attention: count(&[JobStatus::Error, JobStatus::Conflict]),
             offline: count(&[JobStatus::Offline]),
+            looking: count(&[JobStatus::Looking]),
             incomplete: views.iter().filter(|v| !v.unreadable.is_empty() || v.not_synced_count > 0).count(),
             paused_all,
         }
@@ -393,6 +406,15 @@ impl Overview {
             "No sync jobs yet".into()
         } else if self.syncing > 0 {
             format!("Syncing {}", plural(self.syncing as u64, "job"))
+        } else if self.attention > 0 && self.waiting > 0 {
+            // Changes that wait for an OK are never hidden behind a job that needs attention.
+            format!(
+                "{} need{} attention, {} wait{} for your OK",
+                plural(self.attention as u64, "job"),
+                if self.attention == 1 { "s" } else { "" },
+                human_count(self.waiting as u64),
+                if self.waiting == 1 { "s" } else { "" }
+            )
         } else if self.attention > 0 {
             format!("{} need{} attention", plural(self.attention as u64, "job"), if self.attention == 1 { "s" } else { "" })
         } else if self.waiting > 0 {
@@ -403,6 +425,8 @@ impl Overview {
             format!("{} with changes waiting", plural(self.pending as u64, "job"))
         } else if self.incomplete > 0 {
             format!("{} {} sync everything", plural(self.incomplete as u64, "job"), if self.incomplete == 1 { "doesn't" } else { "don't" })
+        } else if self.looking > 0 {
+            "Looking for changes…".into()
         } else {
             "All in sync".into()
         }

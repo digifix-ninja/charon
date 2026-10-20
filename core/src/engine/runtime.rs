@@ -50,6 +50,11 @@ pub(crate) struct JobRuntime {
     pub filter: Option<(JobSetup, ExcludeFilter)>,
     /// Items looks found missing on a drive that may show changes late, and since when.
     pub missing: Missing,
+    /// When the look was made whose changes the last automatic run set out to carry, if
+    /// that run ended before carrying anything (a folder it couldn't read, Charon's state
+    /// that couldn't be saved). Changes found by that look aren't tried again until a newer
+    /// look finds them: a run that fails every time mustn't start every second.
+    pub tried: Option<DateTime<Utc>>,
 }
 
 impl JobRuntime {
@@ -78,6 +83,7 @@ impl JobRuntime {
         self.no_links = (false, false);
         self.filter = None;
         self.missing = Missing::default();
+        self.tried = None;
         self.wanted = None;
         self.waiting_for = None;
     }
@@ -164,8 +170,9 @@ impl Look {
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Reminder {
     /// The last notification about this job (kept when the changes are confirmed, so a new
-    /// wait right after doesn't notify again at once).
-    pub last: Option<Instant>,
+    /// wait right after doesn't notify again at once). By the clock on the wall: the time
+    /// a computer sleeps counts too, so "daily" means daily.
+    pub last: Option<DateTime<Utc>>,
     /// Notifications sent since changes began to wait.
     pub count: u32,
 }
