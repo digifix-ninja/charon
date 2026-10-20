@@ -268,7 +268,7 @@ impl<'a> Scanner<'a> {
 
     /// Whether an item named `.charon` or `.charon-trash` really is one of Charon's: a
     /// folder holding only markers, or only dated trash folders (or nothing).
-    fn looks_like_charons(path: &Path, name: &str, is_dir: bool) -> bool {
+    pub(crate) fn looks_like_charons(path: &Path, name: &str, is_dir: bool) -> bool {
         if !is_dir {
             return false;
         }

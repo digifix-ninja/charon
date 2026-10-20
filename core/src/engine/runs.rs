@@ -17,12 +17,13 @@ use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
-use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
-use crate::scan::{never_download_on_this_thread, ExcludeFilter, Snapshot};
+use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Spellings, Trash};
+use crate::scan::{never_download_on_this_thread, EntryKind, ExcludeFilter, Keys, Scanner, Snapshot, MARKER_FOLDER};
 use crate::store::{Landings, Memory};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -338,10 +339,11 @@ impl Engine {
         self.inner.busy.around(&[&job.setup.source, &job.setup.destination], &inside, &me).first().map(|note| self.busy_with(note))
     }
 
-    /// Leaves the run's busy notes in the job's folders (see `run::Claim`), unless another
-    /// sync is at work there or in the folders above and inside them: then it says who.
+    /// Leaves the run's busy notes in the job's folders and in the Charon folders inside them
+    /// (see `run::Claim`), unless another sync is at work there or in the folders above and
+    /// inside them: then it says who.
     pub(crate) fn claim_folders(&self, job: &Job, survey: &Survey) -> std::result::Result<Claim, String> {
-        let inside = Self::folders_inside(&survey.setup, &survey.source, &survey.destination);
+        let inside = Self::folders_inside_now(survey);
         let note = self.inner.busy.note(&job.id, &job.setup.name);
         Claim::take(&self.inner.busy, note, &[&survey.setup.source, &survey.setup.destination], &inside).map_err(|other| self.busy_with(&other))
     }
@@ -355,6 +357,44 @@ impl Engine {
                 snapshot.charon_folders().iter().filter(|found| !found.folder.is_empty()).map(move |found| root.join(&found.folder))
             })
             .collect()
+    }
+
+    /// The folders inside the job's folders that hold Charon's own folder, for a run about to
+    /// carry out `survey`'s plan: where the scans met one, and where one is now in a folder
+    /// whose contents the plan changes. A sync of a folder inside may have started since the
+    /// scans (for a confirmed list, maybe hours ago) and made Charon's folder there: its
+    /// notes must be seen before this run changes anything in its folder.
+    fn folders_inside_now(survey: &Survey) -> Vec<PathBuf> {
+        let mut inside: BTreeSet<PathBuf> = Self::folders_inside(&survey.setup, &survey.source, &survey.destination).into_iter().collect();
+        let spellings = Spellings::new(&survey.source, &survey.destination);
+        for side in [Side::Source, Side::Destination] {
+            let changed: BTreeSet<&str> = survey.plan.actions.iter().filter(|action| action.changes(side)).flat_map(Action::folders).collect();
+            // A folder comes before the folders inside it. One that isn't a folder of its own
+            // here (it's new to this side and not there yet, or it's a link) has nothing
+            // inside it to look at: Charon never looks through a link.
+            let mut not_folders: HashSet<&str> = HashSet::new();
+            for key in changed {
+                if Keys::ancestors(key).any(|above| not_folders.contains(above)) {
+                    continue;
+                }
+                let folder = survey.setup.root(side).join(spellings.disk(side, key));
+                let real = match survey.snapshot(side).get(key) {
+                    Some(entry) => entry.kind == EntryKind::Dir,
+                    None => fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir()),
+                };
+                if !real {
+                    not_folders.insert(key);
+                    continue;
+                }
+                // Only a folder that is Charon's own: one of the person's of that name is
+                // left alone.
+                let charons = folder.join(MARKER_FOLDER);
+                if fs::symlink_metadata(&charons).is_ok_and(|meta| meta.is_dir()) && Scanner::looks_like_charons(&charons, MARKER_FOLDER, true) {
+                    inside.insert(folder);
+                }
+            }
+        }
+        inside.into_iter().collect()
     }
 
     /// Who left a busy note, as the person knows them: a job of this Charon by its name, or

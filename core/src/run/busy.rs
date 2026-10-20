@@ -1,6 +1,7 @@
 //! Charon's note that a sync is at work in a folder: `.charon/<id>.busy` at the top of each
-//! folder of a running sync, wherever Charon can write there. It names the job, the Charon
-//! the sync runs in and the computer, with a heartbeat refreshed while the sync runs.
+//! folder of a running sync, wherever Charon can write there, and in Charon's own folders
+//! inside them. It names the job, the Charon the sync runs in and the computer, with a
+//! heartbeat refreshed while the sync runs.
 //!
 //! Charon keeps two of its own syncs apart by their folders' paths, and a path can't always
 //! tell: a share mounted under two names is one place under two paths. Another Charon (a
@@ -10,7 +11,9 @@
 //! folders, in the folders above them, and in the folders inside them that hold Charon's
 //! own folder. A note of another sync means the folders are busy, and the sync waits. Two
 //! syncs that start at the same moment each find the other's note, so at most one of them
-//! goes ahead.
+//! goes ahead. A sync of a folder inside another sync's folder may reach it through a share
+//! or mount that starts lower down, where the folders above it can't be seen: it finds the
+//! other sync's note at its own top.
 //!
 //! Whether the sync of a note is still at work is judged by this computer's clock alone,
 //! since two computers' clocks can be minutes or hours apart: a note that hasn't changed for
@@ -335,8 +338,7 @@ impl Notes {
         self.note.heartbeat = Utc::now();
         let Ok(bytes) = serde_json::to_vec_pretty(&self.note) else { return };
         for file in &self.files {
-            let there = file.parent().is_some_and(|folder| fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir()));
-            if !there {
+            if !file.parent().is_some_and(is_real_folder) {
                 continue;
             }
             if let Err(e) = atomic::write_into(file, &bytes) {
@@ -353,9 +355,14 @@ impl Notes {
 }
 
 impl Claim {
-    /// Leaves `note` in each of `roots` where Charon can write, then looks around them (see
-    /// `BusyWatch::around`). When another sync is at work there, nothing stays behind and
-    /// the error is that sync's note.
+    /// Leaves `note` in each of `roots` where Charon can write, and in the Charon folders of
+    /// the folders `inside` them, then looks around them (see `BusyWatch::around`). When
+    /// another sync is at work there, nothing stays behind and the error is that sync's note.
+    ///
+    /// A sync of a folder inside may reach it through a share or mount that starts lower
+    /// down, and then can't look in the folders above it: it finds this sync's note in its
+    /// own Charon folder. A Charon folder that's gone (or is now a link) gets no note, and
+    /// none is made.
     pub fn take(watch: &Arc<BusyWatch>, note: BusyNote, roots: &[&Path], inside: &[PathBuf]) -> std::result::Result<Claim, BusyNote> {
         let name = OsString::from(format!("{}{BUSY_EXTENSION}", uuid::Uuid::new_v4().simple()));
         let bytes = serde_json::to_vec_pretty(&note).unwrap_or_default();
@@ -371,6 +378,13 @@ impl Claim {
                 // A folder Charon can't write to (a card, a read-only share) can't carry a
                 // note; its notes from others are still looked for.
                 Err(e) => log::info!("no busy note in {} ({e})", root.display()),
+            }
+        }
+        for folder in inside.iter().map(|place| place.join(MARKER_FOLDER)).filter(|folder| is_real_folder(folder)) {
+            let file = folder.join(&name);
+            match atomic::write_into(&file, &bytes) {
+                Ok(()) => files.push(file),
+                Err(e) => log::info!("no busy note in {} ({e})", folder.display()),
             }
         }
         let other = watch.around(roots, inside, &note).into_iter().next();
@@ -409,6 +423,11 @@ impl Drop for Claim {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).remove();
         self.watch.hold(&self.name, false);
     }
+}
+
+/// Whether `folder` is there as a folder of its own, not a link to one.
+fn is_real_folder(folder: &Path) -> bool {
+    fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir())
 }
 
 /// This computer's name, as other computers' Charons show it.
@@ -511,6 +530,36 @@ mod tests {
         leave(&inner, &note("inner", "another"));
         assert!(watch.around(&[&outer], &[], &me).is_empty(), "inside is only looked at where told");
         assert_eq!(watch.around(&[&outer], std::slice::from_ref(&inner), &me).len(), 1);
+    }
+
+    #[test]
+    fn a_sync_of_a_folder_inside_finds_the_note_at_its_own_top() {
+        let (data, tmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mine, theirs) = (watch(&data.path().join("mine")), watch(&data.path().join("theirs")));
+        let (homes, laptop) = (tmp.path().join("homes"), tmp.path().join("laptop"));
+        let (photos, music) = (homes.join("alice/Photos"), homes.join("alice/Music"));
+        // Photos is another job's folder: the scan met Charon's own folder there.
+        fs::create_dir_all(photos.join(MARKER_FOLDER)).unwrap();
+        fs::create_dir_all(&music).unwrap();
+        fs::create_dir_all(&laptop).unwrap();
+        let claim = Claim::take(&mine, mine.note(&"homes".into(), "Homes"), &[&homes, &laptop], &[photos.clone(), music.clone()]).unwrap();
+        assert_eq!(notes_in(&photos), 1, "a note in the Charon folder inside");
+        assert!(!music.join(MARKER_FOLDER).exists(), "no Charon folder is made");
+
+        // Another Charon syncs Photos through a share that starts there, where nothing of
+        // "homes" is above it. (Mounting needs special rights: a link to the Charon folder
+        // of Photos plays the share's top.)
+        #[cfg(unix)]
+        {
+            let share = tmp.path().join("home");
+            fs::create_dir_all(&share).unwrap();
+            std::os::unix::fs::symlink(photos.join(MARKER_FOLDER), share.join(MARKER_FOLDER)).unwrap();
+            let refused = Claim::take(&theirs, theirs.note(&"photos".into(), "Photos"), &[&share], &[]).err().expect("the folder is busy");
+            assert_eq!(refused.job, "homes");
+        }
+        drop(claim);
+        assert_eq!(notes_in(&photos), 0, "taken away with the claim");
+        assert!(Claim::take(&theirs, theirs.note(&"photos".into(), "Photos"), &[&photos], &[]).is_ok());
     }
 
     #[test]
