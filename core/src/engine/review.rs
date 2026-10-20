@@ -316,9 +316,11 @@ impl Engine {
             }
             Ok(())
         })?;
-        // Changes made in the folders while it waited didn't count against it, and aren't in
-        // it: once it's done, the folders are looked at again.
-        crossing.outdated = waited && review.stale.load(Ordering::Relaxed);
+        // A list that waited is older than the folders: the sync it waited for changed them,
+        // and Charon may not have heard of it (nobody hears what another computer writes to a
+        // network share). Those changes didn't count against the list, and aren't in it: once
+        // it's done, the folders are looked at again.
+        crossing.outdated = waited;
         // The run's busy notes go into the folders before anything changes there, and before
         // the person is told it started.
         let claim = match self.claim_folders(&job, &review.survey) {

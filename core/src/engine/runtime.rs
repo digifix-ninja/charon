@@ -95,6 +95,15 @@ impl JobRuntime {
         self.checking.is_some()
     }
 
+    /// Stops the running sync, if there is one, as the person asked (Stop, pausing the job):
+    /// what it already carried stays, and the job's next sync waits for their OK.
+    pub fn stop_for_person(&mut self) {
+        if let Some(cancel) = &self.cancel {
+            cancel.store(true, Ordering::Relaxed);
+            self.stopped_by_person = true;
+        }
+    }
+
     /// Stops a running check or review preparation (the job changed under them).
     pub fn stop_looking(&mut self) {
         for flag in [self.checking.as_ref(), self.preparing.as_ref()].into_iter().flatten() {
@@ -162,6 +171,15 @@ pub(crate) struct Wanted {
     /// The person asked for it (Sync all, or Sync now that found another sync at work): it
     /// still starts while the job or everything is paused, as a trigger's run doesn't.
     pub by_hand: bool,
+}
+
+impl Wanted {
+    /// Whether `now`, the job's wanted run as it is now, still asks for what this one (read
+    /// earlier) asked for: a run the person asked for, or a trigger's run, which pausing
+    /// holds back.
+    pub fn asks_as(&self, now: &Wanted) -> bool {
+        self.by_hand == now.by_hand
+    }
 }
 
 /// A list the person confirmed whose sync waits for another sync to finish.

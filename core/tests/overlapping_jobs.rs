@@ -559,6 +559,32 @@ fn a_confirmed_sync_that_waited_leaves_newer_changes_on_its_row() {
 }
 
 #[test]
+fn a_confirmed_sync_that_waited_for_another_computer_leaves_what_it_wrote_on_its_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (laptop, nas) = (tmp.path().join("laptop"), tmp.path().join("nas"));
+    write(&laptop.join("a.txt"), "a");
+    let id = add(&engine, job_setup("Photos", &laptop, &nas, SyncMode::TwoWay));
+    let review = engine.prepare_review(&id).unwrap();
+    // Charon on another computer syncs the share; the person confirms meanwhile.
+    let note = another_charons_note(&nas, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+
+    // That sync writes into the share. This computer hears nothing of what another computer
+    // writes to a network share, so the job isn't told (no `note_change`), and no look runs.
+    write(&nas.join("from-studio.txt"), "theirs");
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(nas.join("a.txt").exists() && !laptop.join("from-studio.txt").exists(), "only what the person confirmed");
+    let row = view(&engine, &id);
+    assert_ne!(row.status, JobStatus::InSync, "from-studio.txt still waits");
+    assert!(engine.check_due(&id, 15), "looked at again at once");
+    engine.check(&id);
+    eventually("the new look: from-studio.txt waits for an OK", || view(&engine, &id).waiting.is_some_and(|waiting| waiting.items == 1));
+}
+
+#[test]
 fn a_confirmed_sync_keeps_saying_what_it_waits_for() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = plain_engine(&tmp.path().join("data"));

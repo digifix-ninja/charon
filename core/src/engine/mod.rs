@@ -310,7 +310,6 @@ impl Engine {
         if paused {
             self.stop_unattended();
             self.call_off_all_confirmed(" (Pause everything)");
-            self.drop_all_wanted("everything is paused");
         }
         saved?;
         self.emit(EngineEvent::Settings(self.settings()));

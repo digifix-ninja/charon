@@ -163,8 +163,7 @@ impl Engine {
         let saved = self.change_job(id, |job| job.paused = paused);
         if paused {
             // Even when the pause couldn't be saved: the person wants it to stop.
-            self.cancel(id);
-            self.drop_wanted(id, |_| true, "the job is paused");
+            self.stop_paused(id);
         }
         saved?;
         self.inner.journal.info(id, if paused { "paused" } else { "resumed" });
