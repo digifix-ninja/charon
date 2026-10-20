@@ -6,7 +6,7 @@
 
 use crate::engine::{runs, Engine, EngineEvent};
 use crate::error::{Error, Result};
-use crate::model::{human_bytes, human_count, plural, Job, JobSetup, Warning};
+use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
 use crate::run::{Copier, Found, Markers, Room, Trash, TrashLook, Unread};
 use crate::scan::{
@@ -276,17 +276,19 @@ impl Engine {
             match self.distrust(job, &memory, folded, &markers) {
                 Some(reason) => {
                     let text = format!(
-                        "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and files that differ are kept twice or left for you."
+                        "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and {}.",
+                        Self::differing_files(setup.conflict)
                     );
                     holds.push(text.clone());
                     warnings.push(Warning::caution(text));
                     (Some(memory), false, Baseline::new())
                 }
                 None if memory.tokens.is_none() => {
-                    warnings.push(Warning::info(
+                    warnings.push(Warning::info(format!(
                         "This is the first two-way sync of these folders (or the first since the job's folders or mode changed). \
-                         Charon compares both and removes nothing: items only on one side are copied to the other, and files that differ are kept twice or left for you.",
-                    ));
+                         Charon compares both and removes nothing: items only on one side are copied to the other, and {}.",
+                        Self::differing_files(setup.conflict)
+                    )));
                     if job.last_synced.is_some() {
                         holds.push("Charon has no memory of this job's last sync, so it compares both folders afresh.".into());
                     }
@@ -492,6 +494,18 @@ impl Engine {
             housekeeping,
             made_at: Utc::now(),
         })
+    }
+
+    /// What a two-way sync without a memory does with files that differ, by the job's rule
+    /// for conflicts.
+    fn differing_files(rule: ConflictRule) -> &'static str {
+        match rule {
+            ConflictRule::Ask => "files that differ are left for you to choose",
+            ConflictRule::KeepBoth => "files that differ are kept twice",
+            ConflictRule::NewestWins => {
+                "where files differ, the version saved last replaces the other, which goes to .charon-trash (both are kept when the times can't tell)"
+            }
+        }
     }
 
     /// App libraries and databases this sync changes: copied while their app writes to them,

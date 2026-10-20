@@ -43,7 +43,7 @@ impl Schedule {
         let mut date = after.date_naive();
         for _ in 0..3 {
             let time = date.and_hms_opt(hour as u32, minute as u32, 0)?;
-            // A time skipped by a daylight-saving change counts as the next valid moment.
+            // A time a daylight-saving change skips doesn't exist that day: it comes the next day.
             if let Some(candidate) = Local.from_local_datetime(&time).earliest() {
                 if candidate > after {
                     return Some(candidate.with_timezone(&Utc));

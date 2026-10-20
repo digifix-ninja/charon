@@ -17,7 +17,7 @@ const RULE_NAMES = { "keep-both": "Keep both", "newest-wins": "Newest wins", ask
 
 /** What each mode does, in one sentence. Backup's depends on safe deletes. */
 const MODE_SENTENCES = {
-  mirror: "The destination becomes an exact copy: files removed from the source are removed there too.",
+  mirror: "The destination becomes a copy of the source: files removed from the source are removed there too.",
   backup: "Files removed from the source stay. Changed files replace the older copy (the older copy goes to .charon-trash).",
   "backup-unsafe": "Files removed from the source stay. Changed files replace the older copy, which is gone at once (safe deletes are off).",
   "two-way": "Changes flow both ways. Deleting a file on either side deletes it on the other.",

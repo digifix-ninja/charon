@@ -13,8 +13,11 @@
 //! | changed            | changed (differently)   | conflict, settled by the job's rule |
 //!
 //! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
-//! deletion, the edit wins: Charon never throws away work. A file meeting a folder, and a
-//! link taking the place of a file or folder, are always a question for the person. When
+//! deletion, the edit wins: Charon never throws away work. An item one side changed into
+//! another kind (a folder that became a file) crosses like any change, unless the folder it
+//! replaces holds changes or items Charon leaves alone; a file meeting a folder that both
+//! sides changed, and a link taking the place of a file or folder, are a question for the
+//! person. When
 //! the newest version wins a conflict, the other version still goes to the trash; and when
 //! "newest" can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time
 //! that went backwards), both versions are kept instead. Places that couldn't be read on
@@ -26,7 +29,8 @@
 //! treated as a conflict, settled by the job's rule (never by "newest").
 //!
 //! Without a baseline (the first sync, or a memory Charon can't trust) every difference is
-//! a conflict or a copy: nothing is ever deleted.
+//! a copy or a conflict, settled by the job's rule: nothing is removed, and a version that
+//! "newest wins" replaces goes to the trash.
 //!
 //! An app library or a database whose files changed on both sides is never mixed: the
 //! whole unit becomes one conflict (see `plan::units`).

@@ -60,7 +60,7 @@ const setupKey = j => JSON.stringify([j.source, j.destination, j.mode, j.conflic
 function run(fields) {
   return {
     startedAt: ago(5 * MIN), finishedAt: ago(4 * MIN),
-    copied: 0, deleted: 0, bytes: 0, conflicts: 0, failed: 0, skipped: 0, leftOut: 0, kept: 0, unreadable: 0, settled: 0, unkept: 0,
+    copied: 0, deleted: 0, bytes: 0, conflicts: 0, failed: 0, skipped: 0, leftOut: 0, kept: 0, unreadable: 0, foundUnreadable: 0, settled: 0, unkept: 0, failedItems: [],
     cancelled: false, error: null, approved: true,
     ...fields,
   };

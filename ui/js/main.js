@@ -189,7 +189,7 @@ class App {
   }
 
   /**
-   * Charon is quitting and stops running syncs first, between two files: says what it
+   * Charon is quitting and stops running syncs first, at a safe point: says what it
    * waits for, so it doesn't look stuck. The app closes by itself.
    */
   quitting({ jobs = [] } = {}) {
@@ -199,7 +199,7 @@ class App {
     const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0];
     Modal.ask({
       title: "Stopping safely…",
-      body: `Charon finishes the file it's copying for ${list}, then quits. What was carried is recorded, so nothing is lost.`,
+      body: `Charon stops the sync of ${list} at a safe point, then quits. A file it was copying stays as it was, and what already crossed is recorded, so nothing is lost.`,
       buttons: [],
     });
   }

@@ -315,7 +315,7 @@ export class JobEditor extends Sheet {
         body: [
           `With full automation, “${name}” copies, replaces and removes files by itself, without showing you the list first. ${AUTOMATION_RISKS[d.mode]}`,
           "A wrong folder, a drive mounted in another place, damaged or encrypted files, or a mistake on one side is carried over before you notice.",
-          "Charon still stops when one side looks empty, or when too much would be removed or replaced within a day: half of a side's files (5 or more), more than a quarter of them (21 or more), or over 1,000. Smaller or slower damage is carried over.",
+          "Charon still stops when one side looks empty, when too much would be removed or replaced within a day (half of a side's files, 5 or more; more than a quarter of them, 21 or more; or over 1,000), or when its own syncs since you last confirmed a list have removed or replaced more than a quarter of a side (21 files or more). Damage smaller than that is carried over.",
           trash,
         ],
         buttons: [
