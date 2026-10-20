@@ -258,10 +258,15 @@ impl Survey {
 
     /// The path of `key` as the person sees it: as spelled on the side that has it.
     pub fn spelling(&self, key: &str) -> String {
-        if self.source.contains(key) || self.source.has_spelling(key) {
-            self.source.spelling(key).to_string()
+        Self::spelled(&self.source, &self.destination, key)
+    }
+
+    /// `spelling`, from the two scans before a survey is made of them.
+    pub(crate) fn spelled(source: &Snapshot, destination: &Snapshot, key: &str) -> String {
+        if source.contains(key) || source.has_spelling(key) {
+            source.spelling(key).to_string()
         } else {
-            self.destination.spelling(key).to_string()
+            destination.spelling(key).to_string()
         }
     }
 
@@ -393,7 +398,7 @@ impl Engine {
                 "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and {}.",
                 Self::differing_files(setup.conflict)
             );
-            if let Some(found) = Self::one_side_only(&plan, memory) {
+            if let Some(found) = Self::one_side_only(&plan, memory, |key| Survey::spelled(&source, &destination, key)) {
                 text = format!("{text} {found}");
             }
             holds.push(text.clone());
@@ -593,7 +598,7 @@ impl Engine {
     /// a record Charon can't decide with (the memory it distrusts, or 0.2's): those were most
     /// likely removed on one side since, and come back. `None` when nothing is on one side
     /// only.
-    fn one_side_only(plan: &Plan, memory: &Memory) -> Option<String> {
+    fn one_side_only(plan: &Plan, memory: &Memory, spelled: impl Fn(&str) -> String) -> Option<String> {
         let only_on = |side: Side| -> Vec<&str> {
             plan.actions
                 .iter()
@@ -619,8 +624,11 @@ impl Engine {
         if back.is_empty() {
             return Some(copied);
         }
-        // Named by the topmost of them: a folder that comes back stands for what's inside.
-        let topmost: Vec<&str> = back.iter().copied().filter(|path| !Keys::ancestors(path).any(|folder| back.contains(&folder))).collect();
+        // Named by the topmost of them: a folder that comes back stands for what's inside. The
+        // plan's keys are folded where a drive ignores case: the names are as on the disk.
+        let topmost: Vec<String> =
+            back.iter().copied().filter(|path| !Keys::ancestors(path).any(|folder| back.contains(&folder))).map(spelled).collect();
+        let topmost: Vec<&str> = topmost.iter().map(String::as_str).collect();
         Some(format!(
             "{copied} By Charon's record of the last sync, {} of them {} on both sides then, so {} most likely removed since: {}.",
             human_count(back.len() as u64),
@@ -1212,6 +1220,7 @@ mod tests {
 
     #[test]
     fn a_fresh_comparison_says_what_it_brings_back() {
+        let as_is = |key: &str| key.to_string();
         let file = Entry::file(1, 10_000);
         let mut plan = Plan::default();
         plan.push(Action::copy(Side::Destination, "a.txt", file, None));
@@ -1221,14 +1230,14 @@ mod tests {
         plan.push(Action::copy(Side::Destination, "c.txt", file, Some(Entry::file(2, 20_000))));
         let mut memory = Memory::default();
         assert_eq!(
-            Engine::one_side_only(&plan, &memory).as_deref(),
+            Engine::one_side_only(&plan, &memory, as_is).as_deref(),
             Some("4 items are only on one side (3 on the source, 1 on the destination) and are copied to the other.")
         );
         memory.baseline.insert("Photos", Pair::new(Entry::dir(), Entry::dir()));
         memory.baseline.insert("Photos/x.jpg", Pair::new(file, file));
         memory.earlier.insert("B.txt".into());
         assert_eq!(
-            Engine::one_side_only(&plan, &memory).as_deref(),
+            Engine::one_side_only(&plan, &memory, as_is).as_deref(),
             Some(
                 "4 items are only on one side (3 on the source, 1 on the destination) and are copied to the other. \
                  By Charon's record of the last sync, 3 of them were on both sides then, so they were most likely removed since: “Photos” and “b.txt”."
@@ -1238,10 +1247,15 @@ mod tests {
         let mut one = Plan::default();
         one.push(Action::copy(Side::Source, "b.txt", file, None));
         assert_eq!(
-            Engine::one_side_only(&one, &memory).as_deref(),
+            Engine::one_side_only(&one, &memory, as_is).as_deref(),
             Some("1 item only on the destination is copied to the source. By Charon's record of the last sync, 1 of them was on both sides then, so it was most likely removed since: “b.txt”.")
         );
-        assert_eq!(Engine::one_side_only(&Plan::default(), &memory), None);
+        assert_eq!(Engine::one_side_only(&Plan::default(), &memory, as_is), None);
+        // Where a drive ignores case, the plan's keys are folded: the names are as on the disk.
+        let mut folded = Plan::default();
+        folded.push(Action::CreateDir { side: Side::Destination, path: "photos".into() });
+        let on_disk = |key: &str| if key == "photos" { "Photos".to_string() } else { key.to_string() };
+        assert!(Engine::one_side_only(&folded, &memory, on_disk).is_some_and(|text| text.ends_with("removed since: “Photos”.")));
     }
 
     /// Only what really is an app's package or a database asks for its app to be closed:

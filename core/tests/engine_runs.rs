@@ -702,6 +702,7 @@ fn marker_token(root: &Path, id: &str) -> String {
 #[test]
 fn a_backup_leaves_alone_copies_whose_dates_didnt_stick() {
     use charon_core::plan::{Baseline, Pair};
+    use charon_core::scan::Volume;
     use charon_core::store::Landings;
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
@@ -722,7 +723,9 @@ fn a_backup_leaves_alone_copies_whose_dates_didnt_stick() {
     let mut landed = Baseline::new();
     landed.insert("old.txt", Pair::new(seen(&src.join("old.txt")), seen(&dst.join("old.txt"))));
     let landings = Landings::new(data.join("landings"));
-    landings.save(&id, &job.setup, false, &marker_token(&dst, &id), &landed).unwrap();
+    // Kept with keys folded as the job's looks fold them: where a drive ignores case.
+    let folded = [&src, &dst].iter().any(|root| !Volume::of(root).case_sensitive);
+    landings.save(&id, &job.setup, folded, &marker_token(&dst, &id), &landed).unwrap();
     let review = engine.prepare_review(&id).unwrap();
     assert_eq!(review.tally.destination.replaced, 0);
     assert!(review.warnings.iter().any(|w| w.level == Level::Info && w.text.contains("other dates")), "{:?}", review.warnings);
