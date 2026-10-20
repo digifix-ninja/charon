@@ -1089,9 +1089,22 @@ impl<'a> Executor<'a> {
                     }
                 };
                 self.touch(&kept);
-                if !self.replace(to, &partial, &target, &relative, &old)? {
-                    let _ = fs::remove_file(&kept);
-                    return Ok(None);
+                let copy = Identity::at(&partial);
+                match self.replace(to, &partial, &target, &relative, &old) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let _ = fs::remove_file(&kept);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        // With the old version still in its place, its copy in the trash goes:
+                        // each sync that fails here (an app holds the file open) would leave
+                        // one more.
+                        if Self::still_in_place(&target, &old, copy) {
+                            let _ = fs::remove_file(&kept);
+                        }
+                        return Err(e);
+                    }
                 }
             }
             Some(_) if keep_old => {
@@ -1273,6 +1286,14 @@ impl<'a> Executor<'a> {
             // Under its temporary name, the next sync moves it into the trash.
             Err(e) => log::error!("couldn't move {} into the trash: {e}; it stays at {}", relative, aside.display()),
         }
+    }
+
+    /// Whether the version `old` is at `target` after a replacement failed: it never left,
+    /// or it was put back. Not when the new copy (`copy`) took the name after all, however
+    /// much it looks like the old version: then the trash holds the only copy of that one.
+    fn still_in_place(target: &Path, old: &Entry, copy: Option<Identity>) -> bool {
+        let looks_old = matches!(Self::look(target), Ok(Some(now)) if Self::same_after_rename(&now, old));
+        looks_old && (copy.is_none() || Identity::at(target) != copy)
     }
 
     /// Whether an item found after it was renamed is still the one seen before: the same
@@ -2069,6 +2090,47 @@ mod tests {
         assert_eq!(fs::read_to_string(&target).unwrap(), "saved by an app");
         assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
         assert!(!executor.replace(Side::Destination, &Copier::partial_path(&target), &target, "notes.txt", &planned).unwrap());
+    }
+
+    /// A replacement that fails while the old version is still in its place (an app holds
+    /// the file open, say) leaves no copy of it in the trash: each sync that tries again
+    /// would leave one more.
+    #[test]
+    fn a_replacement_that_fails_leaves_no_copy_of_the_old_version_in_the_trash() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        write(&shores.source.join("report.txt"), "new version", 1_700_000_000);
+        let target = shores.destination.join("report.txt");
+        write(&target, "old", 1_600_000_000);
+        let (from, old) = (seen(&shores.source.join("report.txt")), seen(&target));
+        let observer = |_: &crate::model::Progress| {};
+        let mut meter = ProgressMeter::for_plan(&Plan::default(), &observer);
+        let staged = executor.stage(Side::Destination, "report.txt", &from, Some(&old), false, &mut meter).unwrap().unwrap();
+        // The copy can't take the name (here it's gone, as a drive may refuse the rename).
+        fs::remove_file(&staged.partial).unwrap();
+        assert!(executor.commit(staged).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(Trash::look(&shores.destination, 0, true).bytes, 0, "no copy of the old version is left in the trash");
+    }
+
+    /// After a failed replacement, only the old version itself counts as still in its place:
+    /// never the new copy that took the name, however much it looks like the old one.
+    #[test]
+    fn only_the_old_version_itself_counts_as_still_in_place() {
+        let (_tmp, shores) = shores();
+        let target = shores.destination.join("vault.img");
+        write(&target, "old", 1_600_000_000);
+        let old = seen(&target);
+        let copy = Copier::partial_path(&target);
+        write(&copy, "new", 1_600_000_000);
+        let copy_identity = Identity::at(&copy);
+        assert!(Executor::still_in_place(&target, &old, copy_identity));
+        fs::rename(&copy, &target).unwrap();
+        assert!(!Executor::still_in_place(&target, &old, copy_identity), "the new copy, with the old one's size and time");
+        fs::remove_file(&target).unwrap();
+        assert!(!Executor::still_in_place(&target, &old, copy_identity));
     }
 
     /// Something new took the name while the old item was aside: the old item goes into the
