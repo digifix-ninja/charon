@@ -1028,6 +1028,46 @@ fn work_saved_into_the_trash_is_shown_and_kept() {
     assert_eq!(fs::read_to_string(&kept).unwrap(), "the report, with today's work");
 }
 
+/// The person opens a dated folder of .charon-trash in Finder to get a removed file back,
+/// and Finder writes its .DS_Store there. That's nobody's work: nothing is held up, nothing
+/// warns, and the folder is emptied when its time comes.
+#[test]
+fn what_finder_writes_into_the_trash_holds_nothing_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for i in 0..10 {
+        write(&a.join(format!("f{i}.txt")), "x");
+    }
+    write(&a.join("report.txt"), "the report");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+    fs::remove_file(a.join("report.txt")).unwrap();
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    let trash = b.join(".charon-trash");
+    let kept = walk(&trash).into_iter().find(|p| p.ends_with("report.txt")).expect("in the trash");
+
+    // Weeks later, the person looks into that folder in Finder.
+    let old = trash.join(format!("{}_0a0b0c", (chrono::Local::now() - chrono::Duration::days(40)).format("%Y-%m-%d_%H-%M-%S")));
+    fs::rename(kept.parent().unwrap(), &old).unwrap();
+    write(&old.join(".DS_Store"), "Finder's view of the folder");
+    write(&a.join("f0.txt"), "edited");
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    assert!(engine.job(&id).unwrap().job.held.is_none(), "{:?}", engine.job(&id).unwrap().job.held);
+    assert_eq!(fs::read_to_string(b.join("f0.txt")).unwrap(), "edited", "ran by itself");
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.warnings.iter().all(|w| !w.text.contains("changed after Charon put")), "{:?}", review.warnings);
+    assert!(review.housekeeping.iter().any(|line| line.contains("Also empties 2 items")), "{:?}", review.housekeeping);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait(&engine, &id);
+    assert!(!old.exists(), "emptied");
+}
+
 /// A sync that would fill a drive says so first, and its copies fail with the reason
 /// instead of filling the drive to the last byte.
 #[test]

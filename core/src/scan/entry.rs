@@ -1,7 +1,8 @@
 //! A file, folder or link as Charon sees it, and a whole folder as a sorted map of them,
 //! together with what the scan learned about the places it couldn't or mustn't touch.
 
-use crate::scan::{Keys, Refusal, Volume};
+use crate::scan::cloud::CloudPlaces;
+use crate::scan::{CloudService, Keys, Refusal, Volume};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -224,11 +225,14 @@ pub struct ScanFacts {
     /// Items left out (not readable as a name, special files, links on Windows).
     pub(crate) skipped: Vec<Skipped>,
     /// Items left out without a note because their names are kept for Charon's own use
-    /// (its trash, its marker, its half-copied files) or for the drive's (its folders at the
-    /// top): key → the path as spelled on disk. Those names are matched as they are written,
-    /// not by key, so an item whose key is the same but whose name is written in another
-    /// case is left alone too, on either side.
+    /// (its trash, its marker, its half-copied files), for the drive's (its folders at the
+    /// top) or for a cloud service's (its placeholders): key → the path as spelled on disk.
+    /// Those names are matched as they are written, not by key, so an item whose key is the
+    /// same but whose name is written in another case is left alone too, on either side.
     pub(crate) reserved: BTreeMap<String, String>,
+    /// The folders where a cloud service keeps files: there, a file named like its
+    /// placeholders is its own (see `scan::cloud`).
+    pub(crate) clouds: CloudPlaces,
     /// Leftover half-copied files from an interrupted run: on-disk path, size and time.
     pub(crate) partials: Vec<(String, Entry)>,
     /// Charon's own folders met: at the top, and in the folders of other jobs that are the
@@ -368,6 +372,12 @@ impl Snapshot {
         self.facts.reserved.contains_key(key) || self.facts.skipped.iter().any(|skipped| skipped.key.as_deref() == Some(key))
     }
 
+    /// The cloud service that would take an item at `key` here for its placeholder: the item
+    /// is named like one, in a folder where that service keeps files (see `scan::cloud`).
+    pub fn placeholder_service(&self, key: &str) -> Option<CloudService> {
+        self.facts.clouds.service_taking(key)
+    }
+
     /// Charon's own folders met in the folder, with the markers they hold.
     pub fn charon_folders(&self) -> &[CharonFolder] {
         &self.facts.charon_folders
@@ -466,6 +476,7 @@ impl Snapshot {
         for skipped in &mut self.facts.skipped {
             skipped.key = skipped.key.as_deref().map(Keys::fold);
         }
+        self.facts.clouds.fold();
         self.facts.unread = std::mem::take(&mut self.facts.unread).iter().map(|key| Keys::fold(key)).collect();
         for twin in twins {
             self.freeze(&twin, "another item in this folder has the same name in different upper/lower case, and one of the drives can't hold both, so Charon leaves them alone");

@@ -47,6 +47,15 @@ fn temp_name(path: &Path) -> PathBuf {
     path.with_file_name(format!(".{name}.{}-{n}.tmp", std::process::id()))
 }
 
+/// The name of the file a temporary file named `temp` is written for, if `temp` is one
+/// (`.charon.json.4711-3.tmp` → `charon.json`, see `temp_name`).
+pub(crate) fn written_for(temp: &str) -> Option<&str> {
+    let (name, counter) = temp.strip_prefix('.')?.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let (process, n) = counter.split_once('-')?;
+    let number = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    (!name.is_empty() && number(process) && number(n)).then_some(name)
+}
+
 /// Makes the rename itself survive a power cut (macOS and Linux; Windows has no such call).
 fn sync_folder(folder: &Path) {
     #[cfg(unix)]
@@ -70,6 +79,17 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"two");
         let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn a_temporary_name_tells_the_file_it_is_written_for() {
+        let temp = temp_name(Path::new("data/0123456789abcdef0123456789abcdef.json"));
+        assert_eq!(written_for(temp.file_name().unwrap().to_str().unwrap()), Some("0123456789abcdef0123456789abcdef.json"));
+        assert_eq!(written_for(".notes.txt.12-0.tmp"), Some("notes.txt"));
+        assert_eq!(written_for("notes.txt.12-0.tmp"), None, "a temporary name is hidden");
+        assert_eq!(written_for(".notes.tmp"), None);
+        assert_eq!(written_for(".notes.txt.12.tmp"), None);
+        assert_eq!(written_for("..12-0.tmp"), None);
     }
 
     #[test]

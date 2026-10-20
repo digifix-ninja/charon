@@ -126,6 +126,22 @@ impl Marker {
             .collect()
     }
 
+    /// Whether `name` is the name of a file Charon keeps in its own folder: a job's marker
+    /// (`<job>.json`), a probe (`<id>.probe`), a note that a sync is at work (any `.busy`
+    /// file, as each one is heeded, see `BusyWatch`), or one of them while it's written (see
+    /// `atomic::write`). Markers and probes are named after an id of 32 hex digits, so a
+    /// folder of the person's own that's only named like Charon's (holding `settings.json`)
+    /// isn't taken for Charon's.
+    pub fn is_charons_file(name: &str) -> bool {
+        let name = atomic::written_for(name).unwrap_or(name);
+        name.ends_with(crate::run::BUSY_EXTENSION) || [".json", PROBE_EXTENSION].iter().any(|extension| name.strip_suffix(extension).is_some_and(Self::is_id))
+    }
+
+    /// Whether `id` is an id as Charon makes them, for a job or a probe: 32 hex digits.
+    fn is_id(id: &str) -> bool {
+        id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
     /// Writes the marker for good (on the drive, not only in its memory).
     pub fn write(&self, root: &Path) -> crate::Result<()> {
         let folder = Self::real_folder(root)?;
@@ -255,6 +271,18 @@ mod tests {
         let mut jobs = Marker::jobs_in(tmp.path());
         jobs.sort();
         assert_eq!(jobs, vec!["job1".to_string(), "job2".to_string()]);
+    }
+
+    #[test]
+    fn charons_own_files_are_told_by_their_names() {
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let busy = crate::run::BUSY_EXTENSION;
+        for name in [format!("{id}.json"), format!("{id}{busy}"), format!("another-charon{busy}"), format!("{id}{PROBE_EXTENSION}"), format!(".{id}.json.4711-3.tmp"), format!(".{id}{busy}.4711-3.tmp")] {
+            assert!(Marker::is_charons_file(&name), "{name}");
+        }
+        for name in ["settings.json", "cache.tmp", ".settings.json.4711-3.tmp", "notes.probe", &format!("{id}.toml"), &format!("x{id}.json")] {
+            assert!(!Marker::is_charons_file(name), "{name}");
+        }
     }
 
     #[test]

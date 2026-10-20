@@ -3,10 +3,11 @@
 //! empty one (that would look like "everything in it was deleted").
 
 use crate::error::{Error, Result};
+use crate::scan::cloud::CloudFolders;
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, RootId,
-    Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, Placeholder,
+    RootId, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -55,6 +56,9 @@ impl<'a> Scanner<'a> {
         let drive_top = Self::top_of_drive(root);
         let mut walker = WalkDir::new(root).follow_links(false).min_depth(1).into_iter();
         let mut seen: u64 = 0;
+        let mut cloud = CloudFolders::of(root);
+        // Files a cloud service freed up, by their keys, with the placeholder left for each.
+        let mut freed_up: Vec<(String, String)> = Vec::new();
 
         while let Some(item) = walker.next() {
             if self.stops.iter().any(|stop| stop.load(Ordering::Relaxed)) {
@@ -85,6 +89,7 @@ impl<'a> Scanner<'a> {
             };
             let key = Keys::normalize(&disk);
             let name = Keys::name(&key);
+            cloud.note(&disk, file_type.is_file());
 
             if item.depth() == 1 && is_system_folder(name) {
                 if file_type.is_dir() {
@@ -97,6 +102,20 @@ impl<'a> Scanner<'a> {
                     snapshot.reserve(&key, &disk);
                 } else {
                     snapshot.leave_out(disk, Some(&key), "named like a folder drives keep for themselves, so Charon leaves it alone");
+                }
+                continue;
+            }
+            let placeholder = Placeholder::named(name).filter(|placeholder| file_type.is_file() && cloud.is_placeholder(&disk, placeholder.service));
+            if let Some(placeholder) = placeholder {
+                // A cloud service's placeholder for a file it freed up: the service's own,
+                // never synced, and its folder isn't empty. The file is the person's, only in
+                // the cloud now, and unless it's excluded or here after all, it's left alone
+                // on both sides (missing, it would look removed).
+                let item = Self::freed_up(&key, placeholder);
+                snapshot.reserve(&key, &disk);
+                snapshot.occupy_folders_of(&key);
+                if !self.filter.excludes(&item) {
+                    freed_up.push((item, disk));
                 }
                 continue;
             }
@@ -214,10 +233,31 @@ impl<'a> Scanner<'a> {
                 snapshot.leave_out(disk, Some(&key), "isn't a file or a folder (a socket, pipe or device)");
             }
         }
+        for (item, placeholder) in freed_up {
+            if !snapshot.contains(&item) && !snapshot.leaves_alone(&item) {
+                snapshot.freeze(
+                    &item,
+                    format!(
+                        "it's only in the cloud (only its placeholder “{}” is on this computer), so Charon leaves it alone (if that placeholder is an old copy, remove it)",
+                        Keys::name(&placeholder)
+                    ),
+                );
+            }
+        }
+        snapshot.facts_mut().clouds = cloud.places();
         if let Some(counter) = self.counter {
             counter(seen);
         }
         Ok(snapshot)
+    }
+
+    /// The key of the file a cloud service freed up, when the file at `key` is the
+    /// `placeholder` it left in its place.
+    fn freed_up(key: &str, placeholder: Placeholder) -> String {
+        match Keys::parent(key) {
+            Some(folder) => format!("{folder}/{}", placeholder.item),
+            None => placeholder.item.to_string(),
+        }
     }
 
     /// A file's size and time. On Windows they are read from the file itself, the way the
@@ -267,7 +307,9 @@ impl<'a> Scanner<'a> {
     }
 
     /// Whether an item named `.charon` or `.charon-trash` really is one of Charon's: a
-    /// folder holding only markers, or only dated trash folders (or nothing).
+    /// folder holding only Charon's own files (see `Marker::is_charons_file`), or only dated
+    /// trash folders (or nothing). The files the system scatters into every folder it shows
+    /// (Finder's `.DS_Store`, Explorer's `desktop.ini`) don't count.
     pub(crate) fn looks_like_charons(path: &Path, name: &str, is_dir: bool) -> bool {
         if !is_dir {
             return false;
@@ -276,9 +318,10 @@ impl<'a> Scanner<'a> {
         items.into_iter().all(|item| {
             let Ok(item) = item else { return false };
             let (Ok(kind), Some(inner)) = (item.file_type(), item.file_name().to_str().map(str::to_owned)) else { return false };
-            if name == MARKER_FOLDER {
-                kind.is_file()
-                    && [".json", crate::run::BUSY_EXTENSION, crate::run::PROBE_EXTENSION, ".tmp"].iter().any(|extension| inner.ends_with(extension))
+            if kind.is_file() && is_clutter(&inner) {
+                true
+            } else if name == MARKER_FOLDER {
+                kind.is_file() && crate::run::Marker::is_charons_file(&inner)
             } else {
                 kind.is_dir() && crate::run::Trash::is_run_folder(&inner)
             }
@@ -510,36 +553,70 @@ mod tests {
         assert!(windows_name_problem(".env").is_none());
     }
 
+    /// Ids of jobs, and of a note that a sync is at work, as Charon makes them.
+    const MINE: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+    const NOTE: &str = "00112233445566778899aabbccddeeff";
+
     #[test]
     fn the_persons_own_items_named_like_charons_folders_are_noted_not_hidden() {
         let tmp = tempfile::tempdir().unwrap();
         // Charon's own: the marker folder at the top, and another job's inside.
-        write(&tmp.path().join(".charon/job1.json"), "{}");
-        write(&tmp.path().join("inner/.charon/job2.json"), "{}");
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
         write(&tmp.path().join("inner/.charon-trash/2026-01-02_03-04-05/old.txt"), "x");
-        // The person's own.
+        // The person's own, whatever the names of the files in them end with.
         write(&tmp.path().join("projects/app/.charon/settings.toml"), "x");
+        write(&tmp.path().join("projects/web/.charon/settings.json"), "{}");
+        write(&tmp.path().join("projects/web/.charon/cache.tmp"), "x");
         write(&tmp.path().join("notes/.charon-trash"), "a file");
         let s = scan(tmp.path(), &[]);
         let mut noted: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
         noted.sort();
-        assert_eq!(noted, vec!["notes/.charon-trash", "projects/app/.charon"]);
+        assert_eq!(noted, vec!["notes/.charon-trash", "projects/app/.charon", "projects/web/.charon"]);
         assert!(s.is_occupied("projects/app") && s.is_occupied("inner"));
         assert!(!s.contains("projects/app/.charon/settings.toml"));
+        let mut met: Vec<&str> = s.charon_folders().iter().map(|c| c.folder.as_str()).collect();
+        met.sort();
+        assert_eq!(met, vec!["", "inner"]);
     }
 
     #[test]
     fn charons_folders_met_are_noted_with_their_markers() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join(".charon/mine.json"), "{}");
-        write(&tmp.path().join("Work/Inner/.charon/other.json"), "{}");
-        write(&tmp.path().join("Busy/.charon/0123.busy"), "{}");
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!("Work/Inner/.charon/{OTHER}.json")), "{}");
+        write(&tmp.path().join(format!("Busy/.charon/{NOTE}.busy")), "{}");
         write(&tmp.path().join("notes/.charon/settings.toml"), "the person's own");
         let s = scan(tmp.path(), &[]);
         let mut seen: Vec<(&str, Vec<String>)> = s.charon_folders().iter().map(|c| (c.folder.as_str(), c.jobs.clone())).collect();
         seen.sort();
-        assert_eq!(seen, vec![("", vec!["mine".to_string()]), ("Busy", vec![]), ("Work/Inner", vec!["other".to_string()])]);
+        assert_eq!(seen, vec![("", vec![MINE.to_string()]), ("Busy", vec![]), ("Work/Inner", vec![OTHER.to_string()])]);
         assert!(s.is_occupied("Busy"), "a folder holding Charon's own folder is never removed");
+    }
+
+    /// Finder leaves a `.DS_Store` in every folder it shows, Charon's trash too when the
+    /// person looks for a removed file there. That doesn't make it the person's folder.
+    #[test]
+    fn the_systems_clutter_in_charons_folders_leaves_them_charons() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!(".charon/.{MINE}.json.4711-3.tmp")), "{}");
+        write(&tmp.path().join(format!(".charon/{NOTE}.busy")), "{}");
+        write(&tmp.path().join(format!(".charon/._{NOTE}.busy")), "x");
+        write(&tmp.path().join(".charon/.DS_Store"), "x");
+        write(&tmp.path().join(".charon-trash/2026-01-02_03-04-05/old.txt"), "x");
+        write(&tmp.path().join(".charon-trash/.DS_Store"), "x");
+        write(&tmp.path().join(".charon-trash/desktop.ini"), "x");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
+        write(&tmp.path().join("inner/.charon/Thumbs.db"), "x");
+        let s = scan(tmp.path(), &[]);
+        assert!(s.skipped().is_empty(), "{:?}", s.skipped());
+        let reserved: Vec<&str> = s.reserved().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(reserved, vec![".charon", ".charon-trash", "inner/.charon"]);
+        let mut seen: Vec<(&str, Vec<String>)> = s.charon_folders().iter().map(|c| (c.folder.as_str(), c.jobs.clone())).collect();
+        seen.sort();
+        assert_eq!(seen, vec![("", vec![MINE.to_string()]), ("inner", vec![OTHER.to_string()])]);
     }
 
     #[test]
@@ -595,6 +672,64 @@ mod tests {
         assert!(s.is_occupied("inner"));
         assert!(s.get("inner/.charon-trash").is_none());
         assert!(s.get(".charon-trash").is_none());
+    }
+
+    /// Nextcloud and ownCloud (and iCloud Drive before macOS 14, see `cloud`) leave a
+    /// placeholder in place of a file they free up. Missing from the scan, the file would look
+    /// removed, and the other side's copy would be removed too.
+    #[test]
+    fn a_file_a_cloud_service_freed_up_is_left_alone_not_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The client's journal, at the top of the folder it syncs.
+        write(&tmp.path().join("Nextcloud/.sync_0123456789ab.db"), "journal");
+        let root = tmp.path().join("Nextcloud/Work");
+        write(&root.join("Docs/Report.pdf.nextcloud"), " ");
+        write(&root.join("Plans.odt.nextcloud"), " ");
+        // Named like what the patterns leave out, a placeholder is still one.
+        write(&root.join("Docs/Budget.xlsx.owncloud"), " ");
+        // Downloaded again: the file is here, and its placeholder is a leftover.
+        write(&root.join("Docs/Back.pdf.nextcloud"), " ");
+        write(&root.join("Docs/Back.pdf"), "the file");
+        // Excluded: left alone by the patterns, like its placeholder.
+        write(&root.join("Docs/draft.tmp.nextcloud"), " ");
+        let s = scan(&root, &["*.tmp", "*.owncloud"]);
+        let mut frozen: Vec<&str> = s.frozen_places().map(|(key, _)| key.as_str()).collect();
+        frozen.sort();
+        assert_eq!(frozen, vec!["Docs/Budget.xlsx", "Docs/Report.pdf", "Plans.odt"]);
+        assert!(s.frozen("Docs/Report.pdf").is_some_and(|why| why.contains("only in the cloud") && why.contains("Report.pdf.nextcloud") && why.contains("remove it")));
+        assert!(s.get("Docs/Back.pdf").is_some());
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/Back.pdf"], "placeholders are never synced");
+        assert!(s.leaves_alone("Docs/Report.pdf.nextcloud") && s.leaves_alone("Docs/Back.pdf.nextcloud") && s.leaves_alone("Docs/draft.tmp.nextcloud"));
+        assert!(s.is_occupied("Docs"), "a folder holding a placeholder isn't empty");
+        assert!(s.skipped().is_empty());
+        assert_eq!(s.placeholder_service("Docs/New.txt.nextcloud"), Some(crate::scan::CloudService::SyncClient), "nothing named so is made here");
+        assert_eq!(s.placeholder_service("Docs/New.txt"), None);
+    }
+
+    /// A copy of a placeholder where its cloud service keeps no files (a backup made by a tool
+    /// that copied a cloud folder as it was) is an ordinary file: it never keeps the file it
+    /// names from being synced there.
+    #[test]
+    fn a_copy_of_a_placeholder_elsewhere_is_an_ordinary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Nextcloud/.sync_0123456789ab.db"), "journal");
+        write(&tmp.path().join("Nextcloud/Docs/Report.pdf.nextcloud"), " ");
+        write(&tmp.path().join("Backup/Docs/Report.pdf.nextcloud"), " ");
+        write(&tmp.path().join("Backup/Docs/.Plans.key.icloud"), "placeholder");
+        // An ownCloud client's journal, with no placeholders in its folder yet.
+        write(&tmp.path().join("ownCloud/._sync_ba9876543210.db"), "journal");
+        let s = scan(&tmp.path().join("Backup"), &[]);
+        assert_eq!(s.frozen_places().count(), 0);
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/.Plans.key.icloud", "Docs/Report.pdf.nextcloud"]);
+        assert_eq!(s.placeholder_service("Docs/New.txt.nextcloud"), None);
+        assert_eq!(s.placeholder_service("Docs/.New.txt.icloud"), None);
+
+        // Scanned from above, each is told by its own folder.
+        let s = scan(tmp.path(), &[]);
+        assert_eq!(s.frozen_places().map(|(key, _)| key.as_str()).collect::<Vec<_>>(), vec!["Nextcloud/Docs/Report.pdf"]);
+        assert!(s.get("Backup/Docs/Report.pdf.nextcloud").is_some() && s.get("Nextcloud/Docs/Report.pdf.nextcloud").is_none());
+        assert!(s.placeholder_service("Nextcloud/New.txt.nextcloud").is_some() && s.placeholder_service("Backup/New.txt.nextcloud").is_none());
+        assert!(s.placeholder_service("ownCloud/Docs/New.txt.owncloud").is_some());
     }
 
     #[test]
@@ -734,7 +869,7 @@ mod tests {
     fn names_kept_for_charons_own_use_are_remembered() {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join(".charon-trash/2026-01-01_00-00-00/a.txt"), "x");
-        write(&tmp.path().join("inner/.charon/job.json"), "{}");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
         write(&tmp.path().join("a/.charon-00112233445566ff.part"), "half");
         write(&tmp.path().join("node_modules/x.js"), "x");
         write(&tmp.path().join("b.charon-partial/inside.txt"), "x");

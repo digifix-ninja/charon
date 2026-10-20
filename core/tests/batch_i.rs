@@ -191,3 +191,152 @@ fn a_folder_named_like_a_drives_own_is_left_alone_and_listed() {
     assert!(dst.join("a.txt").exists());
     assert!(!dst.join("lost+found").exists(), "left alone");
 }
+
+/// A folder a Nextcloud client syncs, in `tmp`: the client keeps its journal at the top of
+/// it. The job's folder is the folder `Work` inside it.
+fn synced_by_nextcloud(tmp: &Path) -> std::path::PathBuf {
+    write(&tmp.join("Nextcloud/.sync_0123456789ab.db"), "the client's journal");
+    let work = tmp.join("Nextcloud/Work");
+    fs::create_dir_all(&work).unwrap();
+    work
+}
+
+/// Frees up `file` the way Nextcloud does with virtual files: the file goes, and a
+/// placeholder takes its place.
+fn free_up(file: &Path) {
+    fs::remove_file(file).unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    write(&file.with_file_name(format!("{name}.nextcloud")), " ");
+}
+
+/// Downloads `file` again: its placeholder goes, and the file is back as it was.
+fn download(file: &Path, text: &str, secs: u64) {
+    let name = file.file_name().unwrap().to_str().unwrap();
+    fs::remove_file(file.with_file_name(format!("{name}.nextcloud"))).unwrap();
+    write(file, text);
+    set_modified(file, secs);
+}
+
+#[test]
+fn a_file_the_cloud_freed_up_never_looks_removed() {
+    for mode in [SyncMode::TwoWay, SyncMode::Mirror] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (synced_by_nextcloud(tmp.path()), tmp.path().join("dst"), tmp.path().join("data"));
+        for i in 0..10 {
+            write(&src.join(format!("Docs/n{i}.txt")), "x");
+        }
+        write(&src.join("Docs/Report.pdf"), "the report");
+        set_modified(&src.join("Docs/Report.pdf"), 1_700_000_000);
+        fs::create_dir_all(&dst).unwrap();
+        let engine = engine(&data);
+        let mut job = setup(&src, &dst, mode, ConflictRule::Ask);
+        job.full_automation = true;
+        let id = engine.add_job(job).unwrap().job.id;
+        confirm(&engine, &id);
+        assert!(dst.join("Docs/Report.pdf").exists());
+
+        free_up(&src.join("Docs/Report.pdf"));
+        assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+        wait(&engine, &id);
+        assert_eq!(fs::read_to_string(dst.join("Docs/Report.pdf")).unwrap(), "the report", "{mode:?}: the other side's copy stays");
+        assert!(!dst.join("Docs/Report.pdf.nextcloud").exists(), "{mode:?}: the placeholder isn't copied");
+        assert!(!dst.join(".charon-trash").exists(), "{mode:?}: nothing was removed");
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.total_steps, 0, "{mode:?}");
+        assert!(
+            review.notes.iter().any(|note| note.kind == NoteKind::Unreadable && note.path == "Docs/Report.pdf" && note.reason.contains("only in the cloud")),
+            "{mode:?}: {:?}",
+            review.notes
+        );
+
+        download(&src.join("Docs/Report.pdf"), "the report", 1_700_000_000);
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.total_steps, 0, "{mode:?}: in sync again");
+        assert!(review.notes.is_empty(), "{mode:?}: {:?}", review.notes);
+    }
+}
+
+/// A Mirror into a folder the cloud frees files up in never copies over a file that's only
+/// in the cloud, and never removes its placeholder (which would remove the file there).
+#[test]
+fn a_mirror_leaves_alone_what_the_cloud_freed_up_in_its_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), synced_by_nextcloud(tmp.path()), tmp.path().join("data"));
+    write(&src.join("Docs/Report.pdf"), "the report");
+    write(&src.join("Docs/Notes.txt"), "notes");
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::Mirror, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+
+    free_up(&dst.join("Docs/Report.pdf"));
+    write(&src.join("Docs/Report.pdf"), "edited on the source");
+    let review = confirm(&engine, &id);
+    assert!(review.notes.iter().any(|note| note.kind == NoteKind::Unreadable && note.path == "Docs/Report.pdf"), "{:?}", review.notes);
+    assert!(dst.join("Docs/Report.pdf.nextcloud").exists(), "the placeholder stays");
+    assert!(!dst.join("Docs/Report.pdf").exists(), "nothing is copied over the file in the cloud");
+}
+
+/// A backup made by a tool that copied a cloud folder as it was (Charon 0.2, rsync, cp)
+/// holds copies of the cloud's placeholders. On a drive where no cloud service keeps files
+/// they are ordinary files: the file each one names is backed up all the same, and a Mirror
+/// replaces the copy of the placeholder with the file.
+#[test]
+fn a_copy_of_a_placeholder_never_keeps_the_file_from_a_backup() {
+    for mode in [SyncMode::Mirror, SyncMode::Backup, SyncMode::TwoWay] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        write(&src.join("Docs/Report.pdf"), "the report");
+        write(&src.join("Docs/Plans.odt"), "the plans");
+        write(&src.join("Docs/Notes.txt"), "notes");
+        write(&dst.join("Docs/.Report.pdf.icloud"), "placeholder");
+        write(&dst.join("Docs/Plans.odt.nextcloud"), " ");
+        let engine = engine(&data);
+        let id = engine.add_job(setup(&src, &dst, mode, ConflictRule::Ask)).unwrap().job.id;
+        let review = confirm(&engine, &id);
+        assert!(review.notes.is_empty(), "{mode:?}: {:?}", review.notes);
+        assert_eq!(fs::read_to_string(dst.join("Docs/Report.pdf")).unwrap(), "the report", "{mode:?}");
+        assert_eq!(fs::read_to_string(dst.join("Docs/Plans.odt")).unwrap(), "the plans", "{mode:?}");
+        let copies = [dst.join("Docs/.Report.pdf.icloud"), dst.join("Docs/Plans.odt.nextcloud")];
+        match mode {
+            SyncMode::Mirror => assert!(copies.iter().all(|copy| !copy.exists()), "{mode:?}: replaced by the files"),
+            _ => assert!(copies.iter().all(|copy| copy.exists()), "{mode:?}: kept"),
+        }
+        if mode == SyncMode::TwoWay {
+            assert!(src.join("Docs/.Report.pdf.icloud").exists() && src.join("Docs/Plans.odt.nextcloud").exists(), "carried like any other file");
+        }
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.total_steps, 0, "{mode:?}: {:?}", review.steps);
+        assert!(review.notes.is_empty(), "{mode:?}: {:?}", review.notes);
+    }
+}
+
+/// Where a cloud service keeps files, Charon never makes a file named like its placeholder:
+/// the service would take it for its own, and the file it names for freed up.
+#[test]
+fn a_copy_of_a_placeholder_is_never_made_where_its_service_keeps_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("usb"), synced_by_nextcloud(tmp.path()), tmp.path().join("data"));
+    write(&src.join("Docs/a.txt"), "a");
+    write(&src.join("Docs/Plans.odt.nextcloud"), " ");
+    write(&src.join("Docs/Old.txt.nextcloud"), " ");
+    write(&dst.join("Docs/Plans.odt"), "the plans");
+    // Only in the cloud there.
+    write(&dst.join("Docs/Old.txt.nextcloud"), " ");
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    let review = confirm(&engine, &id);
+    let note = |path: &str| review.notes.iter().find(|note| note.path == path).unwrap_or_else(|| panic!("{path}: {:?}", review.notes));
+    let made = note("Docs/Plans.odt.nextcloud");
+    assert_eq!(made.kind, NoteKind::LeftOut);
+    assert!(made.reason.contains("named like a placeholder Nextcloud or ownCloud leaves") && made.reason.contains("on the destination"), "{}", made.reason);
+    let kept = note("Docs/Old.txt.nextcloud");
+    assert_eq!(kept.kind, NoteKind::LeftOut);
+    assert!(kept.reason.contains("is the placeholder Nextcloud or ownCloud left"), "{}", kept.reason);
+    assert_eq!(note("Docs/Old.txt").kind, NoteKind::Unreadable);
+    assert_eq!(review.notes.len(), 3, "{:?}", review.notes);
+
+    assert!(!dst.join("Docs/Plans.odt.nextcloud").exists(), "never made where the client would take it for its own");
+    assert_eq!(fs::read_to_string(src.join("Docs/Plans.odt")).unwrap(), "the plans");
+    assert_eq!(fs::read_to_string(dst.join("Docs/a.txt")).unwrap(), "a");
+    assert!(dst.join("Docs/Old.txt.nextcloud").exists() && src.join("Docs/Old.txt.nextcloud").exists());
+}
