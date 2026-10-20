@@ -10,6 +10,11 @@
 //! number on every volume of a kind. So the folder's creation time counts too, where the
 //! system keeps a believable one: two volumes formatted at different times differ there.
 //!
+//! A drive cloned from another (a sector copy) keeps all of these too: the volume's serial
+//! number, the folders' numbers and their creation times. Where the system gives every
+//! volume a name of its own (Windows), that name counts too, so the original and the clone,
+//! both plugged in, are two places.
+//!
 //! The very same drive, pulled out and plugged in again, keeps all of these. Where the
 //! system numbers each mount without ever using a number twice (Linux 6.8 and later), the
 //! mount counts too, so a drive that went away and came back is seen. Elsewhere a run finds
@@ -31,6 +36,11 @@ pub struct RootId {
     /// alike. Unknown in an identity an older Charon kept.
     #[serde(default)]
     mount: Option<u64>,
+    /// The volume's own name, where the system gives every volume one no other volume has
+    /// (Windows: the GUID of its `\\?\Volume{…}` name, which a clone doesn't share). Unknown
+    /// on a network share, and in an identity an older Charon kept.
+    #[serde(default)]
+    volume: Option<u128>,
 }
 
 /// A creation time this close to now isn't believed: some network and cloud file systems
@@ -60,18 +70,28 @@ impl RootId {
         RootId { mount: None, ..*self }.same_folder(other)
     }
 
-    /// Whether `self` and `other` are the same folder. A creation time or a mount only one
-    /// of them knows (or neither) doesn't count as a difference.
+    /// Whether `self` and `other` are the same folder. A creation time, a mount or a
+    /// volume name only one of them knows (or neither) doesn't count as a difference.
     pub fn same_folder(&self, other: &RootId) -> bool {
-        let born = match (self.born, other.born) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        };
-        let mount = match (self.mount, other.mount) {
-            (Some(a), Some(b)) => a == b,
-            _ => true,
-        };
-        self.device == other.device && self.index == other.index && born && mount
+        fn agree<T: PartialEq>(a: Option<T>, b: Option<T>) -> bool {
+            match (a, b) {
+                (Some(a), Some(b)) => a == b,
+                _ => true,
+            }
+        }
+        self.device == other.device && self.index == other.index && agree(self.born, other.born) && agree(self.mount, other.mount) && agree(self.volume, other.volume)
+    }
+
+    /// The GUID of a volume from a path that starts with its `\\?\Volume{…}\` name (as
+    /// Windows gives the real path of an open folder).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn volume_in(path: &str) -> Option<u128> {
+        let (guid, _) = path.strip_prefix(r"\\?\Volume{")?.split_once('}')?;
+        let digits: String = guid.chars().filter(|&c| c != '-').collect();
+        if digits.len() != 32 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        u128::from_str_radix(&digits, 16).ok()
     }
 
     /// The folder's creation time, when it's believable: not missing, not the start of
@@ -107,7 +127,7 @@ mod system {
 
     pub fn id_of(path: &Path) -> io::Result<Option<RootId>> {
         let meta = std::fs::metadata(path)?;
-        Ok(Some(RootId { device: meta.dev(), index: meta.ino(), born: RootId::born(&meta), mount: mount_of(path) }))
+        Ok(Some(RootId { device: meta.dev(), index: meta.ino(), born: RootId::born(&meta), mount: mount_of(path), volume: None }))
     }
 
     /// The unique number of the mount `path` is seen through (Linux 6.8 and later). The
@@ -141,7 +161,9 @@ mod system {
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
-    use windows_sys::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS};
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, GetFinalPathNameByHandleW, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, VOLUME_NAME_GUID,
+    };
 
     pub fn id_of(path: &Path) -> io::Result<Option<RootId>> {
         // A folder can only be opened with backup semantics; reading its information needs no rights.
@@ -157,7 +179,27 @@ mod system {
             index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
             born: folder.metadata().ok().and_then(|meta| RootId::born(&meta)),
             mount: None,
+            volume: volume_of(&folder),
         }))
+    }
+
+    /// The GUID of the volume the open `folder` is on, read from its real path under the
+    /// volume's own name. `None` on a network share, which has no such name.
+    fn volume_of(folder: &std::fs::File) -> Option<u128> {
+        let mut path = vec![0u16; 1024];
+        for _ in 0..2 {
+            // SAFETY: the handle is open for the duration of the call and `path` is valid for its length.
+            let length = unsafe { GetFinalPathNameByHandleW(folder.as_raw_handle() as _, path.as_mut_ptr(), path.len() as u32, VOLUME_NAME_GUID) } as usize;
+            if length == 0 {
+                return None;
+            }
+            if length < path.len() {
+                return RootId::volume_in(&String::from_utf16_lossy(&path[..length]));
+            }
+            // Too long for the buffer: `length` is the size it needs.
+            path.resize(length, 0);
+        }
+        None
     }
 }
 
@@ -207,18 +249,52 @@ mod tests {
 
     #[test]
     fn the_same_numbers_with_another_creation_time_are_another_folder() {
-        let a = RootId { device: 1, index: 2, born: Some(1_000), mount: None };
-        let b = RootId { device: 1, index: 2, born: Some(2_000), mount: None };
-        let unknown = RootId { device: 1, index: 2, born: None, mount: None };
+        let a = RootId { device: 1, index: 2, born: Some(1_000), mount: None, volume: None };
+        let b = RootId { device: 1, index: 2, born: Some(2_000), mount: None, volume: None };
+        let unknown = RootId { device: 1, index: 2, born: None, mount: None, volume: None };
         assert!(!a.same_folder(&b));
         assert!(a.same_folder(&unknown) && unknown.same_folder(&b));
-        assert!(!a.same_folder(&RootId { device: 1, index: 3, born: Some(1_000), mount: None }));
+        assert!(!a.same_folder(&RootId { device: 1, index: 3, born: Some(1_000), mount: None, volume: None }));
+    }
+
+    /// A drive cloned from another keeps its serial number, folder numbers and creation
+    /// times. Both plugged in, only the volumes' own names tell them apart.
+    #[test]
+    fn a_folder_on_a_cloned_drive_is_another_place() {
+        let original = RootId { device: 0x1234_abcd, index: 5, born: Some(1_000), mount: None, volume: Some(1) };
+        let clone = RootId { volume: Some(2), ..original };
+        assert!(!clone.same_place(&original) && !clone.same_folder(&original));
+        let unknown = RootId { volume: None, ..original };
+        assert!(unknown.same_place(&original) && clone.same_place(&unknown), "an unknown volume name isn't a difference");
+    }
+
+    #[test]
+    fn the_volume_of_a_folder_is_read_from_its_real_path() {
+        let guid = RootId::volume_in(r"\\?\Volume{3ec1fb8a-1f39-11e9-a4a5-806e6f6e6963}\Users\me\Photos");
+        assert_eq!(guid, Some(0x3ec1fb8a_1f39_11e9_a4a5_806e6f6e6963));
+        assert_eq!(RootId::volume_in(r"\\?\Volume{3ec1fb8a-1f39-11e9-a4a5-806e6f6e6963}\"), guid, "at the top of the drive");
+        assert_eq!(RootId::volume_in(r"\\?\UNC\nas\share\Photos"), None);
+        assert_eq!(RootId::volume_in(r"\\?\Volume{3ec1fb8a}\"), None);
+        assert_eq!(RootId::volume_in(r"C:\Photos"), None);
+    }
+
+    /// On Windows, a folder on the computer's own drive knows the volume's own name, and two
+    /// folders on one drive know the same one.
+    #[cfg(windows)]
+    #[test]
+    fn folders_know_their_volume_on_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("inner")).unwrap();
+        let (outer, inner) = (RootId::of(tmp.path()).unwrap().unwrap(), RootId::of(&tmp.path().join("inner")).unwrap().unwrap());
+        assert!(outer.volume.is_some(), "{outer:?}");
+        assert_eq!(outer.volume, inner.volume);
+        assert!(RootId::is_within(&tmp.path().join("inner"), tmp.path()));
     }
 
     /// The same drive plugged in again keeps its numbers, but not its mount.
     #[test]
     fn the_same_folder_mounted_again_is_another_folder() {
-        let before = RootId { device: 2049, index: 2, born: None, mount: Some(40) };
+        let before = RootId { device: 2049, index: 2, born: None, mount: Some(40), volume: None };
         let again = RootId { mount: Some(41), ..before };
         assert!(!again.same_folder(&before));
         assert!(RootId { mount: None, ..before }.same_folder(&again), "an unknown mount isn't a difference");
@@ -229,8 +305,9 @@ mod tests {
     fn an_identity_kept_by_an_older_charon_still_compares() {
         let older: RootId = serde_json::from_str(r#"{"device":2049,"index":2,"born":null}"#).unwrap();
         assert_eq!(older.mount, None);
-        assert!(older.same_folder(&RootId { device: 2049, index: 2, born: None, mount: Some(40) }));
-        assert!(!older.same_folder(&RootId { device: 2050, index: 2, born: None, mount: Some(40) }));
+        assert_eq!(older.volume, None);
+        assert!(older.same_folder(&RootId { device: 2049, index: 2, born: None, mount: Some(40), volume: Some(7) }));
+        assert!(!older.same_folder(&RootId { device: 2050, index: 2, born: None, mount: Some(40), volume: Some(7) }));
     }
 
     /// Where Linux numbers mounts for good, a folder knows the mount it's seen through.
