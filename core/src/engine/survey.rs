@@ -27,7 +27,7 @@ const LEFTOVER_AGE_MS: i64 = 60 * 60 * 1000;
 /// A list names at most this many of the files named like Charon 0.2's half-copied files.
 const LEFTOVERS_NAMED: usize = 5;
 /// A background look compares at most this much by contents; whatever is left counts as
-/// identical for that look only (a list the person sees, and every run, read it all).
+/// differing for that look only (a list the person sees, and every run, read it all).
 const CHECK_COMPARE_BYTES: u64 = 1 << 30;
 /// Comparison progress reaches the window at most this often.
 const COMPARE_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -145,8 +145,50 @@ struct Candidate {
     key: String,
     source: Entry,
     destination: Entry,
-    /// Both sides changed since the last sync and look alike by size and date.
+    /// Both sides look alike by size and date (and changed since the last sync, or have no
+    /// record of it).
     alike: bool,
+}
+
+/// Which pairs that look alike, with no record Charon can go by, are read all the same
+/// (see `Engine::candidate`): the pairs found to differ before and left for the person
+/// (`Memory::unsettled`), and, in a fresh comparison, those that a record of the last sync
+/// Charon can't trust (see `Engine::distrust`) shows changed since, on either side. It
+/// never decides what is carried or removed.
+#[derive(Default)]
+struct Guide {
+    /// The record Charon can't trust, if the comparison is a fresh one.
+    pairs: Baseline,
+    unsettled: BTreeSet<String>,
+    /// The memory was made with the other kind of keys (see `Keys::fold`), so it is keyed,
+    /// and looked up, folded.
+    folded: bool,
+}
+
+impl Guide {
+    /// What `memory` tells a look whose keys are `folded` or not; `afresh` when Charon
+    /// can't trust its record.
+    fn of(memory: &Memory, folded: bool, afresh: bool) -> Self {
+        let pairs = if afresh { memory.baseline.clone() } else { Baseline::new() };
+        if memory.folded == folded {
+            return Self { pairs, unsettled: memory.unsettled.clone(), folded: false };
+        }
+        Self {
+            pairs: pairs.iter().map(|(key, pair)| (Keys::fold(key), *pair)).collect(),
+            unsettled: memory.unsettled.iter().map(|key| Keys::fold(key)).collect(),
+            folded: true,
+        }
+    }
+
+    /// Whether the look-alike pair at `key` (`s` and `d` as they are now) is read all the same.
+    fn wants_read(&self, key: &str, s: &Entry, d: &Entry, source: &Snapshot, destination: &Snapshot) -> bool {
+        let key = if self.folded { Keys::fold(key) } else { key.to_string() };
+        self.unsettled.contains(&key)
+            || self.pairs.get(&key).is_some_and(|pair| {
+                !Entry::still_on(Some(s), Some(&pair.source), source.shifts_times())
+                    || !Entry::still_on(Some(d), Some(&pair.destination), destination.shifts_times())
+            })
+    }
 }
 
 /// What reading contents found.
@@ -154,7 +196,8 @@ struct Candidate {
 struct Compared {
     /// Pairs found identical, now recorded as in sync.
     agreed: u64,
-    /// Pairs that both changed and look alike, but whose contents differ.
+    /// Pairs that look alike but whose contents differ, or that a background look left
+    /// unread.
     different: BTreeSet<String>,
 }
 
@@ -172,7 +215,8 @@ pub(crate) struct Survey {
     /// The job's markers in both folders, read before the scans. A sync records nothing
     /// unless they are still the same when it's done.
     pub markers: Markers,
-    /// Two-way: the memory as loaded (trusted or not).
+    /// Two-way: the memory as loaded, with the reason this look couldn't trust it, if it
+    /// couldn't (see `Engine::distrust`).
     pub memory: Option<Memory>,
     /// Two-way: the plan was made with the stored memory.
     pub trusted: bool,
@@ -186,6 +230,9 @@ pub(crate) struct Survey {
     pub left_for_later: Plan,
     /// Pairs of files found identical by their contents, though their dates differ.
     pub agreed: u64,
+    /// Pairs that look alike but were found to differ by their contents (see
+    /// `Memory::unsettled`), or that a background look left unread.
+    pub different: BTreeSet<String>,
     /// Why this plan must not run at all.
     pub refusal: Option<String>,
     pub warnings: Vec<Warning>,
@@ -296,12 +343,14 @@ impl Engine {
         // can't, both folders are compared afresh this time, and the list says why once the
         // plan shows what that brings back.
         let mut afresh = None;
+        let mut guide = Guide::default();
         let (memory, trusted, mut baseline) = if setup.mode.is_two_way() {
             let memory = self.inner.baselines.load(&job.id, &setup);
             match self.distrust(job, &memory, folded, &markers) {
                 Some(reason) => {
-                    afresh = Some(reason);
-                    (Some(memory), false, Baseline::new())
+                    afresh = Some(reason.clone());
+                    guide = Guide::of(&memory, folded, true);
+                    (Some(Memory { distrust: Some(reason), ..memory }), false, Baseline::new())
                 }
                 None if memory.tokens.is_none() => {
                     warnings.push(Warning::info(format!(
@@ -316,6 +365,7 @@ impl Engine {
                 }
                 None => {
                     let baseline = memory.baseline.clone();
+                    guide = Guide::of(&memory, folded, false);
                     (Some(memory), true, baseline)
                 }
             }
@@ -329,7 +379,7 @@ impl Engine {
             self.inner.landings.load(&job.id, &setup, folded, &markers.destination)
         };
         let compared = if setup.mode.is_two_way() {
-            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, purpose, cancel))?
+            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, &guide, purpose, cancel))?
         } else {
             Compared::default()
         };
@@ -528,6 +578,7 @@ impl Engine {
             plan,
             left_for_later: Plan::default(),
             agreed,
+            different: compared.different,
             refusal,
             warnings,
             holds,
@@ -594,8 +645,7 @@ impl Engine {
     /// App libraries and databases this sync changes: copied while their app writes to them,
     /// they may arrive half-written.
     fn units_warning(setup: &JobSetup, plan: &Plan, source: &Snapshot, destination: &Snapshot) -> Option<String> {
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
-        let units: BTreeSet<Unit> = plan.work().filter_map(|action| Unit::of(action.path(), exists)).collect();
+        let units: BTreeSet<Unit> = plan.work().filter_map(|action| Unit::of(action.path(), source, destination)).collect();
         let names: Vec<String> = units
             .iter()
             .map(|unit| {
@@ -716,8 +766,11 @@ impl Engine {
         if job.run_in_progress {
             return Some("The last sync of this job didn't finish properly (Charon was closed, the computer stopped, or a drive went away).".into());
         }
-        // No memory yet (nothing to trust or distrust): nothing is removed.
-        memory.tokens.as_ref()?;
+        // No memory: nothing to trust or distrust before the first sync of these folders
+        // (nothing is removed). After one (it has a record of their drives), it was lost.
+        if memory.tokens.is_none() {
+            return (job.last_synced.is_some() && job.drives.is_some()).then(|| "Charon has no memory of this job's last sync.".into());
+        }
         if memory.folded != folded {
             let guessed = job.drives.as_ref().is_some_and(|drives| drives.source.case_guessed || drives.destination.case_guessed);
             return Some(if guessed {
@@ -755,24 +808,31 @@ impl Engine {
     ///
     /// * no record of the last sync (or both sides changed since), the same size but
     ///   different dates: identical pairs are recorded as in sync;
+    /// * no record Charon can trust, the same size and date, but a record it can't trust
+    ///   shows that one side changed since, or an earlier look found them to differ (see
+    ///   `Guide`): an edit that kept the file's size and time (an encrypted container does)
+    ///   would otherwise be taken for identical, and recorded as in sync. If their contents
+    ///   differ, they're a conflict;
     /// * one side changed since the record but kept its size, and only its details or its
     ///   time moved, by a rounding or by quarter hours (a tag or permission change, a drive
     ///   that shifts or rounds times): identical to the other side, the record is renewed;
     /// * both sides changed since the record and still look alike: if their contents differ
     ///   after all, they're a conflict (`different`), never "already in sync".
     ///
-    /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as identical
-    /// for that look only.
+    /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as differing
+    /// for that look only, so it never shows as in sync what it didn't read.
+    #[allow(clippy::too_many_arguments)]
     fn compare_contents(
         &self,
         job: &Job,
         source: &Snapshot,
         destination: &Snapshot,
         baseline: &mut Baseline,
+        guide: &Guide,
         purpose: Purpose,
         cancel: &AtomicBool,
     ) -> Result<Compared> {
-        let candidates: Vec<Candidate> = source.iter().filter_map(|(key, s)| Self::candidate(key, s, source, destination, baseline)).collect();
+        let candidates: Vec<Candidate> = source.iter().filter_map(|(key, s)| Self::candidate(key, s, source, destination, baseline, guide)).collect();
         let total_bytes: u64 = candidates.iter().map(|c| c.source.size).sum();
         let total_files = candidates.len() as u64;
         let mut compared = Compared::default();
@@ -784,34 +844,32 @@ impl Engine {
                 .change_known_runtime(&job.id, |rt| rt.same_contents.get(&key).filter(|(cs, cd, _)| *cs == s && *cd == d).map(|(_, _, same)| *same))
                 .flatten();
             let same = match cached {
-                Some(same) => Some(same),
+                Some(same) => same,
                 // A background look that has read enough leaves the rest for the next list.
-                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => None,
+                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => false,
                 None => {
                     let a = job.setup.source.join(source.spelling(&key));
                     let b = job.setup.destination.join(destination.spelling(&key));
                     read_bytes += s.size;
-                    let same = match Contents::same(&a, &b, Some(cancel)) {
-                        Ok(same) => same,
+                    match Contents::same(&a, &b, Some(cancel)) {
+                        Ok(same) => {
+                            self.change_known_runtime(&job.id, |rt| {
+                                rt.same_contents.insert(key.clone(), (s, d, same));
+                            });
+                            same
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(Error::Cancelled),
-                        // Unreadable now: the plan decides as if they differ (never a removal).
+                        // Unreadable now: the plan decides as if they differ (never a removal),
+                        // for this look only. The next one reads them again.
                         Err(_) => false,
-                    };
-                    self.change_known_runtime(&job.id, |rt| {
-                        rt.same_contents.insert(key.clone(), (s, d, same));
-                    });
-                    Some(same)
+                    }
                 }
             };
-            match same {
-                Some(true) | None => {
-                    baseline.insert(key, Pair::new(s, d));
-                    compared.agreed += 1;
-                }
-                Some(false) if alike => {
-                    compared.different.insert(key);
-                }
-                Some(false) => {}
+            if same {
+                baseline.insert(key, Pair::new(s, d));
+                compared.agreed += 1;
+            } else if alike {
+                compared.different.insert(key);
             }
             done_files += 1;
             done_bytes += s.size;
@@ -824,13 +882,13 @@ impl Engine {
     }
 
     /// Whether the pair at `key` needs its contents read (see `compare_contents`).
-    fn candidate(key: &str, s: &Entry, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> Option<Candidate> {
+    fn candidate(key: &str, s: &Entry, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, guide: &Guide) -> Option<Candidate> {
         let d = destination.get(key)?;
         if !(s.is_file() && d.is_file() && s.size == d.size) || source.frozen(key).is_some() || destination.frozen(key).is_some() {
             return None;
         }
         let wanted = match baseline.get(key) {
-            None => !s.same_as(d),
+            None => !s.same_as(d) || guide.wants_read(key, s, d, source, destination),
             Some(pair) => {
                 let source_still = Entry::still_on(Some(s), Some(&pair.source), source.shifts_times());
                 let destination_still = Entry::still_on(Some(d), Some(&pair.destination), destination.shifts_times());
@@ -842,7 +900,7 @@ impl Engine {
                 }
             }
         };
-        let alike = baseline.get(key).is_some() && s.same_as(d);
+        let alike = s.same_as(d);
         wanted.then(|| Candidate { key: key.to_string(), source: *s, destination: *d, alike })
     }
 
@@ -1184,6 +1242,35 @@ mod tests {
             Some("1 item only on the destination is copied to the source. By Charon's record of the last sync, 1 of them was on both sides then, so it was most likely removed since: “b.txt”.")
         );
         assert_eq!(Engine::one_side_only(&Plan::default(), &memory), None);
+    }
+
+    /// Only what really is an app's package or a database asks for its app to be closed:
+    /// not a single-file document or a private key that is only named like one.
+    #[test]
+    fn only_real_libraries_and_databases_ask_for_their_app_to_be_closed() {
+        let setup = JobSetup {
+            name: String::new(),
+            source: "/a".into(),
+            destination: "/b".into(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let file = Entry::file(1, 10_000);
+        let source: Snapshot = [("server.key", file), ("Budget.numbers", file), ("Talk.key", Entry::dir()), ("Talk.key/Index.zip", file)]
+            .iter()
+            .map(|(key, entry)| (key.to_string(), *entry))
+            .collect();
+        let mut plan = Plan::default();
+        plan.push(Action::copy(Side::Destination, "server.key", file, None));
+        plan.push(Action::copy(Side::Destination, "Budget.numbers", file, None));
+        assert_eq!(Engine::units_warning(&setup, &plan, &source, &Snapshot::new()), None);
+        plan.push(Action::copy(Side::Destination, "Talk.key/Index.zip", file, None));
+        let warning = Engine::units_warning(&setup, &plan, &source, &Snapshot::new()).unwrap();
+        assert!(warning.starts_with("“Talk.key” is an app library or document."), "{warning}");
     }
 
     #[test]

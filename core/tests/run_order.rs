@@ -7,7 +7,10 @@
 //! into .charon-trash even with safe deletes off. A copy that fails keeps every removal on
 //! its side for the next sync. One left for the next sync because its file changed keeps
 //! the removals there that could be its old copy, and only those: a file an app keeps
-//! writing to never stops the rest of a job's removals.
+//! writing to never stops the rest of a job's removals. An app library the run removes
+//! something of is carried whole after every other copy, and before anything else is
+//! removed: what it removes waits like any removal, and what it brings lands before its
+//! other copy goes.
 
 use charon_core::model::{Review, StepFilter};
 use charon_core::{ConflictRule, Engine, EngineEvent, JobSetup, JobView, Phase, SyncMode, Trigger};
@@ -373,4 +376,133 @@ fn two_way_removes_what_a_busy_file_couldnt_be_an_old_copy_of() {
 #[test]
 fn mirror_removes_what_a_busy_file_couldnt_be_an_old_copy_of() {
     a_busy_file_doesnt_hold_back_other_removals(SyncMode::Mirror);
+}
+
+/// A job whose folders hold the same Logic project, with its arrangement and a take, after
+/// its first confirmed sync. Returns the folders and the job.
+fn a_logic_project(rig: &Rig, root: &Path, mode: SyncMode) -> (PathBuf, PathBuf, String) {
+    let (src, dst) = (root.join("src"), root.join("dst"));
+    write(&src.join("Song.logicx/arrangement.txt"), "the arrangement");
+    write(&src.join("Song.logicx/take.wav"), "the take");
+    let id = rig.engine.add_job(job_setup(&src, &dst, mode)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Song.logicx/take.wav")), "the take");
+    (src, dst, id)
+}
+
+/// A take moved out of a Logic project whose arrangement changed too, and an app writes to
+/// the take in its new place while the run goes on. The project is carried whole, and what
+/// it removes waits for every other copy, like any removal: the take's copy is left for the
+/// next sync, and so is the whole project, with the removal of the take's old copy (the
+/// destination's only one).
+fn a_take_moved_out_of_a_library_and_edited_during_the_run_keeps_its_old_copy(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst, id) = a_logic_project(&rig, tmp.path(), mode);
+    fs::create_dir(src.join("Takes")).unwrap();
+    fs::rename(src.join("Song.logicx/take.wav"), src.join("Takes/take.wav")).unwrap();
+    write(&src.join("Song.logicx/arrangement.txt"), "the arrangement, with a new verse");
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 1, "{:?}", review.tally);
+    let take = src.join("Takes/take.wav");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&take).unwrap().write_all(b", recorded again").unwrap());
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Song.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(read(&dst.join("Song.logicx/arrangement.txt")), "the arrangement", "the project isn't mixed");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.deleted), (0, 0), "{}", run.describe());
+
+    // The next sync carries the take and the project.
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Takes/take.wav")), "the take, recorded again");
+    assert_eq!(read(&dst.join("Song.logicx/arrangement.txt")), "the arrangement, with a new verse");
+    assert!(!dst.join("Song.logicx/take.wav").exists());
+}
+
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_out_of_a_library_and_edited_during_the_run() {
+    a_take_moved_out_of_a_library_and_edited_during_the_run_keeps_its_old_copy(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_keeps_the_old_copy_of_a_take_moved_out_of_a_library_and_edited_during_the_run() {
+    a_take_moved_out_of_a_library_and_edited_during_the_run_keeps_its_old_copy(SyncMode::Mirror);
+}
+
+/// The same, but the take's new folder can't be made (a file took its name on the
+/// destination meanwhile), so its copy fails: the project stays as it was.
+fn a_take_moved_out_of_a_library_keeps_its_old_copy_when_its_copy_fails(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst, id) = a_logic_project(&rig, tmp.path(), mode);
+    fs::create_dir(src.join("Takes")).unwrap();
+    fs::rename(src.join("Song.logicx/take.wav"), src.join("Takes/take.wav")).unwrap();
+    write(&src.join("Song.logicx/arrangement.txt"), "the arrangement, with a new verse");
+    let review = rig.engine.prepare_review(&id).unwrap();
+    let in_the_way = dst.join("Takes");
+    rig.at_first_step(move || write(&in_the_way, "a file where the new folder goes"));
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Song.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(read(&dst.join("Song.logicx/arrangement.txt")), "the arrangement", "the project isn't mixed");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert!(run.failed > 0 && run.deleted == 0, "{}", run.describe());
+}
+
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_out_of_a_library_when_its_copy_fails() {
+    a_take_moved_out_of_a_library_keeps_its_old_copy_when_its_copy_fails(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_keeps_the_old_copy_of_a_take_moved_out_of_a_library_when_its_copy_fails() {
+    a_take_moved_out_of_a_library_keeps_its_old_copy_when_its_copy_fails(SyncMode::Mirror);
+}
+
+/// A take moved into a Logic project from a folder deeper down, another take removed from
+/// the project, and an app writes to the moved take while the run goes on. The project is
+/// carried after every other copy, but still before anything else is removed: it waits for
+/// the next sync, and so does the removal of the moved take's old copy, the destination's
+/// only one.
+fn a_take_moved_into_a_library_keeps_its_old_copy_when_the_library_waits(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst, id) = a_logic_project(&rig, tmp.path(), mode);
+    write(&src.join("Old takes/2024/solo.wav"), "the solo");
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Old takes/2024/solo.wav")), "the solo");
+    fs::rename(src.join("Old takes/2024/solo.wav"), src.join("Song.logicx/solo.wav")).unwrap();
+    fs::remove_file(src.join("Song.logicx/take.wav")).unwrap();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 2, "{:?}", review.tally);
+    let solo = src.join("Song.logicx/solo.wav");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&solo).unwrap().write_all(b", recorded again").unwrap());
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Old takes/2024/solo.wav")), "the solo", "the old copy waits for the new one");
+    assert_eq!(read(&dst.join("Song.logicx/take.wav")), "the take", "the project waits whole");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.deleted), (0, 0), "{}", run.describe());
+
+    // The next sync carries the project, then removes the old copy.
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Song.logicx/solo.wav")), "the solo, recorded again");
+    assert!(!dst.join("Song.logicx/take.wav").exists() && !dst.join("Old takes/2024/solo.wav").exists());
+}
+
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_into_a_library_that_waits() {
+    a_take_moved_into_a_library_keeps_its_old_copy_when_the_library_waits(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_keeps_the_old_copy_of_a_take_moved_into_a_library_that_waits() {
+    a_take_moved_into_a_library_keeps_its_old_copy_when_the_library_waits(SyncMode::Mirror);
 }

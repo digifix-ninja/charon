@@ -24,7 +24,7 @@ use crate::run::{Copier, ProgressMeter, Room, Trash};
 use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
 use std::cell::RefCell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::ops::ControlFlow;
@@ -304,6 +304,34 @@ impl Holds {
     }
 }
 
+/// The steps of one app library or database in a plan (see `Executor::carry_unit`).
+#[derive(Default)]
+struct UnitSteps<'p> {
+    /// The copies and removals of its files and links, carried together.
+    carried: Vec<&'p Action>,
+    /// The sides the plan changes it on.
+    sides: BTreeSet<Side>,
+    /// The folders the plan makes in it, with the side each is made on.
+    made: BTreeSet<(Side, &'p str)>,
+    /// Whether the plan removes something of it, or clears a place in it for an item of
+    /// another kind (see `Executor::starts_carry`).
+    removes: bool,
+}
+
+/// What carrying an app library or database did to each of its carried steps, and why its
+/// other steps wait, if they do (see `Executor::carry_unit`).
+type Carried<'p> = (Vec<(&'p Action, Result<Done>)>, Option<String>);
+
+/// Why the steps of an app library or database wait (see `Executor::carry_unit`).
+enum Wait {
+    /// A removal among them waits (see `Holds`).
+    Held,
+    /// Something of it changed while its files were being copied.
+    Changed,
+    /// Another of its steps couldn't be carried out.
+    NotMixed,
+}
+
 /// What the folders above an item are.
 enum Parents {
     Real,
@@ -430,8 +458,10 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Runs every step of `plan` in order. The files of a database are carried together,
-    /// when the first of them comes up (see `carry_database`).
+    /// Runs every step of `plan` in order. The files of an app library or a database are
+    /// carried together (see `carry_unit`): when its first step other than a new folder comes
+    /// up, or after the plan's copies when the plan removes something of it (see
+    /// `starts_carry`). Its other steps wait when they couldn't be.
     pub fn run(&self, plan: &Plan, meter: &mut ProgressMeter) -> Outcome {
         let mut outcome = Outcome::default();
         // A side where a copy didn't land keeps what this run would remove there that could
@@ -440,8 +470,9 @@ impl<'a> Executor<'a> {
         // The places cleared for an item of another kind: nothing goes into a place whose
         // item couldn't go first.
         let mut cleared: HashSet<Clearing> = HashSet::new();
-        let databases = self.databases(plan);
-        let mut carried: HashSet<String> = HashSet::new();
+        let units = self.units(plan);
+        // The units carried so far, each with why its other steps wait, if they do.
+        let mut carried: HashMap<&Unit, Option<String>> = HashMap::new();
         'steps: for step in plan.ordered_steps() {
             let action = step.action;
             if self.cancel.load(Ordering::Relaxed) {
@@ -455,27 +486,45 @@ impl<'a> Executor<'a> {
                 outcome.stopped = Some(reason);
                 break;
             }
-            let still_taken = step.clearing.filter(|clearing| step.takes_place() && !cleared.contains(clearing));
-            if still_taken.is_none() {
-                if let Some((database, steps)) = self.database_of(&step).and_then(|database| databases.get_key_value(&database)) {
-                    if carried.insert(database.clone()) {
-                        for (step, result) in self.carry_database(steps, &holds, meter) {
-                            if self.record(&mut outcome, &mut holds, step, result).is_break() {
-                                break 'steps;
-                            }
-                        }
+            // The libraries and databases still to be carried go before the plan's first plain
+            // removal: what it removes could be the other copy of what they bring (see
+            // `starts_carry`).
+            if matches!(action, Action::Delete { .. }) && step.clearing.is_none() {
+                let waiting: Vec<(&Unit, &UnitSteps)> = units.iter().filter(|(unit, steps)| steps.removes && !carried.contains_key(unit)).collect();
+                for (unit, steps) in waiting {
+                    if self.cancel.load(Ordering::Relaxed) {
+                        outcome.cancelled = true;
+                        break 'steps;
                     }
-                    continue;
+                    if let Err(reason) = self.check_roots() {
+                        outcome.stopped = Some(reason);
+                        break 'steps;
+                    }
+                    if self.carry(unit, steps, &mut carried, &mut outcome, &mut holds, meter).is_break() {
+                        break 'steps;
+                    }
                 }
             }
+            let still_taken = step.clearing.filter(|clearing| step.takes_place() && !cleared.contains(clearing));
+            let mut waits = None;
+            if let Some((unit, steps)) = self.unit_of(action).and_then(|unit| units.get_key_value(&unit)) {
+                if !carried.contains_key(unit) && Self::starts_carry(&step, steps) && self.carry(unit, steps, &mut carried, &mut outcome, &mut holds, meter).is_break() {
+                    break;
+                }
+                if Self::carried_along(&step) {
+                    continue;
+                }
+                waits = carried.get(unit).cloned().flatten();
+            }
             meter.start(&self.spellings.disk(Self::shown_side(action), action.path()));
-            let result = match (action, still_taken, holds.of(action)) {
-                (_, Some(clearing), _) => Ok(Done::Skipped(format!(
+            let result = match (action, waits, still_taken, holds.of(action)) {
+                (_, Some(why), _, _) => Ok(Done::Skipped(why)),
+                (_, None, Some(clearing), _) => Ok(Done::Skipped(format!(
                     "left for the next sync: the item of another kind in its place on the {} couldn't go first",
                     clearing.side.word()
                 ))),
-                (Action::Delete { side, .. }, None, Some(held)) => Ok(Done::Skipped(self.why_held(held, *side))),
-                (Action::Copy { to, item: EntryKind::Link, .. }, None, _) if outcome.no_links.contains(to) => {
+                (Action::Delete { side, .. }, None, None, Some(held)) => Ok(Done::Skipped(self.why_held(held, *side))),
+                (Action::Copy { to, item: EntryKind::Link, .. }, None, None, _) if outcome.no_links.contains(to) => {
                     Ok(Done::LeftOut(format!("left out: the {}'s drive can't hold symbolic links", to.word())))
                 }
                 _ => self.apply(action, step.makes_room(), meter),
@@ -634,48 +683,106 @@ impl<'a> Executor<'a> {
         self.spellings.snapshot(side).volume().map(Volume::describe).unwrap_or_else(|| format!("{}'s drive", side.word()))
     }
 
-    // ---------------------------------------------------------------- databases
+    // ---------------------------------------------------------------- app libraries and databases
 
-    /// The database a step's file belongs to, when the step can be carried with the rest of
-    /// the database: copies and plain removals of files.
-    fn database_of(&self, step: &Step) -> Option<String> {
-        let groupable = match step.action {
-            Action::Copy { item: EntryKind::File, .. } => true,
-            Action::Delete { item: EntryKind::File, other: None, .. } => !step.makes_room(),
-            _ => false,
-        };
-        let exists = |key: &str| self.spellings.snapshot(Side::Source).contains(key) || self.spellings.snapshot(Side::Destination).contains(key);
-        groupable.then(|| Unit::database_of(step.action.path(), exists)).flatten()
+    /// The app library or database a step's item belongs to, if any (see `Unit`).
+    fn unit_of(&self, action: &Action) -> Option<Unit> {
+        let (source, destination) = (self.spellings.snapshot(Side::Source), self.spellings.snapshot(Side::Destination));
+        Unit::of(action.path(), source, destination)
     }
 
-    /// The databases with more than one file to carry in this plan, with their steps.
-    fn databases<'p>(&self, plan: &'p Plan) -> HashMap<String, Vec<&'p Action>> {
-        let mut databases: HashMap<String, Vec<&'p Action>> = HashMap::new();
+    /// The app libraries and databases this plan changes, each with its steps.
+    fn units<'p>(&self, plan: &'p Plan) -> BTreeMap<Unit, UnitSteps<'p>> {
+        let mut units: BTreeMap<Unit, UnitSteps<'p>> = BTreeMap::new();
         for step in plan.ordered_steps() {
-            if let Some(database) = self.database_of(&step) {
-                databases.entry(database).or_default().push(step.action);
+            let action = step.action;
+            if matches!(action, Action::Conflict { .. }) {
+                continue;
+            }
+            let Some(unit) = self.unit_of(action) else { continue };
+            let steps = units.entry(unit.clone()).or_default();
+            match action {
+                Action::CreateDir { side, path } => {
+                    steps.made.insert((*side, path.as_str()));
+                }
+                Action::Copy { to, path, .. } => steps.made.extend(Keys::ancestors(path).filter(|folder| unit.holds(folder)).map(|folder| (*to, folder))),
+                _ => {}
+            }
+            steps.sides.extend(Self::receiving(action));
+            if let Action::Delete { side, .. } = action {
+                steps.sides.insert(*side);
+            }
+            steps.removes |= matches!(action, Action::Delete { .. }) || step.clearing.is_some();
+            if Self::carried_along(&step) {
+                steps.carried.push(action);
             }
         }
-        databases.retain(|_, steps| steps.len() > 1);
-        databases
+        units
     }
 
-    /// Carries the files of one database (an SQLite file and its journals) together. Its
-    /// journals only fit the database they were written with, so a mix of two versions can
-    /// damage it: every new version is written next to its target first, then everything
-    /// is checked again, and only then do the old journals go and the new files take their
-    /// places, one right after the other. If any file can't be carried or changed meanwhile,
-    /// none is, and the next sync tries again.
-    fn carry_database<'p>(&self, steps: &[&'p Action], holds: &Holds, meter: &mut ProgressMeter) -> Vec<(&'p Action, Result<Done>)> {
-        let all_wait = |why: &str| steps.iter().map(|step| (*step, Ok(Done::Skipped(why.to_string())))).collect::<Vec<_>>();
-        let removals: Vec<&Action> = steps.iter().copied().filter(|step| matches!(step, Action::Delete { .. })).collect();
+    /// Whether a step of an app library or database is carried with the rest of it (see
+    /// `carry_unit`): a copy of a file or link, or the removal of one, that doesn't clear or
+    /// fill a place for an item of another kind. Its new folders are made before, and the
+    /// folders it no longer has are removed after, each in its own time.
+    fn carried_along(step: &Step) -> bool {
+        step.clearing.is_none()
+            && matches!(
+                step.action,
+                Action::Copy { item: EntryKind::File | EntryKind::Link, .. } | Action::Delete { item: EntryKind::File | EntryKind::Link, other: None, .. }
+            )
+    }
+
+    /// Whether an app library or database is carried when this step of it comes up. One the
+    /// plan only copies into is carried at its first step but a plain new folder, which its
+    /// files may need first. One the plan removes something of, or clears a place in, waits
+    /// for every plain copy of the plan, like any removal (see `Plan::ordered`): it's carried
+    /// at its first removal or step in a cleared place, or before the plan's first plain
+    /// removal if that comes sooner (see `run`). So a copy that failed or changed holds back
+    /// what it removes (see `Holds`), a run stopped before then leaves it as it was, and what
+    /// it brings still lands before anything else goes that could be its other copy.
+    fn starts_carry(step: &Step, steps: &UnitSteps) -> bool {
+        if steps.removes {
+            matches!(step.action, Action::Delete { .. }) || step.clearing.is_some()
+        } else {
+            !matches!(step.action, Action::CreateDir { .. })
+        }
+    }
+
+    /// Carries `unit` (see `carry_unit`), notes that it was, and adds what each of its steps
+    /// did to the outcome. `Break` when the whole run stops there.
+    fn carry<'u>(&self, unit: &'u Unit, steps: &UnitSteps, carried: &mut HashMap<&'u Unit, Option<String>>, outcome: &mut Outcome, holds: &mut Holds, meter: &mut ProgressMeter) -> ControlFlow<()> {
+        let (results, why) = self.carry_unit(unit, steps, holds, meter);
+        carried.insert(unit, why);
+        for (step, result) in results {
+            self.record(outcome, holds, step, result)?;
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Carries the files of one app library or database together (see `Unit`): a mix of two
+    /// versions may not open, or be quietly damaged (a database's journals only fit the
+    /// version they were written with). Every new version is written next to its target
+    /// first. Then everything is checked again, and so is the whole library or database on
+    /// each side the plan changes it on: nothing else of it may have changed, or been added,
+    /// meanwhile (by its app, or by another computer's sync). Only then do the files it no
+    /// longer has go (a database's old journals first), and the new versions take their
+    /// places, one right after the other. If any file can't be carried, or anything changed
+    /// meanwhile, none is, and the next sync tries again.
+    ///
+    /// Returns what each carried step did, and why the unit's other steps (its folders) wait,
+    /// if they do.
+    fn carry_unit<'p>(&self, unit: &Unit, steps: &UnitSteps<'p>, holds: &Holds, meter: &mut ProgressMeter) -> Carried<'p> {
+        let carried = &steps.carried;
+        let not_mixed = self.waiting(unit, Wait::NotMixed);
+        let all_wait = |why: String| (carried.iter().map(|step| (*step, Ok(Done::Skipped(why.clone())))).collect(), Some(why));
+        let removals: Vec<&'p Action> = carried.iter().copied().filter(|step| matches!(step, Action::Delete { .. })).collect();
         if removals.iter().any(|step| holds.of(step).is_some()) {
-            return all_wait("kept for now: other copies didn't land in this run, and a database's files are only synced together");
+            return all_wait(self.waiting(unit, Wait::Held));
         }
 
         // Every new version, written and checked next to its target.
-        let mut staged: Vec<(&Action, Staged)> = Vec::new();
-        for step in steps {
+        let mut staged: Vec<(&'p Action, Staged)> = Vec::new();
+        for step in carried {
             let Action::Copy { to, path, from, existing, settles_conflict, .. } = step else { continue };
             meter.start(&self.spellings.disk(to.opposite(), path));
             let result = self.stage(*to, path, from, existing.as_ref(), *settles_conflict, meter);
@@ -685,12 +792,13 @@ impl<'a> Executor<'a> {
                 failed => {
                     Self::discard_all(staged);
                     let failed = failed.map(|_| Done::Skipped(format!("changed on the {} side since the scan", to.word())));
-                    return Self::one_failed(steps, step, failed);
+                    return (Self::one_failed(carried, step, failed, &not_mixed), Some(not_mixed));
                 }
             }
         }
 
-        // Nothing may have changed while the others were written.
+        // Nothing may have changed while the others were written: not the files carried, and
+        // nothing else of the unit.
         let unchanged = staged.iter().all(|(_, ready)| {
             let source = self.path(ready.to.opposite(), &ready.key);
             matches!(self.look_fresh(ready.to.opposite(), &source), Ok(now) if Entry::still(now.as_ref(), Some(&ready.from)))
@@ -703,17 +811,26 @@ impl<'a> Executor<'a> {
             }
             _ => true,
         });
-        if !unchanged {
-            Self::discard_all(staged);
-            return all_wait("left for the next sync: a file of its database changed while the others were being copied");
+        match self.unit_unchanged(unit, steps) {
+            Ok(true) if unchanged => {}
+            Ok(_) => {
+                Self::discard_all(staged);
+                return all_wait(self.waiting(unit, Wait::Changed));
+            }
+            Err(e) => {
+                Self::discard_all(staged);
+                let results = carried.first().map(|first| Self::one_failed(carried, first, Err(e), &not_mixed)).unwrap_or_default();
+                return (results, Some(not_mixed));
+            }
         }
 
-        // The old journals go first, then the new files take their places.
+        // The files it no longer has go first (a database's old journals), then the new
+        // versions take their places.
         let mut results: Vec<(&Action, Result<Done>)> = Vec::new();
         let mut broken = false;
         for step in removals {
             meter.start(&self.spellings.disk(Self::shown_side(step), step.path()));
-            let result = if broken { Ok(Done::Skipped(Self::NOT_MIXED.into())) } else { self.apply(step, false, meter) };
+            let result = if broken { Ok(Done::Skipped(not_mixed.clone())) } else { self.apply(step, false, meter) };
             meter.finish_item();
             broken |= !matches!(result, Ok(Done::Deleted | Done::Nothing));
             results.push((step, result));
@@ -721,7 +838,7 @@ impl<'a> Executor<'a> {
         for (step, ready) in staged {
             if broken {
                 Copier::discard(&ready.partial);
-                results.push((step, Ok(Done::Skipped(Self::NOT_MIXED.into()))));
+                results.push((step, Ok(Done::Skipped(not_mixed.clone()))));
                 continue;
             }
             let (to, key, from, existing) = (ready.to, ready.key.clone(), ready.from, ready.existing);
@@ -736,19 +853,122 @@ impl<'a> Executor<'a> {
             broken |= !matches!(result, Ok(Done::Copied(..)));
             results.push((step, result));
         }
-        results
+        (results, broken.then_some(not_mixed))
     }
 
-    /// Why a database file waits when another file of it couldn't be carried.
-    const NOT_MIXED: &'static str = "left for the next sync: another file of its database couldn't be synced, and a database's files only go together";
+    /// Whether `unit` is still, on each side the plan changes it on, exactly what the scan
+    /// saw there: every item of it as it was, and nothing in it but those, the folders this
+    /// run makes there and the copies it is writing (and system clutter, and what Charon
+    /// leaves alone). Another program, or another computer's sync, that wrote into it
+    /// meanwhile would be left a mix of two versions. `Err` only when the run is stopped
+    /// meanwhile; an item that can't be looked at counts as changed.
+    fn unit_unchanged(&self, unit: &Unit, steps: &UnitSteps) -> Result<bool> {
+        for &side in &steps.sides {
+            let here = self.spellings.snapshot(side);
+            let (items, folders): (Vec<(String, Option<&Entry>)>, BTreeSet<&str>) = match unit {
+                Unit::Database(database) => (Unit::database_files(database).into_iter().map(|file| (file.clone(), here.get(&file))).collect(), BTreeSet::new()),
+                Unit::Package(library) => {
+                    let scanned: Vec<(&String, &Entry)> = here.get(library).map(|entry| (library, entry)).into_iter().chain(here.inside(library)).collect();
+                    let made = steps.made.iter().filter(|(on, _)| *on == side).map(|(_, folder)| *folder);
+                    let folders = scanned.iter().filter(|(_, entry)| entry.is_dir()).map(|(key, _)| key.as_str()).chain(made).collect();
+                    let items = scanned.into_iter().filter(|(key, _)| !is_clutter(Keys::name(here.spelling(key))));
+                    (items.map(|(key, entry)| (key.clone(), Some(entry))).collect(), folders)
+                }
+            };
+            for (key, scanned) in &items {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                let path = self.path(side, key);
+                // A file the system won't let Charon open is looked at by its details alone.
+                let now = match self.look_fresh(side, &path) {
+                    Err(Error::ReadDenied { .. }) => Self::look(&path),
+                    now => now,
+                };
+                if !matches!(now, Ok(now) if Entry::still(now.as_ref(), *scanned)) {
+                    log::info!("{} changed since the scan, so its {} waits", path.display(), unit.describe());
+                    return Ok(false);
+                }
+            }
+            for folder in folders {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(Error::Cancelled);
+                }
+                if !self.holds_nothing_new(side, folder, &steps.made) {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
 
-    /// `failing`'s own result, and every other step of its database waiting (the failing
-    /// one last, so a stop of the whole run comes after the others are counted).
-    fn one_failed<'p>(steps: &[&'p Action], failing: &&'p Action, result: Result<Done>) -> Vec<(&'p Action, Result<Done>)> {
+    /// Whether the folder `folder` of an app library on `side` holds only what the scan saw
+    /// there, folders this run makes (`made`), system clutter, and items Charon leaves alone
+    /// (the copies this run is writing among them). A folder that isn't there holds nothing
+    /// new; one that can't be listed counts as holding something.
+    fn holds_nothing_new(&self, side: Side, folder: &str, made: &BTreeSet<(Side, &str)>) -> bool {
+        let here = self.spellings.snapshot(side);
+        let disk = self.spellings.disk(side, folder);
+        let path = self.shores.root(side).join(&disk);
+        let items = match fs::read_dir(&path) {
+            Ok(items) => items,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return true,
+            Err(e) => {
+                log::info!("couldn't list {}: {e}", path.display());
+                return false;
+            }
+        };
+        for item in items {
+            let Ok(item) = item else { return false };
+            // A name that isn't valid Unicode was left out by the scan, and is never synced.
+            let Some(name) = item.file_name().to_str().map(str::to_string) else { continue };
+            let relative = format!("{disk}/{name}");
+            let key = self.spellings.key_for(&relative);
+            let known = here.contains(&key)
+                || made.contains(&(side, key.as_str()))
+                || is_clutter(&name)
+                || here.leaves_alone(&key)
+                || here.frozen(&key).is_some()
+                || self.filter.excludes(&Keys::normalize(&relative));
+            if !known {
+                log::info!("{} is new since the scan", item.path().display());
+                return false;
+            }
+        }
+        true
+    }
+
+    /// What the person reads about a step of `unit` that waits, and why.
+    fn waiting(&self, unit: &Unit, why: Wait) -> String {
+        match unit {
+            Unit::Database(_) => match why {
+                Wait::Held => "kept for now: other copies didn't land in this run, and a database's files are only synced together".into(),
+                Wait::Changed => "left for the next sync: a file of its database changed while its files were being copied".into(),
+                Wait::NotMixed => "left for the next sync: another file of its database couldn't be synced, and a database's files only go together".into(),
+            },
+            Unit::Package(library) => {
+                let side = if self.spellings.snapshot(Side::Source).contains(library) { Side::Source } else { Side::Destination };
+                let library = self.spellings.disk(side, library);
+                match why {
+                    Wait::Held => {
+                        format!("kept for now: other copies didn't land in this run, and the files of “{library}”, an app library or document, are only synced together")
+                    }
+                    Wait::Changed => format!("left for the next sync: something in “{library}”, an app library or document, changed while its files were being copied"),
+                    Wait::NotMixed => {
+                        format!("left for the next sync: another item of “{library}”, an app library or document, couldn't be synced, and its files only go together")
+                    }
+                }
+            }
+        }
+    }
+
+    /// `failing`'s own result, and every other carried step of its unit waiting (`why`; the
+    /// failing one last, so a stop of the whole run comes after the others are counted).
+    fn one_failed<'p>(steps: &[&'p Action], failing: &&'p Action, result: Result<Done>, why: &str) -> Vec<(&'p Action, Result<Done>)> {
         let mut results: Vec<(&Action, Result<Done>)> = steps
             .iter()
             .filter(|step| !std::ptr::eq(**step, *failing))
-            .map(|step| (*step, Ok(Done::Skipped(Self::NOT_MIXED.into()))))
+            .map(|step| (*step, Ok(Done::Skipped(why.to_string()))))
             .collect();
         results.push((*failing, result));
         results

@@ -51,6 +51,16 @@ fn confirm(engine: &Engine, id: &String) -> charon_core::model::Review {
     review
 }
 
+/// A background look at the job, waited for.
+fn look(engine: &Engine, id: &String) {
+    engine.check(id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while engine.job(id).unwrap().looking {
+        assert!(Instant::now() < deadline, "the look took too long");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
@@ -318,6 +328,44 @@ fn nothing_changes_by_itself_without_full_automation() {
     assert_eq!(view.status, JobStatus::Review);
     assert_eq!(view.waiting.as_ref().unwrap().items, 1);
     assert!(!b.join("doc.txt").exists());
+}
+
+/// A background look reads at most 1 GiB of files to compare them, and what it leaves
+/// unread never shows as in sync: a large file edited inside, its size the same and its
+/// time moved by a second only (an encrypted container may keep its time altogether),
+/// waits in the row for the person.
+#[test]
+fn a_large_file_a_background_look_leaves_unread_never_shows_as_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    let at = |seconds: i64| filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0);
+    for side in [&a, &b] {
+        fs::create_dir_all(side).unwrap();
+        // More than a background look reads, taking no room.
+        let vault = fs::File::create(side.join("vault.hc")).unwrap();
+        if vault.set_len((1 << 30) + 4096).is_err() {
+            return;
+        }
+        filetime::set_file_mtime(side.join("vault.hc"), at(0)).unwrap();
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    look(&engine, &id);
+    assert_eq!(engine.job(&id).unwrap().status, JobStatus::InSync);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut vault = fs::OpenOptions::new().write(true).open(a.join("vault.hc")).unwrap();
+        vault.seek(SeekFrom::Start(4096)).unwrap();
+        vault.write_all(b"secret").unwrap();
+    }
+    filetime::set_file_mtime(a.join("vault.hc"), at(1)).unwrap();
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert!(matches!(view.status, JobStatus::Review | JobStatus::Pending), "{:?}", view.status);
+    let items = view.waiting.as_ref().map(|waiting| waiting.items).or(view.pending.as_ref().map(|pending| pending.items));
+    assert_eq!(items, Some(1));
 }
 
 #[test]
@@ -861,6 +909,66 @@ fn a_library_changed_on_both_sides_is_kept_whole_from_one_side() {
     assert_eq!(next.tally.conflicts, 0);
 }
 
+/// An engine that runs the hook put in its slot once, right before the next step acts.
+fn hooked(data: &Path) -> (Engine, Arc<Mutex<Option<Hook>>>) {
+    let hook: Arc<Mutex<Option<Hook>>> = Arc::default();
+    let armed = hook.clone();
+    let engine = Engine::open(
+        data,
+        Arc::new(move |event: EngineEvent| {
+            if let EngineEvent::Progress { progress, .. } = &event {
+                if progress.current.is_some() {
+                    if let Some(hook) = armed.lock().unwrap().take() {
+                        hook();
+                    }
+                }
+            }
+        }),
+    )
+    .unwrap();
+    (engine, hook)
+}
+
+/// Something else writes into an app library on the side it's carried to while the sync
+/// runs (its app there, or another computer's sync): a file the list doesn't touch
+/// changes, or a new one turns up. Then nothing of the library moves, and it's never left
+/// a mix of two versions. System clutter and excluded items don't count.
+#[test]
+fn a_library_written_to_on_the_other_side_during_the_sync_isnt_mixed() {
+    let cases = [
+        ("a file the list doesn't touch changes", "c.txt", false),
+        ("a new file turns up", "Media/take 2.wav", false),
+        ("Finder's clutter turns up", ".DS_Store", true),
+        ("an excluded file turns up", "cache.tmp", true),
+    ];
+    for (case, meddle, carried) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+        let song = |root: &Path, name: &str| root.join("Song.logicx").join(name);
+        for name in ["a.txt", "b.txt", "c.txt", "Media/take 1.wav"] {
+            write(&song(&a, name), "1");
+        }
+        fs::create_dir_all(&b).unwrap();
+        let (engine, hook) = hooked(&data);
+        let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+        confirm(&engine, &id);
+
+        write(&song(&a, "a.txt"), "2 from a");
+        write(&song(&a, "b.txt"), "2 from a");
+        let meddled = song(&b, meddle);
+        *hook.lock().unwrap() = Some(Box::new(move || write(&meddled, "written on b meanwhile")));
+        thread::sleep(Duration::from_millis(200)); // live progress reaches the window at most this often
+        confirm(&engine, &id);
+        assert!(hook.lock().unwrap().is_none(), "{case}: something wrote during the sync");
+        let run = engine.job(&id).unwrap().job.last_run.unwrap();
+        let expected = if carried { ((2, 0), "2 from a") } else { ((0, 2), "1") };
+        assert_eq!((run.copied, run.skipped), expected.0, "{case}: {run:?}");
+        for name in ["a.txt", "b.txt"] {
+            assert_eq!(fs::read_to_string(song(&b, name)).unwrap(), expected.1, "{case}: {name}");
+        }
+    }
+}
+
 /// An app that had a removed file open follows it into .charon-trash and saves the person's
 /// work there: Charon says so, never empties it, and stops running by itself until then.
 #[test]
@@ -964,4 +1072,63 @@ fn the_first_list_after_charon_0_2_says_which_items_come_back() {
     assert!(warning.text.contains("3 of them were on both sides then, so they were most likely removed since:"), "{}", warning.text);
     assert!(warning.text.contains("“Photos”") && warning.text.contains("“b.txt”") && !warning.text.contains("x.jpg"), "{}", warning.text);
     assert_eq!(warning.text.matches("afresh").count(), 1, "said once: {}", warning.text);
+}
+
+/// Settling one conflict of that first list leaves Charon 0.2's record as it is: the lists
+/// after it still say why they remove nothing, and which items most likely were removed.
+#[test]
+fn settling_a_conflict_after_charon_0_2_keeps_saying_which_items_come_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    for side in [&src, &dst] {
+        write(&side.join("gone.txt"), "g");
+        write(&side.join("plan.txt"), "first");
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    let item = r#"{"kind":"file","size":1,"modified":10000}"#;
+    fs::write(data.join("baselines").join(format!("{id}.json")), format!(r#"{{"gone.txt":{item},"plan.txt":{item}}}"#)).unwrap();
+    // Since then the person removed gone.txt on the destination, and edited plan.txt on both sides.
+    fs::remove_file(dst.join("gone.txt")).unwrap();
+    write(&src.join("plan.txt"), "edited on the source");
+    write(&dst.join("plan.txt"), "edited on the destination");
+    let review = engine.prepare_review(&id).unwrap();
+    engine.discard_review(&id, &review.review_id);
+
+    let conflict = engine.job(&id).unwrap().conflicts[0].clone();
+    let settle = engine.prepare_resolution(&id, &conflict, ConflictChoice::KeepSource).unwrap();
+    assert!(settle.warnings.iter().any(|w| w.text.contains("no memory of the last sync that it can trust")), "{:?}", settle.warnings);
+    engine.approve(&id, &settle.review_id, false).unwrap();
+    wait(&engine, &id);
+    assert_eq!(fs::read_to_string(dst.join("plan.txt")).unwrap(), "edited on the source");
+
+    let next = engine.prepare_review(&id).unwrap();
+    assert!(next.steps.iter().all(|step| step.kind != StepKind::Remove), "nothing is removed: {:?}", next.steps);
+    let warning = next.warnings.iter().find(|w| w.text.contains("older version of Charon")).expect("the list still says why");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("so it was most likely removed since: “gone.txt”."), "{}", warning.text);
+    assert!(!next.warnings.iter().any(|w| w.text.contains("first two-way sync")), "{:?}", next.warnings);
+}
+
+/// A job whose memory of the last sync is gone isn't syncing its folders for the first
+/// time: its list says that it compares them afresh, and that what was removed comes back.
+#[test]
+fn a_job_that_lost_its_memory_never_calls_its_list_the_first_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("gone.txt"), "g");
+    fs::create_dir_all(&dst).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    fs::remove_file(data.join("baselines").join(format!("{id}.json"))).unwrap();
+    fs::remove_file(dst.join("gone.txt")).unwrap();
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.new_files, 1, "gone.txt comes back: {:?}", review.steps);
+    let warning = review.warnings.iter().find(|w| w.text.contains("no memory of this job's last sync")).expect("the list says why");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("removed since the last sync may come back"), "{}", warning.text);
+    assert!(!review.warnings.iter().any(|w| w.text.contains("first two-way sync")), "{:?}", review.warnings);
 }

@@ -28,12 +28,19 @@ pub struct Memory {
     /// Whether the keys ignore upper and lower case (see `Keys::fold`). A memory made with
     /// the other kind of keys can't be compared with today's scans.
     pub folded: bool,
-    /// Why the stored memory can't be used, if it can't. The baseline is then empty.
+    /// Why the memory can't be trusted, if it can't. Its baseline (empty when the file
+    /// couldn't be used at all) then decides nothing: it only tells a fresh comparison what
+    /// it brings back and which look-alike files to read. A memory kept when an item was
+    /// settled stays untrusted until a whole list is confirmed (see `Engine::remember`).
     pub distrust: Option<String>,
     /// The items an older record Charon can't use (0.2's) had on both sides at the last
     /// sync. They decide nothing: they only tell which of the items a fresh comparison
     /// brings back were most likely removed since.
     pub earlier: BTreeSet<String>,
+    /// Pairs that look alike (the same size and time) but were read and found to differ,
+    /// left for the person, with no record to go by: the next look reads them again rather
+    /// than take them for identical (see `Engine::compare_contents`).
+    pub unsettled: BTreeSet<String>,
 }
 
 impl Memory {
@@ -62,6 +69,10 @@ struct StoredMemory {
     #[serde(default)]
     folded: bool,
     pairs: Baseline,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unsettled: BTreeSet<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    distrust: Option<String>,
 }
 
 /// The file as it may be on disk: 0.2.0 and earlier stored a bare map of items.
@@ -116,8 +127,9 @@ impl Baselines {
                         tokens: Some((stored.source_token, stored.destination_token)),
                         generation: stored.generation,
                         folded: stored.folded,
-                        distrust: None,
+                        distrust: stored.distrust,
                         earlier: BTreeSet::new(),
+                        unsettled: stored.unsettled,
                     }
                 } else {
                     // Left behind when the job's folders changed (and it couldn't be removed
@@ -184,6 +196,8 @@ impl Baselines {
             generation: memory.generation,
             folded: memory.folded,
             pairs: memory.baseline.clone(),
+            unsettled: memory.unsettled.clone(),
+            distrust: memory.distrust.clone(),
         };
         let bytes = serde_json::to_vec(&stored)?;
         let header = Header {
@@ -242,7 +256,8 @@ mod tests {
     fn memory() -> Memory {
         let mut baseline = Baseline::new();
         baseline.insert("a.txt", Pair::new(Entry::file(1, 10_000), Entry::file(1, 11_000)));
-        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None, earlier: BTreeSet::new() }
+        let unsettled = BTreeSet::from(["vault.hc".to_string()]);
+        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None, earlier: BTreeSet::new(), unsettled }
     }
 
     #[test]
@@ -257,6 +272,18 @@ mod tests {
             assert!(loaded.baseline.is_empty() && loaded.tokens.is_none());
             assert!(loaded.distrust.is_some(), "the review says why it starts afresh");
         }
+    }
+
+    #[test]
+    fn a_memory_kept_untrusted_stays_untrusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let baselines = Baselines::new(tmp.path().to_path_buf());
+        let id = "job".to_string();
+        let kept = Memory { distrust: Some("The last sync of this job didn't finish properly.".into()), ..memory() };
+        baselines.save(&id, &setup("/a", "/b"), &kept).unwrap();
+        assert_eq!(baselines.load(&id, &setup("/a", "/b")), kept);
+        baselines.save(&id, &setup("/a", "/b"), &memory()).unwrap();
+        assert_eq!(baselines.load(&id, &setup("/a", "/b")).distrust, None, "until a whole list is confirmed");
     }
 
     #[test]

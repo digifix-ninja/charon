@@ -918,14 +918,10 @@ impl Engine {
             // Without a memory it can trust (a sync didn't finish, a marker changed), settling
             // one item can't be recorded. And the memory from before must never be trusted
             // again: a file restored since the interrupted sync would look removed on its
-            // side, and the next sync would remove its only copy. So it is forgotten: until
-            // a whole list is confirmed, each look compares both folders afresh and removes
-            // nothing.
-            ReviewKind::Resolve => {
-                return self.inner.baselines.forget(id).map_err(|e| {
-                    format!("The item was settled, but Charon couldn't put aside what it remembers of the last sync ({e}), so it waits for your OK before the next sync.")
-                });
-            }
+            // side, and the next sync would remove its only copy. So it stays untrusted:
+            // until a whole list is confirmed, each look compares both folders afresh and
+            // removes nothing, and still says why.
+            ReviewKind::Resolve => return self.keep_untrusted(job, survey, &memory, crossing),
         };
         let (tokens, generation) = match (&memory.tokens, survey.trusted) {
             (Some(tokens), true) => (tokens.clone(), memory.generation + 1),
@@ -941,8 +937,35 @@ impl Engine {
                 return Err(fail(format!("couldn't leave its marker in the {} ({e})", side.word())));
             }
         }
-        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default() };
+        // Pairs found to differ though they look alike, still without a record: the next
+        // look reads them again (a list that settles one item keeps the others).
+        let found = match crossing.kind {
+            ReviewKind::Sync => survey.different.clone(),
+            ReviewKind::Resolve => memory.unsettled.union(&survey.different).cloned().collect(),
+        };
+        let unsettled = found.into_iter().filter(|key| !next.contains(key)).collect();
+        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default(), unsettled };
         self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
+    }
+
+    /// After an item was settled while Charon couldn't trust its memory (see `remember`):
+    /// the memory is kept with the reason the look gave (see `Survey::memory`), so no later
+    /// look trusts it, and without the settled item. It still tells those looks what they
+    /// bring back and which look-alike files to read. A memory without markers (Charon
+    /// 0.2's, a damaged one, one for other folders) is left as it is: no look trusts it.
+    fn keep_untrusted(&self, job: &Job, survey: &Survey, memory: &Memory, crossing: &Crossing) -> std::result::Result<(), String> {
+        if memory.tokens.is_none() {
+            return Ok(());
+        }
+        let outside = |key: &String| crossing.resolving.as_ref().is_none_or(|settled| !Keys::is_within(key, settled));
+        let mut kept = memory.clone();
+        if let Some(settled) = &crossing.resolving {
+            kept.baseline.forget_within(settled);
+        }
+        kept.unsettled = memory.unsettled.union(&survey.different).filter(|key| outside(key)).cloned().collect();
+        self.inner.baselines.save(&job.id, &survey.setup, &kept).map_err(|e| {
+            format!("The item was settled, but Charon couldn't note that it doesn't trust what it remembers of the last sync ({e}), so it waits for your OK before the next sync.")
+        })
     }
 
     /// Mirror and Backup: the destination's marker, then the source's where Charon can
@@ -1310,6 +1333,7 @@ impl Survey {
             plan: Default::default(),
             left_for_later: Default::default(),
             agreed: 0,
+            different: BTreeSet::new(),
             refusal: None,
             warnings: Vec::new(),
             holds: Vec::new(),

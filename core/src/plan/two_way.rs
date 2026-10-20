@@ -13,15 +13,20 @@
 //! | changed            | changed (differently)   | conflict, settled by the job's rule |
 //!
 //! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
-//! deletion, the edit wins: Charon never throws away work. An item one side changed into
-//! another kind (a folder that became a file) crosses like any change, unless the folder it
-//! replaces holds changes or items Charon leaves alone; a file meeting a folder that both
-//! sides changed, and a link taking the place of a file or folder, are a question for the
-//! person. When
-//! the newest version wins a conflict, the other version still goes to the trash; and when
-//! "newest" can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time
-//! that went backwards), both versions are kept instead. Places that couldn't be read on
-//! either side are left alone completely, and their baseline is kept.
+//! deletion, the edit wins: Charon never throws away work. A file whose details alone
+//! changed on one side (a tag, a permission, an app noting that it was opened: its size and
+//! time are as recorded) doesn't stand against a real edit on the other side (not a time a
+//! drive moved by itself, by whole quarter hours say): that edit crosses, and the version
+//! it replaces goes to the trash, like every version a two-way job replaces. Against a
+//! deletion it is an edit, and wins: an edit can put a file's old time back. An item one
+//! side changed into another kind (a folder that became a file) crosses like any change,
+//! unless the folder it replaces holds changes or items Charon leaves alone; a file meeting
+//! a folder that both sides changed, and a link taking the place of a file or folder, are a
+//! question for the person. When the newest version wins a conflict, the other version
+//! still goes to the trash; and when "newest" can't be told reliably (a FAT or exFAT drive,
+//! times whole hours apart, a time that went backwards), both versions are kept instead.
+//! Places that couldn't be read on either side are left alone completely, and their
+//! baseline is kept.
 //!
 //! A file whose time is now *older* than at the last sync isn't an ordinary change either:
 //! it was restored from an older copy, or the drive lost its last writes (pulled out too
@@ -64,20 +69,19 @@ impl TwoWayPlanner {
         let mut plan = Plan::default();
         let mut ground = Ground::new(source, destination, &[Side::Source, Side::Destination], &mut plan);
         let all_paths: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(baseline.paths()).collect();
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
         let split = self.split_units(&all_paths, source, destination, baseline, &ground);
 
         for path in all_paths {
             if ground.is_off_limits(path) {
                 continue;
             }
-            if let Some(unit) = Unit::of(path, exists).filter(|unit| split.contains(unit)) {
+            if let Some(unit) = Unit::of(path, source, destination).filter(|unit| split.contains(unit)) {
                 Self::ask_unit(&mut plan, &mut ground, &unit, path, source, destination);
                 continue;
             }
             let s = source.get(path);
             let d = destination.get(path);
-            let (source_changed, destination_changed) = self.changes(path, source, destination, baseline);
+            let (source_changed, destination_changed) = self.changes_that_cross(path, source, destination, baseline);
 
             match (source_changed, destination_changed) {
                 // Both sides are as the last sync left them, even if they look different (a
@@ -116,16 +120,43 @@ impl TwoWayPlanner {
         (source_changed, destination_changed)
     }
 
+    /// `changes`, for deciding what crosses: when only the details of a file changed on one
+    /// side, a real edit of it on the other side is a change of that side alone. A time that
+    /// only moved the way drives move times isn't a real edit: then either side may hold the
+    /// edit, and the pair stays a conflict (unless its contents were read and found the same,
+    /// see `Engine::compare_contents`).
+    fn changes_that_cross(&self, path: &str, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> (bool, bool) {
+        let changes = self.changes(path, source, destination, baseline);
+        if changes != (true, true) || self.different.contains(path) {
+            return changes;
+        }
+        let (s, d) = (source.get(path), destination.get(path));
+        let only_details = |now: Option<&Entry>, side: Side| {
+            now.zip(baseline.side(path, side)).is_some_and(|(now, before)| now.is_file() && now.changed_at(0).unchanged(before))
+        };
+        // The size changed, or the time moved more than by a rounding or whole quarter hours
+        // (see `Entry::drifted_from`, which a change of details alone passes too).
+        let edited = |now: Option<&Entry>, side: Side| {
+            now.is_some_and(Entry::is_file) && !now.zip(baseline.side(path, side)).is_some_and(|(now, before)| now.drifted_from(before))
+        };
+        if only_details(s, Side::Source) && edited(d, Side::Destination) {
+            (false, true)
+        } else if only_details(d, Side::Destination) && edited(s, Side::Source) {
+            (true, false)
+        } else {
+            changes
+        }
+    }
+
     /// The app libraries and databases with files changed on both sides: syncing them file
-    /// by file would mix two versions.
+    /// by file would mix two versions. Any change counts here, details too.
     fn split_units(&self, paths: &BTreeSet<&String>, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, ground: &Ground) -> BTreeSet<Unit> {
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
         let mut changed: std::collections::BTreeMap<Unit, (bool, bool)> = std::collections::BTreeMap::new();
         for path in paths {
             if ground.is_off_limits(path) {
                 continue;
             }
-            let Some(unit) = Unit::of(path, exists) else { continue };
+            let Some(unit) = Unit::of(path, source, destination) else { continue };
             let (on_source, on_destination) = self.changes(path, source, destination, baseline);
             let sides = changed.entry(unit).or_default();
             sides.0 |= on_source;
@@ -334,6 +365,59 @@ mod tests {
         let dst = snap(&[("a.txt", file(5, 90_000))]);
         let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert!(matches!(&plan.actions[0], Action::Copy { to: Side::Source, .. }));
+    }
+
+    /// A tag, a permission or an app noting that a file was opened moves only its change
+    /// time. A real edit on the other side then crosses, by every rule, instead of meeting
+    /// it as a conflict. A removal on the other side doesn't: the details may hide an edit
+    /// that put the old time back, and an edit beats a removal.
+    #[test]
+    fn a_change_of_details_yields_to_a_real_edit_on_the_other_side() {
+        let synced = file(1000, 10_000).changed_at(7);
+        let touched = synced.changed_at(8);
+        let edited = file(1200, 90_000).changed_at(9);
+        let b = base(&[("report.docx", synced)]);
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", touched)]), &snap(&[("report.docx", edited)]), &b);
+            assert_eq!(plan.actions, vec![Action::copy(Side::Source, "report.docx", edited, Some(touched))], "{rule:?}");
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", edited)]), &snap(&[("report.docx", touched)]), &b);
+            assert_eq!(plan.actions, vec![Action::copy(Side::Destination, "report.docx", edited, Some(touched))], "{rule:?}");
+        }
+        let ask = TwoWayPlanner::new(ConflictRule::Ask);
+        let plan = ask.plan(&snap(&[("report.docx", touched)]), &snap(&[]), &b);
+        assert_eq!(plan.actions, vec![Action::copy(Side::Destination, "report.docx", touched, None)], "the removal doesn't cross");
+        // Edits on both sides, and an older version coming back, are still conflicts.
+        let also_edited = file(1100, 50_000).changed_at(8);
+        assert_eq!(ask.plan(&snap(&[("report.docx", also_edited)]), &snap(&[("report.docx", edited)]), &b).conflicts().len(), 1);
+        let restored = file(900, 4_000).changed_at(9);
+        assert_eq!(ask.plan(&snap(&[("report.docx", touched)]), &snap(&[("report.docx", restored)]), &b).conflicts().len(), 1);
+        // A time that only moved the way drives move times (by whole quarter hours, on an
+        // exFAT drive used under another time-zone offset) isn't a real edit. Such a pair is
+        // read, and when the contents differ, either side may hold the edit (one that kept the
+        // file's time, as an encrypted container does): it stays a conflict, by every rule.
+        let mut shifted = snap(&[("report.docx", file(1000, 10_000 + 30 * 60_000))]);
+        shifted.facts_mut().volume = Some(crate::scan::Volume {
+            kind: crate::scan::FsKind::Exfat,
+            fs: "exfat".into(),
+            mount: "/Volumes/STICK".into(),
+            name: "STICK".into(),
+            network: false,
+            case_sensitive: false,
+            case_guessed: false,
+            refuses_links: false,
+        });
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", touched)]), &shifted, &b);
+            assert!(matches!(plan.actions.as_slice(), [Action::Conflict { .. } | Action::KeepBoth { .. }]), "{rule:?}: {:?}", plan.actions);
+        }
+        // Inside an app library, a change of details still counts: the library is one conflict.
+        let library = [("Talk.key", Entry::dir()), ("Talk.key/Index.zip", synced)];
+        let plan = ask.plan(
+            &snap(&[library[0], ("Talk.key/Index.zip", touched)]),
+            &snap(&[library[0], ("Talk.key/Index.zip", edited)]),
+            &base(&library),
+        );
+        assert_eq!(plan.conflicts().len(), 1, "{:?}", plan.actions);
     }
 
     #[test]
@@ -585,5 +669,83 @@ mod tests {
         // Nothing inside the library moves; the rest of the job syncs.
         assert!(plan.work().all(|action| action.path() == "notes.txt"), "{:?}", plan.actions);
         assert_eq!(plan.summary().to_destination, 1);
+    }
+
+    /// A file of a library that Charon leaves alone (one it couldn't read, or one only in
+    /// the cloud) keeps the whole library: syncing its other files would leave a library made
+    /// of two versions on the side they go to.
+    #[test]
+    fn a_library_with_a_file_left_alone_is_left_alone_whole() {
+        let lib = "Lib.photoslibrary";
+        let item = |name: &str| format!("{lib}/{name}");
+        let baseline = base(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(2, 10_000)), ("notes.txt", file(3, 10_000))]);
+        let source = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(5, 20_000)), (&item("b.db"), file(2, 10_000)), ("notes.txt", file(4, 20_000))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(6, 20_000)), ("notes.txt", file(3, 10_000))]);
+        // The destination changed "b.db", which the last sync couldn't read there.
+        destination.freeze_unread(&item("b.db"), "permission denied");
+        let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&source, &destination, &baseline);
+        assert!(plan.actions.iter().all(|action| action.path() == "notes.txt"), "nothing inside the library moves: {:?}", plan.actions);
+        assert!(
+            plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib && n.reason.contains(&format!("“{}”", item("b.db")))),
+            "{:?}",
+            plan.notes
+        );
+        // Changed on one side only, with a file only in the cloud on the other side.
+        let source = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(5, 20_000)), (&item("b.db"), file(7, 20_000))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(2, 10_000))]);
+        destination.freeze(&item("b.db"), "it's only in the cloud");
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&source, &destination, &baseline);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib), "{:?}", plan.notes);
+    }
+
+    /// A link in a library that the other side's drive can't hold is left out on its own: no
+    /// version of it can ever be in the library there, and the rest of the library still
+    /// syncs.
+    #[test]
+    fn a_library_syncs_without_a_link_the_other_drive_can_never_hold() {
+        let lib = "Movie.fcpbundle";
+        let event = format!("{lib}/CurrentVersion.fcpevent");
+        let clip = format!("{lib}/clip.mov");
+        let baseline = base(&[(lib, Entry::dir()), (&event, file(1, 10_000))]);
+        let source = snap(&[(lib, Entry::dir()), (&event, file(1, 10_000)), (&clip, Entry::link(b"/Volumes/Media/clip.mov", 1))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&event, file(2, 20_000))]);
+        destination.refuse_links();
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&source, &destination, &baseline);
+        assert_eq!(plan.actions, vec![Action::copy(Side::Source, &event, file(2, 20_000), Some(file(1, 10_000)))], "{:?}", plan.notes);
+        assert_eq!(plan.notes.len(), 1);
+        assert_eq!((plan.notes[0].kind, plan.notes[0].path.as_str()), (NoteKind::LeftOut, clip.as_str()));
+    }
+
+    /// A Numbers document saved as one file, and a private key: only named like an app's
+    /// package. They follow the job's rule like any file.
+    #[test]
+    fn a_single_file_named_like_a_package_follows_the_rules_for_files() {
+        for name in ["Budget.numbers", "server.key"] {
+            let baseline = base(&[(name, file(1, 10_000))]);
+            let (source, destination) = (snap(&[(name, file(2, 50_000))]), snap(&[(name, file(3, 90_000))]));
+            let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&source, &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::KeepBoth { .. }]), "{name}: {:?}", plan.actions);
+            let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&source, &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::Copy { to: Side::Source, settles_conflict: true, .. }]), "{name}: {:?}", plan.actions);
+            // Edited on one side, removed on the other: the edit wins.
+            let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[]), &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::Copy { to: Side::Source, .. }]), "{name}: {:?}", plan.actions);
+        }
+    }
+
+    /// A folder "notes" next to a file "notes-journal" is no database: the file changed on
+    /// both sides follows the job's rule, and the folder syncs as usual.
+    #[test]
+    fn a_folder_next_to_a_file_named_like_its_journal_syncs_as_usual() {
+        let baseline = base(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes-journal", file(1, 10_000))]);
+        let source = snap(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes/new.txt", file(4, 20_000)), ("notes-journal", file(2, 50_000))]);
+        let destination = snap(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes-journal", file(3, 90_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&source, &destination, &baseline);
+        let mut paths: Vec<&str> = plan.actions.iter().map(|action| action.path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["notes-journal", "notes/new.txt"], "{:?}", plan.actions);
+        assert!(plan.actions.iter().any(|action| matches!(action, Action::KeepBoth { path, .. } if path == "notes-journal")));
+        assert!(plan.conflicts().is_empty());
     }
 }

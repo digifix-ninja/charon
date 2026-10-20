@@ -37,7 +37,7 @@ impl Resolution {
         if ground.is_off_limits(key) {
             return Err("Charon can't settle this item: it's in a place it leaves alone (see the notes).".into());
         }
-        let unit = Unit::of(key, |k| source.contains(k) || destination.contains(k))
+        let unit = Unit::of(key, source, destination)
             .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
         if let Some(unit) = unit {
             return Self::settle_unit(plan, ground, &unit, choice);
@@ -80,7 +80,8 @@ impl Resolution {
         Ok(plan)
     }
 
-    /// Settles a whole app library or database: the other side's copy becomes the chosen one.
+    /// Settles a whole app library or database: the other side's copy becomes the chosen one,
+    /// except for what that side's drive can never hold (see `Ground::keep_units_whole`).
     fn settle_unit(mut plan: Plan, ground: Ground, unit: &Unit, choice: ConflictChoice) -> Result<Plan, String> {
         let spelling = {
             let side = if ground.side(Side::Source).contains(unit.key()) { Side::Source } else { Side::Destination };
@@ -97,7 +98,9 @@ impl Resolution {
                 ))
             }
         };
-        let keys = Self::unit_keys(&ground, unit);
+        // An item one side's drive can never hold stays out of that side, and stays where it
+        // is on the other.
+        let keys: BTreeSet<String> = Self::unit_keys(&ground, unit).into_iter().filter(|key| !ground.is_never_there(key)).collect();
         if keys.iter().any(|key| ground.is_off_limits(key)) {
             return Err(format!(
                 "Charon can't settle “{spelling}” as a whole: some of its files are in places it leaves alone (see the notes)."
@@ -296,6 +299,22 @@ mod tests {
         assert!(Resolution::plan(&source, &destination, lib, ConflictChoice::KeepBoth).is_err(), "a library is never kept twice");
     }
 
+    /// A library holding a link the other side's drive can't hold is still settled as a
+    /// whole: the chosen version goes over without the link, and the link stays where it is.
+    #[test]
+    fn a_library_is_settled_without_what_the_other_drive_can_never_hold() {
+        let (lib, event, clip) = ("Movie.fcpbundle", "Movie.fcpbundle/CurrentVersion.fcpevent", "Movie.fcpbundle/clip.mov");
+        let (on_source, on_destination) = (Entry::file(8, 20_000), Entry::file(6, 30_000));
+        let source = snap(&[(lib, Entry::dir()), (event, on_source), (clip, Entry::link(b"/Volumes/Media/clip.mov", 1))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (event, on_destination)]);
+        destination.refuse_links();
+        let plan = Resolution::plan(&source, &destination, lib, ConflictChoice::KeepSource).unwrap();
+        assert_eq!(plan.actions, vec![Action::copy(Side::Destination, event, on_source, Some(on_destination)).settling(true)]);
+        assert!(plan.notes.iter().any(|n| n.path == clip), "{:?}", plan.notes);
+        let plan = Resolution::plan(&source, &destination, lib, ConflictChoice::KeepDestination).unwrap();
+        assert_eq!(plan.actions, vec![Action::copy(Side::Source, event, on_destination, Some(on_source)).settling(true)], "the link stays");
+    }
+
     #[test]
     fn a_database_is_settled_with_its_journals() {
         let source = snap(&[("data.db", Entry::file(8, 20_000)), ("data.db-wal", Entry::file(0, 20_000))]);
@@ -305,5 +324,23 @@ mod tests {
         paths.sort();
         assert_eq!(paths, vec!["data.db", "data.db-shm", "data.db-wal"]);
         assert!(Resolution::plan(&source, &destination, "data.db", ConflictChoice::KeepBoth).is_err());
+    }
+
+    /// Only a folder is an app's package, and only files make a database: a single-file
+    /// Numbers document can be kept twice, and settling a folder next to a file named like
+    /// its journal settles that folder alone.
+    #[test]
+    fn items_only_named_like_a_library_or_database_are_settled_on_their_own() {
+        let (s, d) = (Entry::file(2, 50_000), Entry::file(3, 90_000));
+        let plan = Resolution::plan(&snap(&[("Budget.numbers", s)]), &snap(&[("Budget.numbers", d)]), "Budget.numbers", ConflictChoice::KeepBoth).unwrap();
+        assert!(matches!(plan.actions.as_slice(), [Action::KeepBoth { .. }]), "{:?}", plan.actions);
+
+        let source = snap(&[("Garden", Entry::dir()), ("Garden/plan.txt", Entry::file(1, 1))]);
+        let destination = snap(&[("Garden-journal", Entry::dir()), ("Garden-journal/day1.txt", Entry::file(1, 1))]);
+        let plan = Resolution::plan(&source, &destination, "Garden", ConflictChoice::KeepSource).unwrap();
+        let mut paths: Vec<&str> = plan.actions.iter().map(|a| a.path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Garden", "Garden/plan.txt"], "the destination's “Garden-journal” stays: {:?}", plan.actions);
+        assert!(plan.actions.iter().all(|a| !matches!(a, Action::Delete { .. })));
     }
 }

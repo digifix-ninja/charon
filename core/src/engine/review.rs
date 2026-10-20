@@ -252,7 +252,8 @@ impl Engine {
     /// Carries out exactly the reviewed list, after the checks that make sure it can still be
     /// trusted. A list that `waited` for another sync was confirmed in time: neither its age
     /// nor the changes made in the folders since count against it (each step still checks
-    /// its items right before it acts, and leaves alone what changed).
+    /// its items right before it acts, and leaves alone what changed; an app library or a
+    /// database is only carried when nothing of it changed, see `run::Executor`).
     fn carry_out(&self, id: &JobId, review_id: &str, acknowledged: bool, waited: bool) -> Result<()> {
         let review = self.stored_review(id, review_id)?;
         // The folders must still be the very folders the list was made from.
@@ -375,10 +376,10 @@ impl Engine {
         survey.housekeeping = Default::default();
         // What's said about the drives themselves still holds (another drive, a missing marker).
         survey.warnings.retain(|warning| warning.level == Level::Danger);
-        if !survey.trusted && survey.memory.as_ref().is_some_and(|memory| memory.tokens.is_some()) {
-            survey.warnings.push(Warning::caution(
-                "Charon doesn't trust its memory of the last sync right now, so settling this item lets go of that memory. \
-                 Until you confirm a whole list of this job's changes, Charon compares both folders afresh and removes nothing.",
+        if survey.memory.as_ref().is_some_and(|memory| memory.distrust.is_some()) {
+            survey.warnings.push(Warning::info(
+                "Charon has no memory of the last sync that it can trust right now, and settling this item doesn't change that: \
+                 until you confirm a whole list of this job's changes, it compares both folders afresh and removes nothing.",
             ));
         }
         survey.warnings.push(Warning::info(
@@ -439,8 +440,7 @@ impl Engine {
     /// A conflict as the window shows it, saying when it's about a whole app library or
     /// database.
     fn conflict_item(survey: &Survey, key: &str, source: Option<Entry>, destination: Option<Entry>) -> ConflictItem {
-        let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
-            .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
+        let unit = Unit::of(key, &survey.source, &survey.destination).filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
         ConflictItem::new(key, &survey.spelling(key), source, destination).whole(unit.as_ref())
     }
 
@@ -725,7 +725,7 @@ impl Engine {
                 danger: false,
             },
             Action::Conflict { source, destination, path: key } => {
-                let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
+                let unit = Unit::of(key, &survey.source, &survey.destination)
                     .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
                 let reason = match (source, destination) {
                     _ if unit.is_some() => format!(

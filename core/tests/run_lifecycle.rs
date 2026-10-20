@@ -110,8 +110,8 @@ mod after_an_unfinished_run {
         let conflict = engine.job(id).unwrap().conflicts.iter().find(|c| c.path == "plan.txt").cloned().expect("conflict card");
         let resolution = engine.prepare_resolution(id, &conflict, ConflictChoice::KeepSource).unwrap();
         assert!(
-            resolution.warnings.iter().any(|w| w.text.contains("doesn't trust its memory")),
-            "the card says that settling it lets go of the memory: {:?}",
+            resolution.warnings.iter().any(|w| w.text.contains("no memory of the last sync that it can trust")),
+            "the card says that settling it leaves the rest compared afresh: {:?}",
             resolution.warnings
         );
         engine.approve(id, &resolution.review_id, false).unwrap();
@@ -124,8 +124,11 @@ mod after_an_unfinished_run {
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
         settle_plan(&engine, &id);
 
-        // The next list compares afresh: the restored report goes back, nothing is removed.
+        // The next list compares afresh, and says why: the restored report goes back,
+        // nothing is removed.
         let next = engine.prepare_review(&id).unwrap();
+        assert!(next.warnings.iter().any(|w| w.text.contains("didn't finish properly") && w.text.contains("afresh")), "{:?}", next.warnings);
+        assert!(!next.warnings.iter().any(|w| w.text.contains("first two-way sync")), "{:?}", next.warnings);
         let removals = engine.review_steps(&id, &next.review_id, StepFilter::Removals, "", 0, 50).unwrap();
         assert_eq!(removals.total, 0, "{:?}", removals.steps.iter().map(|s| &s.path).collect::<Vec<_>>());
         engine.approve(&id, &next.review_id, true).unwrap();
