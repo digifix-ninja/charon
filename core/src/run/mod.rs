@@ -21,7 +21,7 @@ mod room;
 mod trash;
 
 pub use copier::{Copier, Written};
-pub use executor::{Care, Executor, Outcome, Shores, Spellings};
+pub use executor::{Care, Executor, Outcome, Refused, Shores, Spellings};
 pub use marker::{Found, Marker, Markers};
 pub use meter::ProgressMeter;
 pub use room::Room;

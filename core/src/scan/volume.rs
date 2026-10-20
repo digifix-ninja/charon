@@ -10,6 +10,7 @@
 use crate::scan::MARKER_FOLDER;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use unicode_normalization::UnicodeNormalization;
 
 /// The family of file system a drive uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -47,6 +48,91 @@ pub struct Volume {
     pub network: bool,
     /// Whether "Report.pdf" and "report.pdf" are two names on this drive.
     pub case_sensitive: bool,
+    /// A sync found that this drive refuses symbolic links (some network shares do, though
+    /// their kind would allow them). Kept with the job's record of its drives.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub refuses_links: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// What a drive turned out not to hold when a sync tried to create an item there (see
+/// `run::Executor`). Looks after that leave the item out, with a note, instead of trying
+/// again on every sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The drive finds another item under this name: a Windows short name (REPORT~1.PDF
+    /// for "Report final.pdf"), or a rule for upper and lower case Charon doesn't share.
+    TakenName,
+    /// The drive refused the name.
+    Name,
+    /// The name, or the path to it, is too long for the drive.
+    TooLong,
+    /// The file is too big for the drive.
+    TooBig,
+}
+
+impl Refusal {
+    /// Why the item can't be created on `drive` ("Backup SSD (NTFS)"), for a note.
+    pub fn reason(self, drive: &str) -> String {
+        match self {
+            Refusal::TakenName => format!(
+                "the {drive} finds another item under its name (a short name like REPORT~1.PDF, or another rule for upper and lower case)"
+            ),
+            Refusal::Name => format!("the {drive} refused its name"),
+            Refusal::TooLong => format!("its name, or the path to it, is too long for the {drive}"),
+            Refusal::TooBig => format!("it's too big for the {drive}"),
+        }
+    }
+
+    /// The refusal an error from creating or renaming an item stands for, if it stands
+    /// for one (rather than a passing problem like a full disk or a missing permission).
+    pub fn of_naming(error: &std::io::Error) -> Option<Refusal> {
+        let code = error.raw_os_error()?;
+        #[cfg(unix)]
+        {
+            match code {
+                libc::EINVAL | libc::EILSEQ => Some(Refusal::Name),
+                libc::ENAMETOOLONG => Some(Refusal::TooLong),
+                _ => None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{ERROR_FILENAME_EXCED_RANGE, ERROR_INVALID_NAME};
+            match code as u32 {
+                ERROR_INVALID_NAME => Some(Refusal::Name),
+                ERROR_FILENAME_EXCED_RANGE => Some(Refusal::TooLong),
+                _ => None,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = code;
+            None
+        }
+    }
+
+    /// The refusal an error from writing a file stands for, if it stands for one.
+    pub fn of_writing(error: &std::io::Error) -> Option<Refusal> {
+        let code = error.raw_os_error()?;
+        #[cfg(unix)]
+        {
+            (code == libc::EFBIG).then_some(Refusal::TooBig)
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::ERROR_FILE_TOO_LARGE;
+            (code as u32 == ERROR_FILE_TOO_LARGE).then_some(Refusal::TooBig)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = code;
+            None
+        }
+    }
 }
 
 impl Volume {
@@ -66,6 +152,7 @@ impl Volume {
             name: Self::folder_name(root),
             network: false,
             case_sensitive: false,
+            refuses_links: false,
         });
         let asked = system::case_sensitive(root).or_else(|| probe_case(root)).or_else(|| probe_case_with_own_file(root));
         volume.case_sensitive = asked.unwrap_or_else(|| volume.kind.usually_case_sensitive());
@@ -131,7 +218,14 @@ impl Volume {
 
     /// Whether symbolic links can be created here.
     pub fn holds_links(&self) -> bool {
-        !matches!(self.kind, FsKind::Fat | FsKind::Exfat)
+        !self.refuses_links && !matches!(self.kind, FsKind::Fat | FsKind::Exfat)
+    }
+
+    /// Whether this drive may refuse a link with another answer than "not supported" (a
+    /// network share or a drive Charon doesn't know may say "permission denied" or
+    /// "invalid argument" instead).
+    pub fn answers_links_vaguely(&self) -> bool {
+        self.network || matches!(self.kind, FsKind::Smb | FsKind::Nfs | FsKind::Afp | FsKind::Other)
     }
 
     /// Whether extended attributes (Finder tags and the like) can be kept here. FAT and exFAT
@@ -153,7 +247,11 @@ impl Volume {
                 return Some(format!("{reason}, which the {} can't hold", self.describe()));
             }
         }
-        let too_long = if self.kind.counts_utf16() {
+        // Mac OS Extended stores names decomposed (é as e and an accent), which makes accented
+        // names longer there than they look.
+        let too_long = if self.kind == FsKind::Hfs {
+            name.nfd().map(char::len_utf16).sum::<usize>() > 255
+        } else if self.kind.counts_utf16() {
             name.encode_utf16().count() > 255
         } else {
             name.len() > 255
@@ -193,7 +291,8 @@ impl FsKind {
             "hfs" | "hfsplus" => FsKind::Hfs,
             "msdos" | "vfat" | "fat" | "fat32" | "fat16" | "fat12" => FsKind::Fat,
             "exfat" => FsKind::Exfat,
-            "ntfs" | "ntfs3" => FsKind::Ntfs,
+            // The kernel's own, and the drivers Macs use to write to NTFS (Paragon, Tuxera).
+            "ntfs" | "ntfs3" | "ufsd_ntfs" | "tuxera_ntfs" | "fusefs_txantfs" => FsKind::Ntfs,
             "refs" => FsKind::Refs,
             "smbfs" | "cifs" | "smb2" | "smb3" => FsKind::Smb,
             "nfs" | "nfs4" => FsKind::Nfs,
@@ -328,7 +427,7 @@ mod system {
             "/" | "/System/Volumes/Data" => "startup disk".to_string(),
             other => Path::new(other).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| other.to_string()),
         };
-        Some(Volume { kind, fs, mount, name, network: !local, case_sensitive: false })
+        Some(Volume { kind, fs, mount, name, network: !local, case_sensitive: false, refuses_links: false })
     }
 
     /// macOS answers this directly.
@@ -381,7 +480,7 @@ mod system {
             "/" => "system disk".to_string(),
             other => Path::new(other).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| other.to_string()),
         };
-        Some(Volume { kind: FsKind::from_name(&fs), fs, mount, name, network, case_sensitive: true })
+        Some(Volume { kind: FsKind::from_name(&fs), fs, mount, name, network, case_sensitive: true, refuses_links: false })
     }
 
     /// The topmost folder above `root` on the same drive.
@@ -459,7 +558,7 @@ mod system {
         let network = unc || remote;
         let name = if !label.is_empty() { label } else if !mount_text.is_empty() { mount_text.trim_end_matches('\\').to_string() } else { "drive".into() };
         let kind = if network { FsKind::Smb } else { FsKind::from_name(&fs) };
-        Some(Volume { kind, fs, mount: format!("{serial:08X}"), name, network, case_sensitive: false })
+        Some(Volume { kind, fs, mount: format!("{serial:08X}"), name, network, case_sensitive: false, refuses_links: false })
     }
 
     /// Windows programs see every drive as ignoring case.
@@ -487,7 +586,7 @@ mod tests {
     use super::*;
 
     fn volume(kind: FsKind) -> Volume {
-        Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Stick".into(), network: false, case_sensitive: false }
+        Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Stick".into(), network: false, case_sensitive: false, refuses_links: false }
     }
 
     #[test]
@@ -505,6 +604,48 @@ mod tests {
         let name = "é".repeat(200); // 400 bytes, 200 UTF-16 units
         assert!(volume(FsKind::Ext).cannot_hold(&name).is_some());
         assert!(volume(FsKind::Ntfs).cannot_hold(&name).is_none());
+        // Mac OS Extended keeps é as two letters: 400 UTF-16 units there.
+        assert!(volume(FsKind::Hfs).cannot_hold(&name).is_some());
+        assert!(volume(FsKind::Hfs).cannot_hold(&"e".repeat(200)).is_none());
+        assert!(volume(FsKind::Apfs).cannot_hold(&"é".repeat(120)).is_none());
+    }
+
+    #[test]
+    fn mac_drivers_for_ntfs_follow_windows_rules() {
+        for name in ["ufsd_NTFS", "tuxera_ntfs", "fusefs_txantfs"] {
+            let drive = volume(FsKind::from_name(name));
+            assert_eq!(drive.kind, FsKind::Ntfs, "{name}");
+            assert!(drive.cannot_hold("Q3: plan.txt").is_some(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_drive_found_refusing_links_holds_none() {
+        let mut share = volume(FsKind::Smb);
+        assert!(share.holds_links() && share.answers_links_vaguely());
+        share.refuses_links = true;
+        assert!(!share.holds_links());
+        assert!(!volume(FsKind::Apfs).answers_links_vaguely());
+        // Only a refusal that was found is kept with the job.
+        let saved = serde_json::to_string(&volume(FsKind::Smb)).unwrap();
+        assert!(!saved.contains("refusesLinks"));
+        let read: Volume = serde_json::from_str(&saved).unwrap();
+        assert!(!read.refuses_links);
+        let saved = serde_json::to_string(&share).unwrap();
+        assert!(serde_json::from_str::<Volume>(&saved).unwrap().refuses_links);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusals_are_told_from_passing_problems() {
+        let error = |code| std::io::Error::from_raw_os_error(code);
+        assert_eq!(Refusal::of_naming(&error(libc::EINVAL)), Some(Refusal::Name));
+        assert_eq!(Refusal::of_naming(&error(libc::ENAMETOOLONG)), Some(Refusal::TooLong));
+        assert_eq!(Refusal::of_naming(&error(libc::ENOSPC)), None, "a full disk can be emptied");
+        assert_eq!(Refusal::of_naming(&error(libc::EACCES)), None);
+        assert_eq!(Refusal::of_writing(&error(libc::EFBIG)), Some(Refusal::TooBig));
+        assert_eq!(Refusal::of_writing(&error(libc::EINVAL)), None);
+        assert!(Refusal::Name.reason("Stick (exFAT)").contains("Stick (exFAT)"));
     }
 
     #[test]

@@ -44,6 +44,8 @@ export class UpgradeSheet extends Sheet {
       <div class="scroll">
         <p class="upgrade-lead"><span class="ico">${raw(Icons.review)}</span>
           <span>Charon no longer changes your files by itself unless you allow it. Each job now prepares the list of changes and waits for your OK.</span></p>
+        <p class="upgrade-lead"><span class="ico">${raw(Icons.info)}</span>
+          <span>Symbolic links are now copied as links. Charon 0.2 left them out, so a job's first list may include them. Drives that can't hold links (FAT, exFAT, some network shares) leave them out, and the list says so.</span></p>
         <div class="upgrade-jobs">${n.jobs.map(item => raw(this.jobHtml(item)))}</div>
       </div>
       <footer>

@@ -14,11 +14,11 @@
 //!
 //! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
 //! deletion, the edit wins: Charon never throws away work. A file meeting a folder, and a
-//! link taking a folder's place, are always a question for the person. When the newest
-//! version wins a conflict, the other version still goes to the trash; and when "newest"
-//! can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time that went
-//! backwards), both versions are kept instead. Places that couldn't be read on either side
-//! are left alone completely, and their baseline is kept.
+//! link taking the place of a file or folder, are always a question for the person. When
+//! the newest version wins a conflict, the other version still goes to the trash; and when
+//! "newest" can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time
+//! that went backwards), both versions are kept instead. Places that couldn't be read on
+//! either side are left alone completely, and their baseline is kept.
 //!
 //! A file whose time is now *older* than at the last sync isn't an ordinary change either:
 //! it was restored from an older copy, or the drive lost its last writes (pulled out too
@@ -179,9 +179,10 @@ impl TwoWayPlanner {
             // The other side changed the item into another kind (a folder became a file…).
             (Some(wanted), Some(existing)) if wanted.kind != existing.kind => {
                 let folder_in_the_way = existing.is_dir() && (here.is_occupied(path) || ground.holds_changes(to, path, baseline));
-                // A link in a folder's place would take everything in the folder away on this
-                // side, while it stays reachable only through the link on the other.
-                if folder_in_the_way || (existing.is_dir() && wanted.is_link()) {
+                // A link in a file's or folder's place would take what it holds away on this
+                // side, while it stays reachable only through the link on the other (usually
+                // it was moved to another drive, with a link left behind).
+                if folder_in_the_way || wanted.is_link() {
                     Self::ask(plan, ground, path, s, d);
                     return;
                 }
@@ -392,6 +393,7 @@ mod tests {
             name: "STICK".into(),
             network: false,
             case_sensitive: false,
+            refuses_links: false,
         });
         let dst = snap(&[("a.txt", file(3, 20_000_000))]);
         assert!(matches!(&rule.plan(&src, &dst, &b).actions[0], Action::KeepBoth { .. }));
@@ -437,6 +439,42 @@ mod tests {
         let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &b);
         assert_eq!(plan.actions.len(), 1, "{:?}", plan.actions);
         assert!(matches!(&plan.actions[0], Action::Conflict { path, .. } if path == "footage"));
+    }
+
+    #[test]
+    fn a_link_taking_a_files_place_is_a_question() {
+        let b = base(&[("clip.mov", file(4_000, 10_000))]);
+        let link = Entry::link(b"/Volumes/SSD/clip.mov", 50_000);
+        for (src, dst) in [(snap(&[("clip.mov", link)]), snap(&[("clip.mov", file(4_000, 10_000))])), (snap(&[("clip.mov", file(4_000, 10_000))]), snap(&[("clip.mov", link)]))] {
+            let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&src, &dst, &b);
+            assert_eq!(plan.actions.len(), 1, "{:?}", plan.actions);
+            assert!(matches!(&plan.actions[0], Action::Conflict { path, .. } if path == "clip.mov"));
+        }
+        // A file taking a link's place loses nothing: it crosses.
+        let b = base(&[("x", link)]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[("x", file(1, 60_000))]), &snap(&[("x", link)]), &b);
+        assert!(plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Destination, item: EntryKind::File, .. })), "{:?}", plan.actions);
+    }
+
+    #[test]
+    fn a_case_only_rename_keeps_the_folder_syncing() {
+        // "invoices" became "Invoices" on the destination; one drive ignores case, so both
+        // sides' keys are folded and the folder is one item.
+        let fold = |items: &[(&str, Entry)]| {
+            let mut s = snap(items);
+            s.fold();
+            s
+        };
+        let b = base(&[("invoices", Entry::dir()), ("invoices/a.pdf", file(1, 10_000))]);
+        let src = fold(&[("invoices", Entry::dir()), ("invoices/a.pdf", file(2, 20_000)), ("invoices/new.pdf", file(3, 30_000))]);
+        let dst = fold(&[("Invoices", Entry::dir()), ("Invoices/a.pdf", file(1, 10_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        let mut copied: Vec<&str> = plan.actions.iter().filter(|a| matches!(a, Action::Copy { to: Side::Destination, .. })).map(|a| a.path()).collect();
+        copied.sort();
+        assert_eq!(copied, vec!["invoices/a.pdf", "invoices/new.pdf"], "{:?}", plan.actions);
+        assert_eq!(plan.actions.len(), 2, "nothing is removed: {:?}", plan.actions);
+        assert!(plan.notes.is_empty(), "nothing is left alone: {:?}", plan.notes);
+        assert_eq!(dst.spelling("invoices/a.pdf"), "Invoices/a.pdf", "the destination keeps its own spelling");
     }
 
     #[test]

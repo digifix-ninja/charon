@@ -9,7 +9,9 @@ use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
 use crate::run::{Found, Markers, Room, Trash, TrashLook};
-use crate::scan::{never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot, Volume};
+use crate::scan::{
+    is_legacy_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot, Volume,
+};
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
@@ -19,6 +21,8 @@ use std::time::Instant;
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
 /// younger one may belong to a sync running right now in another job).
 const LEFTOVER_AGE_MS: i64 = 60 * 60 * 1000;
+/// A list names at most this many of the files named like Charon 0.2's half-copied files.
+const LEFTOVERS_NAMED: usize = 5;
 /// A background look compares at most this much by contents; whatever is left counts as
 /// identical for that look only (a list the person sees, and every run, read it all).
 const CHECK_COMPARE_BYTES: u64 = 1 << 30;
@@ -66,15 +70,57 @@ impl Housekeeping {
             ));
         }
         for (side, leftovers) in &self.leftovers {
-            if !leftovers.is_empty() {
+            let (legacy, current): (Vec<&str>, Vec<&str>) =
+                leftovers.iter().map(|(path, _)| path.as_str()).partition(|path| is_legacy_partial(Keys::name(path)));
+            if !current.is_empty() {
                 lines.push(format!(
                     "Also moves {} left by an interrupted sync into .charon-trash on the {}.",
-                    plural(leftovers.len() as u64, "half-copied file"),
+                    plural(current.len() as u64, "half-copied file"),
+                    side.word()
+                ));
+            }
+            if !legacy.is_empty() {
+                lines.push(format!(
+                    "Also moves {} into .charon-trash on the {}: Charon 0.2 named its half-copied files this way. If one of them is yours, rename it before you confirm.",
+                    Self::names(&legacy),
                     side.word()
                 ));
             }
         }
         lines
+    }
+
+    /// The half-copied files in `snapshot` a sync made for `purpose` tidies away at `now`:
+    /// those nothing wrote to for an hour, and whose copy started more than an hour ago by
+    /// the time in their name (a copy being finished gets the original's old modification
+    /// time, so its change time counts too, and a long copy may belong to another
+    /// computer's sync). Files named like Charon 0.2's half-copied files may be the
+    /// person's own: only a list the person sees, which names them, moves those.
+    fn leftovers(snapshot: &Snapshot, now: i64, purpose: Purpose) -> Vec<(String, Entry)> {
+        snapshot
+            .partials()
+            .iter()
+            .filter(|(path, entry)| {
+                let name = Keys::name(path);
+                let last_written = entry.modified.max(entry.changed / 1_000_000);
+                let started_long_ago = partial_started(name, now).is_none_or(|started| now - started > LEFTOVER_AGE_MS);
+                now - last_written > LEFTOVER_AGE_MS && started_long_ago && (purpose == Purpose::Review || !is_legacy_partial(name))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// “a.txt”, “b.txt” and 3 more.
+    fn names(paths: &[&str]) -> String {
+        let shown: Vec<String> = paths.iter().take(LEFTOVERS_NAMED).map(|path| format!("“{path}”")).collect();
+        let more = paths.len().saturating_sub(LEFTOVERS_NAMED);
+        if more > 0 {
+            return format!("{} and {} more", shown.join(", "), human_count(more as u64));
+        }
+        match shown.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => shown.join(", "),
+        }
     }
 }
 
@@ -183,12 +229,20 @@ impl Engine {
             destination.fold();
         }
         let (no_source_links, no_destination_links) = self.change_runtime(&job.id, |rt| rt.no_links);
-        if no_source_links {
+        // A drive found refusing links at an earlier sync still does, while it's the same drive.
+        let refused_before = |side: Side, now: &Volume| {
+            job.drives.as_ref().is_some_and(|drives| {
+                let before = drives.side(side);
+                before.refuses_links && Self::same_drive(before, now)
+            })
+        };
+        if no_source_links || refused_before(Side::Source, &volumes.0) {
             source.refuse_links();
         }
-        if no_destination_links {
+        if no_destination_links || refused_before(Side::Destination, &volumes.1) {
             destination.refuse_links();
         }
+        self.apply_refusals(job, &mut source, &mut destination);
 
         let mut warnings = Vec::new();
         let mut holds = Vec::new();
@@ -344,12 +398,18 @@ impl Engine {
         }
         let links = plan.actions.iter().filter(|a| matches!(a, Action::Copy { item: EntryKind::Link, .. })).count() as u64;
         if links > 0 {
-            warnings.push(Warning::info(format!(
+            let mut text = format!(
                 "{} copied as {}, not the files {} point to.",
                 if links == 1 { "1 symbolic link is".to_string() } else { format!("{} symbolic links are", human_count(links)) },
                 if links == 1 { "a link" } else { "links" },
                 if links == 1 { "it" } else { "they" }
-            )));
+            );
+            // A job synced before, but not since it got a record of its drives: possibly by
+            // Charon 0.2, which left links out.
+            if job.last_synced.is_some() && job.drives.is_none() {
+                text.push_str(" Charon 0.2 left symbolic links out, so this list may include links that were never synced before.");
+            }
+            warnings.push(Warning::info(text));
         }
 
         let housekeeping = self.housekeeping(&setup, &source, &destination, purpose);
@@ -655,6 +715,27 @@ impl Engine {
         wanted.then(|| Candidate { key: key.to_string(), source: *s, destination: *d, alike })
     }
 
+    /// Notes in the scans what a drive refused in an earlier sync of this session (see
+    /// `run::Refused`), while the item it refused and the drive are still the same: the plan
+    /// then leaves it out, with the reason, instead of trying it again on every sync.
+    fn apply_refusals(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) {
+        let refusals: Vec<_> = self.change_runtime(&job.id, |rt| rt.refused.values().cloned().collect());
+        for (refused, drive) in refusals {
+            let (from, here) = match refused.side {
+                Side::Source => (&*destination, &mut *source),
+                Side::Destination => (&*source, &mut *destination),
+            };
+            let same_item = from.get(&refused.key).is_some_and(|now| now.unchanged(&refused.item));
+            let same_drive = match (&drive, here.volume()) {
+                (Some(before), Some(now)) => Self::same_drive(before, now),
+                _ => true,
+            };
+            if same_item && same_drive {
+                here.refuse(&refused.key, refused.why);
+            }
+        }
+    }
+
     /// Old trash to empty and half-copied leftovers to tidy, on the sides the job writes to.
     /// A background look only looks into the trash folders old enough to be emptied.
     fn housekeeping(&self, setup: &JobSetup, source: &Snapshot, destination: &Snapshot, purpose: Purpose) -> Housekeeping {
@@ -667,13 +748,7 @@ impl Engine {
                 Side::Destination => (&setup.destination, destination),
             };
             housekeeping.trash.push((side, Trash::look(root, trash_days, purpose != Purpose::Check)));
-            // Old by its time and by when its copy started: a long copy carries the old time
-            // of its original at the end, and may belong to another computer's sync.
-            let old = |path: &str, entry: &Entry| {
-                now - entry.modified > LEFTOVER_AGE_MS && partial_started(Keys::name(path), now).is_none_or(|started| now - started > LEFTOVER_AGE_MS)
-            };
-            let leftovers: Vec<(String, Entry)> = snapshot.partials().iter().filter(|(path, entry)| old(path, entry)).cloned().collect();
-            housekeeping.leftovers.push((side, leftovers));
+            housekeeping.leftovers.push((side, Housekeeping::leftovers(snapshot, now, purpose)));
         }
         housekeeping
     }
@@ -748,5 +823,40 @@ impl Engine {
     pub(crate) fn same_drive(before: &Volume, now: &Volume) -> bool {
         let same_mount = before.mount.is_empty() || now.mount.is_empty() || before.mount == now.mount;
         same_mount && before.kind == now.kind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+
+    #[test]
+    fn files_named_like_old_half_copies_are_only_moved_from_a_list_that_names_them() {
+        let now = 1_800_000_000_000;
+        let old = now - 2 * HOUR_MS;
+        let mut snapshot = Snapshot::new();
+        snapshot.facts_mut().partials = vec![
+            ("a/.charon-00112233445566ff.part".into(), Entry::file(1, old)),
+            ("notes.charon-partial".into(), Entry::file(1, old)),
+            // Its modification time is the original's, but it was written a moment ago.
+            ("b/.charon-0011223344556677.part".into(), Entry::file(1, old).changed_at(now * 1_000_000)),
+        ];
+        let paths = |purpose| Housekeeping::leftovers(&snapshot, now, purpose).into_iter().map(|(path, _)| path).collect::<Vec<_>>();
+        assert_eq!(paths(Purpose::Automatic), vec!["a/.charon-00112233445566ff.part"]);
+        assert_eq!(paths(Purpose::Review), vec!["a/.charon-00112233445566ff.part", "notes.charon-partial"]);
+
+        let leftovers = vec![(Side::Destination, Housekeeping::leftovers(&snapshot, now, Purpose::Review))];
+        let lines = Housekeeping { trash: Vec::new(), leftovers }.lines(30);
+        assert_eq!(lines[0], "Also moves 1 half-copied file left by an interrupted sync into .charon-trash on the destination.");
+        assert!(lines[1].starts_with("Also moves “notes.charon-partial” into .charon-trash on the destination:"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn long_lists_of_names_are_cut_short() {
+        assert_eq!(Housekeeping::names(&["a"]), "“a”");
+        assert_eq!(Housekeeping::names(&["a", "b", "c"]), "“a”, “b” and “c”");
+        assert_eq!(Housekeeping::names(&["a", "b", "c", "d", "e", "f", "g"]), "“a”, “b”, “c”, “d”, “e” and 2 more");
     }
 }

@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_clutter, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Skipped, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
+    is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Skipped, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -106,8 +106,24 @@ impl<'a> Scanner<'a> {
                 if ExcludeFilter::is_internal(&key, name) {
                     if is_partial(name) && file_type.is_file() {
                         if let Ok(meta) = item.metadata() {
-                            snapshot.facts_mut().partials.push((disk.clone(), Entry::file(meta.len(), Self::modified_ms(&meta))));
+                            // Its change time too: a copy being finished gets the original's
+                            // modification time, which can be long ago.
+                            let changed = if change_times { Self::change_time(&meta) } else { 0 };
+                            snapshot.facts_mut().partials.push((disk.clone(), Entry::file(meta.len(), Self::modified_ms(&meta)).changed_at(changed)));
                         }
+                        if is_legacy_partial(name) {
+                            snapshot.facts_mut().skipped.push(Skipped {
+                                path: disk.clone(),
+                                reason: "named like a half-copied file of Charon 0.2, so Charon doesn't sync it (if it's yours, rename it)".into(),
+                            });
+                        }
+                        snapshot.occupy_folders_of(&key);
+                    } else if is_partial(name) {
+                        // A folder or link only named like a file Charon is copying.
+                        snapshot.facts_mut().skipped.push(Skipped {
+                            path: disk.clone(),
+                            reason: "named like a file Charon is copying, so Charon leaves it alone (if it's yours, rename it)".into(),
+                        });
                         snapshot.occupy_folders_of(&key);
                     } else if (name == MARKER_FOLDER || name == TRASH_FOLDER) && !Self::looks_like_charons(item.path(), name, file_type.is_dir()) {
                         // The person's own item, only named like one of Charon's folders:
@@ -541,6 +557,48 @@ mod tests {
         assert_eq!(s.partials().len(), 2);
         assert!(s.get("a/big.mov.charon-partial").is_none());
         assert!(s.is_occupied("a"), "a folder with a leftover isn't empty");
+    }
+
+    #[test]
+    fn items_only_named_like_half_copied_files_are_noted() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("a/big.mov.charon-partial"), "maybe mine");
+        write(&tmp.path().join("a/.charon-00112233445566ff.part"), "half");
+        write(&tmp.path().join("b.charon-partial/inside.txt"), "x");
+        let s = scan(tmp.path(), &[]);
+        let mut noted: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
+        noted.sort();
+        // Charon 0.3's own temporary names are its own; the others may be the person's.
+        assert_eq!(noted, vec!["a/big.mov.charon-partial", "b.charon-partial"]);
+        assert!(s.skipped().iter().all(|skipped| skipped.reason.contains("rename it")));
+        assert_eq!(s.partials().len(), 2, "only files count as leftovers");
+        assert!(s.get("b.charon-partial/inside.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn leftovers_carry_their_change_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".charon-00112233445566ff.part"), "half");
+        // A copy being finished gets the original's old modification time.
+        filetime::set_file_mtime(tmp.path().join(".charon-00112233445566ff.part"), filetime::FileTime::from_unix_time(1_000_000_000, 0)).unwrap();
+        let s = scan(tmp.path(), &[]);
+        let (_, entry) = &s.partials()[0];
+        if Volume::of(tmp.path()).keeps_change_times() {
+            assert!(entry.changed / 1_000_000 > entry.modified, "the change time tells it was written just now");
+        }
+    }
+
+    #[test]
+    fn patterns_match_names_in_either_unicode_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Re\u{301}sume\u{301}.pdf"), "x");
+        write(&tmp.path().join("Notes.pdf"), "x");
+        let s = scan(tmp.path(), &["R\u{e9}sum\u{e9}*"]);
+        assert!(s.get("R\u{e9}sum\u{e9}.pdf").is_none(), "a name stored decomposed is excluded by a pattern typed composed");
+        assert!(s.get("Notes.pdf").is_some());
+        let s = scan(tmp.path(), &["Re\u{301}sume\u{301}*"]);
+        assert!(s.get("R\u{e9}sum\u{e9}.pdf").is_none(), "and the other way round");
     }
 
     #[test]

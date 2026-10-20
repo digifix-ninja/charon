@@ -3,7 +3,7 @@
 
 use charon_core::model::{Level, SyncMode};
 use charon_core::plan::NoteKind;
-use charon_core::{ConflictRule, Engine, EngineEvent, Error, JobSetup, SyncStart, Trigger};
+use charon_core::{ConflictRule, Engine, EngineEvent, JobSetup, SyncStart, Trigger};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -141,7 +141,7 @@ fn a_change_left_in_only_by_its_case_makes_the_list_stale() {
 
     let review = engine.prepare_review(&id).unwrap();
     assert!(engine.note_change(&id, &src.join("notes.TMP")));
-    assert!(matches!(engine.approve(&id, &review.review_id, true), Err(Error::ReviewOutdated(_))));
+    assert!(matches!(engine.approve(&id, &review.review_id, true), Err(charon_core::Error::ReviewOutdated(_))));
     // A change to an item the sync leaves out still doesn't matter.
     let review = engine.prepare_review(&id).unwrap();
     assert!(!engine.note_change(&id, &src.join("notes.tmp")));

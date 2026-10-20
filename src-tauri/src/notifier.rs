@@ -61,6 +61,13 @@ impl Notifier {
                 "Open Charon to see which ones in the job's log.".into(),
             ));
         }
+        if run.left_out > 0 {
+            let what = if run.left_out == 1 { "it" } else { "them" };
+            return Some((
+                format!("{name}: {} left out", plural(run.left_out, "item")),
+                format!("A drive couldn't hold {what} (a name, a path or a size it refused, or a symbolic link). Open Charon to see which ones and why."),
+            ));
+        }
         if run.conflicts > 0 {
             return Some((
                 format!("{name}: {} to resolve", plural(run.conflicts, "conflict")),

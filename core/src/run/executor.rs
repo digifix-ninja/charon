@@ -19,7 +19,7 @@ use crate::run::durable;
 use crate::run::names;
 use crate::run::rename::{rename_new, swap};
 use crate::run::{Copier, ProgressMeter, Room, Trash};
-use crate::scan::{is_clutter, Entry, EntryKind, FsKind, Keys, RootId, Scanner, Snapshot};
+use crate::scan::{is_clutter, Entry, EntryKind, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -64,9 +64,11 @@ pub struct Outcome {
     pub bytes: u64,
     /// `(path, reason)` for every step that failed.
     pub failed: Vec<(String, String)>,
-    /// `(path, reason)` for every step left out because the item changed after the scan
-    /// (or can't be carried after all).
+    /// `(path, reason)` for every step left out because the item changed after the scan.
     pub skipped: Vec<(String, String)>,
+    /// `(path, reason)` for every step whose item the drive turned out not to hold (a link,
+    /// a name, a path or a size it refused). The next looks list such items as left out.
+    pub left_out: Vec<(String, String)>,
     /// Folders that were to be removed but still hold something.
     pub kept: Vec<String>,
     pub cancelled: bool,
@@ -81,6 +83,18 @@ pub struct Outcome {
     /// `(path, what)` for every copy that arrived without some of the original's details
     /// ("Finder tags", "resource fork"…), because the receiving drive can't keep them.
     pub unkept: Vec<(String, String)>,
+    /// Items a drive refused to take.
+    pub refused: Vec<Refused>,
+}
+
+/// An item a drive refused to take (see `Refusal`): the side it was to go to, its key, why,
+/// and the item as it was on the side it came from (once that changes, it's worth a try again).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Refused {
+    pub side: Side,
+    pub key: String,
+    pub why: Refusal,
+    pub item: Entry,
 }
 
 /// What one step did.
@@ -91,6 +105,8 @@ enum Done {
     /// Nothing was needed (the item was already gone).
     Nothing,
     Skipped(String),
+    /// The drive can't hold the item (see `Outcome::left_out`).
+    LeftOut(String),
     Kept,
 }
 
@@ -280,11 +296,11 @@ impl<'a> Executor<'a> {
             meter.start(&self.spellings.disk(Self::shown_side(action), action.path()));
             let result = match action {
                 Action::Delete { side, .. } if !makes_room && copies_failed.contains(side) => Ok(Done::Skipped(format!(
-                    "kept for now: some copies to the {} failed in this run",
+                    "kept for now: some items couldn't be copied to the {} in this run",
                     side.word()
                 ))),
                 Action::Copy { to, item: EntryKind::Link, .. } if outcome.no_links.contains(to) => {
-                    Ok(Done::Skipped(format!("left out: the {}'s drive can't hold symbolic links", to.word())))
+                    Ok(Done::LeftOut(format!("left out: the {}'s drive can't hold symbolic links", to.word())))
                 }
                 _ => self.apply(action, meter),
             };
@@ -313,6 +329,7 @@ impl<'a> Executor<'a> {
                 log::info!("skipped {}: {reason}", action.path());
                 outcome.skipped.push((action.path().to_string(), reason));
             }
+            Ok(Done::LeftOut(reason)) => outcome.left_out.push((action.path().to_string(), reason)),
             Ok(Done::Kept) => outcome.kept.push(action.path().to_string()),
             Err(Error::Cancelled) => {
                 outcome.cancelled = true;
@@ -328,24 +345,76 @@ impl<'a> Executor<'a> {
                     if !outcome.no_links.contains(to) {
                         outcome.no_links.push(*to);
                     }
-                    outcome.skipped.push((action.path().to_string(), format!("left out: the {}'s drive can't hold symbolic links", to.word())));
+                    outcome.left_out.push((action.path().to_string(), format!("left out: the {}'s drive can't hold symbolic links", to.word())));
+                }
+            }
+            Err(Error::Refused { path, why }) => {
+                log::info!("{}: {} refused: {}", action.path(), path.display(), why.reason("drive"));
+                // Like a failed copy, this keeps the run's removals on that side: the
+                // person sees the item left out in the next list before anything goes.
+                copies_failed.extend(Self::receiving(action));
+                let place = self.locate(action, &path);
+                outcome.left_out.push((action.path().to_string(), self.refusal_reason(action.path(), place.as_ref(), why)));
+                if let Some(refused) = place.and_then(|(side, key)| self.refused_item(side, key, why)) {
+                    if !outcome.refused.contains(&refused) {
+                        outcome.refused.push(refused);
+                    }
                 }
             }
             Err(e) => {
                 log::warn!("{}: {e}", action.path());
-                match action {
-                    Action::Copy { to, .. } => {
-                        copies_failed.insert(*to);
-                    }
-                    Action::KeepBoth { .. } => {
-                        copies_failed.extend([Side::Source, Side::Destination]);
-                    }
-                    _ => {}
+                if matches!(action, Action::Copy { .. } | Action::KeepBoth { .. }) {
+                    copies_failed.extend(Self::receiving(action));
                 }
                 outcome.failed.push((action.path().to_string(), e.to_string()));
             }
         }
         ControlFlow::Continue(())
+    }
+
+    /// The sides a step brings items to.
+    fn receiving(action: &Action) -> Vec<Side> {
+        match action {
+            Action::Copy { to, .. } => vec![*to],
+            Action::CreateDir { side, .. } => vec![*side],
+            Action::KeepBoth { .. } => vec![Side::Source, Side::Destination],
+            Action::Delete { .. } | Action::Conflict { .. } => Vec::new(),
+        }
+    }
+
+    /// The side and key of `path`, something `action` tried to create: its own item, or a
+    /// folder on the way to it.
+    fn locate(&self, action: &Action, path: &Path) -> Option<(Side, String)> {
+        Self::receiving(action).into_iter().find_map(|side| {
+            let relative = Scanner::relative(self.shores.root(side), path)?;
+            Some((side, self.spellings.key_for(&relative)))
+        })
+    }
+
+    /// What the person reads about the step of `key` when a drive refused `place` (`why`).
+    fn refusal_reason(&self, key: &str, place: Option<&(Side, String)>, why: Refusal) -> String {
+        match place {
+            Some((side, refused)) if refused != key => format!(
+                "left out: “{}” can't be created on the {}, because {}",
+                self.spellings.disk(*side, refused),
+                side.word(),
+                why.reason(&self.drive(*side))
+            ),
+            Some((side, _)) => format!("left out: {}", why.reason(&self.drive(*side))),
+            None => format!("left out: {}", why.reason("drive")),
+        }
+    }
+
+    /// The record of an item `side`'s drive refused, with the item as the other side has it
+    /// (`None` for a name this run made up, like a conflict copy's).
+    fn refused_item(&self, side: Side, key: String, why: Refusal) -> Option<Refused> {
+        let item = *self.spellings.snapshot(side.opposite()).get(&key)?;
+        Some(Refused { side, key, why, item })
+    }
+
+    /// `side`'s drive as the person knows it: "Backup SSD (exFAT)".
+    fn drive(&self, side: Side) -> String {
+        self.spellings.snapshot(side).volume().map(Volume::describe).unwrap_or_else(|| format!("{}'s drive", side.word()))
     }
 
     // ---------------------------------------------------------------- databases
@@ -567,11 +636,9 @@ impl<'a> Executor<'a> {
         if !Self::look(&there)?.is_some_and(|e| e.is_dir()) {
             return Ok(Done::Skipped(format!("no longer a folder on the {} side", side.opposite().word())));
         }
-        let relative = self.spellings.disk(side, key);
-        let root = self.shores.root(side);
-        self.prepare_parents(root, &relative)?;
-        self.ensure_folder(&root.join(&relative))?;
-        self.on_its_drive(side, &root.join(&relative))?;
+        self.prepare_parents(side, key)?;
+        self.ensure_folder(side, key)?;
+        self.on_its_drive(side, &self.path(side, key))?;
         self.settle(key, Some(Pair::new(Entry::dir(), Entry::dir())));
         Ok(Done::Created)
     }
@@ -599,9 +666,14 @@ impl<'a> Executor<'a> {
             return Err(Error::Changed(format!("changed on the {} side since the scan", to.opposite().word())));
         }
         if !Entry::still(Self::look(&target)?.as_ref(), existing) {
+            // Something the plan didn't see is there: new since the scan, or the drive
+            // taking this name for another item's.
+            if existing.is_none() {
+                self.not_taken(to, key)?;
+            }
             return Ok(None);
         }
-        self.prepare_parents(root, &relative)?;
+        self.prepare_parents(to, key)?;
 
         let (partial, unkept) = match from.kind {
             EntryKind::File => {
@@ -614,7 +686,10 @@ impl<'a> Executor<'a> {
                 let written = copier.file(&from_path, &target, from, &mut |n| meter.add_bytes(n))?;
                 (written.partial, written.unkept)
             }
-            EntryKind::Link => (Copier::link(&from_path, &target, from)?, BTreeSet::new()),
+            EntryKind::Link => {
+                let vague = self.spellings.snapshot(to).volume().is_some_and(Volume::answers_links_vaguely);
+                (Copier::link(&from_path, &target, from, vague)?, BTreeSet::new())
+            }
             EntryKind::Dir => return Err(Error::Invalid("a folder can't be copied as a file".into())),
         };
         self.touch(&target);
@@ -1152,10 +1227,12 @@ impl<'a> Executor<'a> {
 
     /// The item at `path` as it is now, without following links; `None` if nothing is there.
     /// Any other answer (no permission, a drive error) is an error: it never counts as "gone".
+    /// A path too long for the drive fails with `Error::Refused`.
     fn look(path: &Path) -> Result<Option<Entry>> {
         match fs::symlink_metadata(path) {
             Ok(meta) => Self::entry_of(path, &meta).map(Some),
             Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+            Err(e) if Refusal::of_naming(&e) == Some(Refusal::TooLong) => Err(Error::Refused { path: path.to_path_buf(), why: Refusal::TooLong }),
             Err(e) => Err(Error::file(path, e)),
         }
     }
@@ -1189,18 +1266,13 @@ impl<'a> Executor<'a> {
 
     // ---------------------------------------------------------------- folders on the way
 
-    /// Every folder above `relative` must be a real folder; missing ones are created one
-    /// level at a time, below the root only. A file or link in the way stops the step.
-    fn prepare_parents(&self, root: &Path, relative: &str) -> Result<()> {
-        let mut current = root.to_path_buf();
-        let parts: Vec<&str> = relative.split('/').collect();
-        for part in &parts[..parts.len().saturating_sub(1)] {
-            current.push(part);
-            if self.real_folders.borrow().contains(&current) {
-                continue;
-            }
-            self.ensure_folder(&current)?;
-            self.real_folders.borrow_mut().insert(current.clone());
+    /// Every folder above `key` on `side` must be a real folder; missing ones are created
+    /// one level at a time, below the root only. A file or link in the way stops the step.
+    fn prepare_parents(&self, side: Side, key: &str) -> Result<()> {
+        let mut folders: Vec<&str> = Keys::ancestors(key).collect();
+        folders.reverse();
+        for folder in folders {
+            self.ensure_folder(side, folder)?;
         }
         Ok(())
     }
@@ -1226,24 +1298,89 @@ impl<'a> Executor<'a> {
         Ok(Parents::Real)
     }
 
-    /// `path` is a real folder afterwards (created if missing), or this fails.
-    fn ensure_folder(&self, path: &Path) -> Result<()> {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.is_dir() => Ok(()),
-            Ok(meta) if meta.file_type().is_symlink() => {
-                Err(Error::Invalid(format!("{} is a link; Charon never writes through links", path.display())))
-            }
-            Ok(_) => Err(Error::Invalid(format!("a file named {} is in the way", path.display()))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(path) {
-                Ok(()) => {
-                    self.touch(path);
-                    Ok(())
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => self.ensure_folder(path),
-                Err(e) => Err(Error::file(path, e)),
-            },
-            Err(e) => Err(Error::file(path, e)),
+    /// The folder `key` on `side` is a real folder afterwards (created if missing), or this
+    /// fails. A name the drive refuses, or takes for another item's (see `not_taken`), fails
+    /// with `Error::Refused`.
+    fn ensure_folder(&self, side: Side, key: &str) -> Result<()> {
+        let path = self.path(side, key);
+        if self.real_folders.borrow().contains(&path) {
+            return Ok(());
         }
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                if !self.spellings.snapshot(side).contains(key) {
+                    self.not_taken(side, key)?;
+                }
+                if meta.file_type().is_symlink() {
+                    return Err(Error::Invalid(format!("{} is a link; Charon never writes through links", path.display())));
+                }
+                if !meta.is_dir() {
+                    return Err(Error::Invalid(format!("a file named {} is in the way", path.display())));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
+                Ok(()) => self.touch(&path),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return self.ensure_folder(side, key),
+                Err(e) => {
+                    return Err(match Refusal::of_naming(&e) {
+                        Some(why) => Error::Refused { path, why },
+                        None => Error::file(&path, e),
+                    })
+                }
+            },
+            Err(e) => return Err(Error::file(&path, e)),
+        }
+        self.real_folders.borrow_mut().insert(path);
+        Ok(())
+    }
+
+    /// A step found something at `key` on `side` where its scan saw nothing. That is
+    /// usually an item new since the scan, but a drive can also take a name for another
+    /// item's: a Windows short name (REPORT~1.PDF for "Report final.pdf"), or upper and
+    /// lower case by rules Charon's keys don't share. Then the folder above lists no name
+    /// with that key, and the step fails with `Refusal::TakenName` instead of waiting for
+    /// a next sync that would find the same. The folders above `key` are checked first.
+    fn not_taken(&self, side: Side, key: &str) -> Result<()> {
+        let here = self.spellings.snapshot(side);
+        let mut places: Vec<&str> = Keys::ancestors(key).collect();
+        places.reverse();
+        places.push(key);
+        for place in places {
+            let path = self.path(side, place);
+            if here.contains(place) || self.real_folders.borrow().contains(&path) {
+                continue;
+            }
+            if Self::look(&path)?.is_none() {
+                return Ok(());
+            }
+            // Still there once the folder was listed: it didn't just go away meanwhile.
+            if !self.listed(side, place) && Self::look(&path)?.is_some() {
+                return Err(Error::Refused { path, why: Refusal::TakenName });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the folder that holds `key` on `side` lists a name with `key`'s name. A
+    /// folder that can't be listed counts as listing it.
+    fn listed(&self, side: Side, key: &str) -> bool {
+        let path = self.path(side, key);
+        let Some(folder) = path.parent() else { return true };
+        let items = match fs::read_dir(folder) {
+            Ok(items) => items,
+            Err(e) => {
+                log::info!("couldn't list {}: {e}", folder.display());
+                return true;
+            }
+        };
+        let name = Keys::name(key);
+        for item in items {
+            let Ok(item) = item else { return true };
+            if item.file_name().to_str().is_some_and(|listed| self.spellings.key_for(listed) == name) {
+                return true;
+            }
+        }
+        false
     }
 
     // ---------------------------------------------------------------- conflict names
@@ -1252,8 +1389,9 @@ impl<'a> Executor<'a> {
     /// (conflict 2026-10-16 16.20).txt`, numbered when that name is taken on either side.
     /// Returns its key; the run remembers how it is spelled on each side.
     fn free_conflict_name(&self, key: &str) -> Result<String> {
+        // In the NFC form most systems write: a name made on a Mac drive can come decomposed.
         let on_destination = self.spellings.disk(Side::Destination, key);
-        let name = Keys::name(&on_destination).to_string();
+        let name: String = Keys::name(&on_destination).nfc().collect();
         let folder_on = |side: Side| Keys::parent(key).map(|parent| self.spellings.disk(side, parent));
         let (folder_destination, folder_source) = (folder_on(Side::Destination), folder_on(Side::Source));
         let join = |folder: &Option<String>, name: &str| match folder {
@@ -1495,6 +1633,44 @@ mod tests {
                 let relative = path.strip_prefix(&shores.destination).unwrap().to_string_lossy().replace('\\', "/");
                 assert!(matches!(executor.remove_folder(Side::Destination, &relative, &path).unwrap(), Done::Deleted));
             }
+        }
+    }
+
+    #[test]
+    fn a_name_the_drive_takes_for_another_items_is_refused() {
+        let (_tmp, shores) = shores();
+        let (source, destination) = (Snapshot::new(), Snapshot::new());
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel);
+        fs::write(shores.destination.join("Report final.pdf"), "theirs").unwrap();
+        fs::write(shores.destination.join("new.txt"), "added after the scan").unwrap();
+        // A drive with short names finds "Report final.pdf" under REPORT~1.PDF; this test's
+        // drive has none, so the spelling stands in for the drive's answer.
+        executor.spellings.learn(Side::Destination, "REPORT~1.PDF", "Report final.pdf".into());
+        assert!(matches!(
+            executor.not_taken(Side::Destination, "REPORT~1.PDF"),
+            Err(Error::Refused { why: Refusal::TakenName, .. })
+        ));
+        // An item that's simply new since the scan is listed under its own name.
+        assert!(executor.not_taken(Side::Destination, "new.txt").is_ok());
+        assert!(executor.not_taken(Side::Destination, "missing.txt").is_ok());
+    }
+
+    #[test]
+    fn conflict_copies_get_names_in_one_unicode_form() {
+        let (_tmp, shores) = shores();
+        let mut source = Snapshot::new();
+        source.insert("caf\u{e9}.txt", Entry::file(1, 1));
+        let mut destination = Snapshot::new();
+        destination.insert("caf\u{e9}.txt", Entry::file(2, 2));
+        // The destination is a Mac drive that stores names decomposed.
+        destination.facts_mut().spellings.insert("caf\u{e9}.txt".into(), "cafe\u{301}.txt".into());
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel);
+        let key = executor.free_conflict_name("caf\u{e9}.txt").unwrap();
+        for side in [Side::Source, Side::Destination] {
+            let name = executor.spellings.disk(side, &key);
+            assert!(unicode_normalization::is_nfc(&name), "{name:?} on the {}", side.word());
         }
     }
 }

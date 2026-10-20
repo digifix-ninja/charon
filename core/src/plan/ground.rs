@@ -2,7 +2,7 @@
 //! and a last look at folder removals once every step is known.
 
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
-use crate::scan::{Entry, EntryKind, Keys, Snapshot};
+use crate::scan::{Entry, EntryKind, Keys, Snapshot, Volume};
 use std::collections::{BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
@@ -48,27 +48,29 @@ impl<'a> Ground<'a> {
     }
 
     /// Items on the other side that side `to`'s drive can't hold: names it can't take, files
-    /// too big for it, links where it has none. Only the topmost such place is listed.
+    /// too big for it, links where it has none, and what it refused in an earlier sync. Only
+    /// the topmost such place is listed.
     fn unholdable(&self, to: Side) -> Vec<(String, String)> {
         let (from, here) = (self.side(to.opposite()), self.side(to));
-        let Some(volume) = here.volume() else { return Vec::new() };
+        let drive = here.volume().map(Volume::describe).unwrap_or_else(|| format!("{}'s drive", to.word()));
         let mut found: Vec<(String, String)> = Vec::new();
         for (key, entry) in from.iter() {
             if self.is_frozen(key) || found.last().is_some_and(|(top, _)| Keys::is_within(key, top)) {
                 continue;
             }
             let existing = here.get(key);
-            let reason = if existing.is_none() {
+            let reason = if let Some(why) = here.refused(key) {
+                Some(format!("an earlier sync found that {}", why.reason(&drive)))
+            } else if existing.is_none() {
                 let name: String = Keys::name(from.spelling(key)).nfc().collect();
-                volume.cannot_hold(&name).or_else(|| match entry.kind {
-                    EntryKind::Link if !here.holds_links() => {
-                        Some(format!("it's a symbolic link, and the {} can't hold links", volume.describe()))
-                    }
-                    EntryKind::File => volume.too_big(entry.size),
+                let volume = here.volume();
+                volume.and_then(|volume| volume.cannot_hold(&name)).or_else(|| match entry.kind {
+                    EntryKind::Link if !here.holds_links() => Some(format!("it's a symbolic link, and the {drive} can't hold links")),
+                    EntryKind::File => volume.and_then(|volume| volume.too_big(entry.size)),
                     _ => None,
                 })
             } else if entry.is_file() && existing.is_some_and(Entry::is_file) {
-                volume.too_big(entry.size)
+                here.volume().and_then(|volume| volume.too_big(entry.size))
             } else {
                 None
             };
@@ -164,7 +166,7 @@ mod tests {
 
     fn snap(items: &[(&str, Entry)], kind: FsKind) -> Snapshot {
         let mut s: Snapshot = items.iter().map(|(k, e)| (k.to_string(), *e)).collect();
-        s.facts_mut().volume = Some(Volume { kind, fs: "x".into(), mount: "/m".into(), name: "Stick".into(), network: false, case_sensitive: false });
+        s.facts_mut().volume = Some(Volume { kind, fs: "x".into(), mount: "/m".into(), name: "Stick".into(), network: false, case_sensitive: false, refuses_links: false });
         s
     }
 
@@ -190,6 +192,29 @@ mod tests {
         // The source never receives anything in a one-way job: nothing to check there.
         let ground = Ground::new(&destination, &source, &[], &mut Plan::default());
         assert!(!ground.is_off_limits("a:b.txt"));
+    }
+
+    #[test]
+    fn what_a_drive_refused_in_an_earlier_sync_is_left_out_with_everything_inside() {
+        let source = snap(
+            &[
+                ("q3: plans", Entry::dir()),
+                ("q3: plans/a.txt", Entry::file(1, 1)),
+                ("big.iso", Entry::file(9, 1)),
+                ("fine.txt", Entry::file(1, 1)),
+            ],
+            FsKind::Ext,
+        );
+        let mut destination = snap(&[("big.iso", Entry::file(5, 1))], FsKind::Other);
+        destination.refuse("q3: plans", crate::scan::Refusal::Name);
+        destination.refuse("big.iso", crate::scan::Refusal::TooBig);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("q3: plans/a.txt"));
+        assert!(ground.is_off_limits("big.iso"), "even over an older version the drive holds");
+        assert!(!ground.is_off_limits("fine.txt"));
+        assert_eq!(plan.notes.len(), 2, "{:?}", plan.notes);
+        assert!(plan.notes.iter().all(|n| n.kind == NoteKind::LeftOut && n.reason.starts_with("left out: an earlier sync found that")));
     }
 
     #[test]

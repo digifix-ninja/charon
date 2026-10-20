@@ -18,7 +18,7 @@ pub const PARTIAL_EXTENSION: &str = ".part";
 
 /// Whether `name` is a file Charon was copying (now or in an interrupted run).
 pub fn is_partial(name: &str) -> bool {
-    if name.ends_with(PARTIAL_SUFFIX) {
+    if is_legacy_partial(name) {
         return true;
     }
     partial_digits(name).is_some()
@@ -39,6 +39,13 @@ pub fn partial_started(name: &str, now_ms: i64) -> Option<i64> {
 fn partial_digits(name: &str) -> Option<&str> {
     let digits = name.strip_prefix(PARTIAL_PREFIX).and_then(|rest| rest.strip_suffix(PARTIAL_EXTENSION))?;
     (digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digits)
+}
+
+/// Whether `name` is named like a half-copied file of Charon 0.2 and earlier. Such a name
+/// may just as well be the person's own file, so these are only ever moved from a list the
+/// person confirmed, by name.
+pub fn is_legacy_partial(name: &str) -> bool {
+    name.ends_with(PARTIAL_SUFFIX)
 }
 
 /// Files the operating system scatters into folders by itself (Finder and Explorer

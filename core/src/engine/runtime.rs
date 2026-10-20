@@ -3,6 +3,7 @@
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side};
+use crate::run::Refused;
 use crate::scan::{Entry, ExcludeFilter, Snapshot, Volume};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -44,6 +45,9 @@ pub(crate) struct JobRuntime {
     pub same_contents: HashMap<String, (Entry, Entry, bool)>,
     /// The drive of the source / destination turned out not to hold symbolic links.
     pub no_links: (bool, bool),
+    /// Items a drive refused in a sync (by the side they were to go to, and key), with that
+    /// drive. Looks leave them out while the item and the drive stay the same.
+    pub refused: HashMap<(Side, String), (Refused, Option<Volume>)>,
     /// The job's exclude filter, to tell which folder changes matter: the setup it was made
     /// for, and the filter (matching case the way the job's drives do, once a look has
     /// found out how they do).
@@ -81,6 +85,7 @@ impl JobRuntime {
         self.problem = None;
         self.same_contents.clear();
         self.no_links = (false, false);
+        self.refused.clear();
         self.filter = None;
         self.missing = Missing::default();
         self.tried = None;
@@ -187,7 +192,7 @@ mod tests {
         let mut snapshot: Snapshot = paths.iter().map(|path| (path.to_string(), Entry::file(1, 1))).collect();
         let kind = if share { FsKind::Smb } else { FsKind::Ext };
         snapshot.facts_mut().volume =
-            Some(Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Drive".into(), network: share, case_sensitive: true });
+            Some(Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Drive".into(), network: share, case_sensitive: true, refuses_links: false });
         snapshot
     }
 

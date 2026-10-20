@@ -49,18 +49,28 @@ impl Keys {
         key == folder || (key.len() > folder.len() && key.starts_with(folder) && key.as_bytes()[folder.len()] == b'/')
     }
 
-    /// The key of an NFC key on drives that ignore case: lower case, with the Greek final
-    /// sigma (ς) folded like σ, so "ΟΔΟΣ" and "οδος" are one name, as they are to the drive.
+    /// The key of an NFC key on drives that ignore case, by Unicode's simple case folding:
+    /// "Report" and "report" are one name, and so are the letters that have two lower-case
+    /// forms ("ΟΔΟΣ" and "οδος", the micro sign µ and the Greek μ, the long ſ and s), as
+    /// they are to the drive.
     pub fn fold(key: &str) -> String {
         let mut folded = String::with_capacity(key.len());
         for c in key.chars() {
-            if c == 'ς' {
-                folded.push('σ');
-            } else {
-                folded.extend(c.to_lowercase());
-            }
+            folded.extend(Self::fold_char(c));
         }
         Self::normalize(&folded)
+    }
+
+    /// One character's folded form: the lower case of its upper case, so both lower-case
+    /// forms of a letter meet. A letter whose upper case is more than one letter (ß, the
+    /// ligatures) keeps its own lower case, and the Turkish dotless ı stays apart from i,
+    /// as Unicode's case folding has it.
+    fn fold_char(c: char) -> std::char::ToLowercase {
+        let mut upper = c.to_uppercase();
+        match (upper.next(), upper.next()) {
+            (Some(single), None) if c != 'ı' => single.to_lowercase(),
+            _ => c.to_lowercase(),
+        }
     }
 }
 
@@ -92,5 +102,18 @@ mod tests {
         assert_eq!(Keys::fold("ΟΔΟΣ"), Keys::fold("οδος"));
         assert_eq!(Keys::fold("ODOς"), "odoσ");
         assert_eq!(Keys::fold("caf\u{e9}"), Keys::fold("CAF\u{c9}"));
+    }
+
+    #[test]
+    fn letters_with_two_lower_case_forms_fold_together() {
+        // Drives that ignore case compare upper case: µ (micro sign) and μ are both Μ there.
+        assert_eq!(Keys::fold("\u{b5}.txt"), Keys::fold("\u{3bc}.txt"));
+        assert_eq!(Keys::fold("\u{17f}ee"), Keys::fold("See"));
+        assert_eq!(Keys::fold("\u{3d1}"), Keys::fold("\u{398}"));
+        assert_eq!(Keys::fold("\u{1e9e}"), "\u{df}", "capital ẞ is ß, never ss");
+        assert_ne!(Keys::fold("stra\u{df}e"), Keys::fold("strasse"));
+        assert_ne!(Keys::fold("k\u{131}sa"), Keys::fold("kisa"), "the dotless ı is its own letter");
+        assert_eq!(Keys::fold("I\u{131}"), "i\u{131}");
+        assert_eq!(Keys::fold("\u{212a}elvin"), "kelvin");
     }
 }

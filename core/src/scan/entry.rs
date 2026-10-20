@@ -1,7 +1,7 @@
 //! A file, folder or link as Charon sees it, and a whole folder as a sorted map of them,
 //! together with what the scan learned about the places it couldn't or mustn't touch.
 
-use crate::scan::{Keys, Volume};
+use crate::scan::{Keys, Refusal, Volume};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -219,6 +219,8 @@ pub struct ScanFacts {
     pub(crate) folded: bool,
     /// A run found out that links can't be created on this drive (some network shares).
     pub(crate) no_links: bool,
+    /// Items this drive refused to take in an earlier sync (key → why).
+    pub(crate) refused: BTreeMap<String, Refusal>,
 }
 
 /// Every item in a folder, keyed by its NFC path relative to the folder, with `/`
@@ -352,6 +354,19 @@ impl Snapshot {
     /// Notes that this folder's drive turned out not to hold links (a run failed to create one).
     pub fn refuse_links(&mut self) {
         self.facts.no_links = true;
+        if let Some(volume) = self.facts.volume.as_mut() {
+            volume.refuses_links = true;
+        }
+    }
+
+    /// Notes that this folder's drive refused to take the item `key` in an earlier sync.
+    pub fn refuse(&mut self, key: &str, why: Refusal) {
+        self.facts.refused.insert(key.to_string(), why);
+    }
+
+    /// Why this folder's drive refused the item `key` in an earlier sync, if it did.
+    pub fn refused(&self, key: &str) -> Option<Refusal> {
+        self.facts.refused.get(key).copied()
     }
 
     pub fn is_folded(&self) -> bool {
@@ -397,6 +412,7 @@ impl Snapshot {
         }
         self.facts.occupied = std::mem::take(&mut self.facts.occupied).iter().map(|key| Keys::fold(key)).collect();
         self.facts.clashes = std::mem::take(&mut self.facts.clashes).iter().map(|key| Keys::fold(key)).collect();
+        self.facts.refused = std::mem::take(&mut self.facts.refused).into_iter().map(|(key, why)| (Keys::fold(&key), why)).collect();
         for twin in twins {
             self.freeze(&twin, "another item in this folder has the same name in different upper/lower case, and one of the drives can't hold both, so Charon leaves them alone");
             self.facts.clashes.insert(twin);

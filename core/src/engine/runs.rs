@@ -21,7 +21,7 @@ use crate::scan::never_download_on_this_thread;
 use crate::store::{Landings, Memory};
 use chrono::Utc;
 use serde::Serialize;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -369,6 +369,7 @@ impl Engine {
         summary.conflicts = survey.plan.conflicts().len() as u64;
         summary.failed = outcome.failed.len() as u64;
         summary.skipped = outcome.skipped.len() as u64;
+        summary.left_out = outcome.left_out.len() as u64;
         summary.kept = outcome.kept.len() as u64;
         summary.unreadable = survey.plan.notes.iter().filter(|n| n.kind == NoteKind::Unreadable).count() as u64;
         summary.cancelled = outcome.cancelled;
@@ -396,7 +397,7 @@ impl Engine {
         for (path, reason) in outcome.failed.iter().take(LOGGED_ITEMS) {
             journal.warn(id, &format!("{path}: {reason}"));
         }
-        for (path, reason) in outcome.skipped.iter().take(LOGGED_ITEMS) {
+        for (path, reason) in outcome.skipped.iter().chain(&outcome.left_out).take(LOGGED_ITEMS) {
             journal.info(id, &format!("{path}: {reason}"));
         }
         for (path, to) in settled.iter().take(LOGGED_ITEMS) {
@@ -422,12 +423,30 @@ impl Engine {
                     Side::Destination => rt.no_links.1 = true,
                 }
             }
+            // An item this run carried after all was taken; one refused waits for a change.
+            if !rt.refused.is_empty() {
+                let carried: HashSet<&str> = outcome.settled.iter().map(|step| step.path.as_str()).collect();
+                rt.refused.retain(|(_, key), _| !carried.contains(key.as_str()));
+            }
+            for refused in &outcome.refused {
+                rt.refused.insert((refused.side, refused.key.clone()), (refused.clone(), survey.volume(refused.side).cloned()));
+            }
         });
+        // The drives, with what this run found out about links on them.
         let drives = match (survey.volume(Side::Source), survey.volume(Side::Destination)) {
-            (Some(source), Some(destination)) if recorded => Some(Drives { source: source.clone(), destination: destination.clone() }),
+            (Some(source), Some(destination)) if recorded => {
+                let mut drives = Drives { source: source.clone(), destination: destination.clone() };
+                for side in &outcome.no_links {
+                    match side {
+                        Side::Source => drives.source.refuses_links = true,
+                        Side::Destination => drives.destination.refuses_links = true,
+                    }
+                }
+                Some(drives)
+            }
             _ => None,
         };
-        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty();
+        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.left_out.is_empty();
         self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left }));
     }
 
@@ -751,7 +770,7 @@ struct Recorded {
     drives: Option<Drives>,
     /// Files removed or replaced on the source and on the destination.
     destroyed: (Vec<String>, Vec<String>),
-    /// Steps failed or were skipped.
+    /// Steps failed, were skipped or left out.
     left: bool,
 }
 

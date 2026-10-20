@@ -282,6 +282,16 @@ pub struct Drives {
     pub destination: Volume,
 }
 
+impl Drives {
+    /// The drive of `side`'s folder.
+    pub fn side(&self, side: crate::plan::Side) -> &Volume {
+        match side {
+            crate::plan::Side::Source => &self.source,
+            crate::plan::Side::Destination => &self.destination,
+        }
+    }
+}
+
 /// Files one automatic run removed or replaced on each side.
 /// The files and links automatic runs removed or replaced during the last day, on each
 /// side, with when it last happened to each. A file saved again and again counts once.

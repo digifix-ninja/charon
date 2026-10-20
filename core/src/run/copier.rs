@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::run::durable;
 use crate::run::rename::rename_new;
-use crate::scan::{Entry, Scanner, PARTIAL_EXTENSION, PARTIAL_PREFIX};
+use crate::scan::{Entry, Refusal, Scanner, PARTIAL_EXTENSION, PARTIAL_PREFIX};
 use std::collections::BTreeSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{Read, Write};
@@ -59,21 +59,31 @@ impl<'a> Copier<'a> {
 
     /// Copies the file `from` (which must still be `expected`) to a new temporary file next
     /// to `to`, reporting bytes as they go. Returns the temporary file, ready for a commit.
+    /// Fails with `Error::Refused` when the drive can't hold the file there (too big, or a
+    /// path too long for it).
     pub fn file(&self, from: &Path, to: &Path, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<Written> {
         let (partial, writer) = Self::create_partial(to)?;
         match self.write_partial(from, &partial, writer, expected, on_bytes) {
             Ok(unkept) => Ok(Written { partial, unkept }),
             Err(e) => {
                 Self::discard(&partial);
-                Err(e)
+                match e {
+                    Error::File { path, source } if path == partial => match Refusal::of_writing(&source) {
+                        Some(why) => Err(Error::Refused { path: to.to_path_buf(), why }),
+                        None => Err(Error::File { path, source }),
+                    },
+                    e => Err(e),
+                }
             }
         }
     }
 
     /// Makes a link like the one at `from` (which must still be `expected`) under a
     /// temporary name next to `to`. macOS and Linux only; Windows plans never hold links.
-    /// Fails with `Error::NoLinks` when the target drive can't hold links.
-    pub fn link(from: &Path, to: &Path, expected: &Entry) -> Result<PathBuf> {
+    /// Fails with `Error::NoLinks` when the target drive can't hold links; `vague`: the
+    /// target drive may say so with "permission denied" or "invalid argument" too (see
+    /// `Volume::answers_links_vaguely`).
+    pub fn link(from: &Path, to: &Path, expected: &Entry, vague: bool) -> Result<PathBuf> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -93,27 +103,38 @@ impl<'a> Copier<'a> {
                         return Ok(partial);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 5 => tries += 1,
-                    Err(e) if matches!(e.raw_os_error(), Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS) => {
-                        return Err(Error::NoLinks)
-                    }
+                    Err(e) if Self::refuses_links(&e, vague) => return Err(Error::NoLinks),
                     Err(e) => return Err(Error::file(&partial, e)),
                 }
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = (from, to, expected);
+            let _ = (from, to, expected, vague);
             Err(Error::NoLinks)
         }
     }
 
+    /// Whether the error from creating a link says the drive can't hold links at all.
+    #[cfg(unix)]
+    fn refuses_links(error: &std::io::Error, vague: bool) -> bool {
+        match error.raw_os_error() {
+            Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS => true,
+            Some(code) if vague => code == libc::EACCES || code == libc::EINVAL,
+            _ => false,
+        }
+    }
+
     /// Gives the finished copy its real name. Nothing may be at `to`: a file that appeared
-    /// there at the last moment is never overwritten.
+    /// there at the last moment is never overwritten. Fails with `Error::Refused` when the
+    /// drive can't hold the name.
     pub fn commit_new(partial: &Path, to: &Path) -> Result<()> {
         rename_new(partial, to).map_err(|e| {
             Self::discard(partial);
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 Error::Changed("something new appeared there meanwhile".into())
+            } else if let Some(why) = Refusal::of_naming(&e) {
+                Error::Refused { path: to.to_path_buf(), why }
             } else {
                 Error::file(to, e)
             }
@@ -144,6 +165,10 @@ impl<'a> Copier<'a> {
             match OpenOptions::new().write(true).create_new(true).open(&partial) {
                 Ok(file) => return Ok((partial, file)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 5 => tries += 1,
+                // The temporary name is short: only the path to it can be too long.
+                Err(e) if Refusal::of_naming(&e) == Some(Refusal::TooLong) => {
+                    return Err(Error::Refused { path: to.to_path_buf(), why: Refusal::TooLong })
+                }
                 Err(e) => return Err(Error::file(&partial, e)),
             }
         }
@@ -483,8 +508,32 @@ mod tests {
         std::os::unix::fs::symlink("../somewhere/else", &from).unwrap();
         let meta = fs::symlink_metadata(&from).unwrap();
         let expected = Entry::link(b"../somewhere/else", Scanner::modified_ms(&meta));
-        let partial = Copier::link(&from, &to, &expected).unwrap();
+        let partial = Copier::link(&from, &to, &expected, false).unwrap();
         Copier::commit_new(&partial, &to).unwrap();
         assert_eq!(fs::read_link(&to).unwrap(), Path::new("../somewhere/else"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shares_may_refuse_links_with_vaguer_answers() {
+        let error = std::io::Error::from_raw_os_error;
+        assert!(Copier::refuses_links(&error(libc::EOPNOTSUPP), false));
+        // On a local drive, "permission denied" is a problem to report, not a drive without links.
+        assert!(!Copier::refuses_links(&error(libc::EACCES), false));
+        assert!(Copier::refuses_links(&error(libc::EACCES), true));
+        assert!(Copier::refuses_links(&error(libc::EINVAL), true));
+        assert!(!Copier::refuses_links(&error(libc::EIO), true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_name_too_long_for_the_drive_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("a.txt"), tmp.path().join("x".repeat(300)));
+        fs::write(&from, "copy").unwrap();
+        let never = AtomicBool::new(false);
+        let partial = Copier::new(&never).file(&from, &to, &entry_of(&from), &mut |_| {}).unwrap().partial;
+        assert!(matches!(Copier::commit_new(&partial, &to), Err(Error::Refused { why: Refusal::TooLong, .. })));
+        assert!(!partial.exists(), "the unfinished copy is gone");
     }
 }

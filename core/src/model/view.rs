@@ -146,6 +146,10 @@ pub struct RunSummary {
     /// look picks them up again.
     #[serde(default)]
     pub skipped: u64,
+    /// Steps left out because a drive turned out not to hold the item (a link, a name, a
+    /// path or a size it refused). The next looks list them, with the reason.
+    #[serde(default)]
+    pub left_out: u64,
     /// Folders kept because something is still in them.
     #[serde(default)]
     pub kept: u64,
@@ -179,6 +183,7 @@ impl RunSummary {
             conflicts: 0,
             failed: 0,
             skipped: 0,
+            left_out: 0,
             kept: 0,
             unreadable: 0,
             settled: 0,
@@ -225,6 +230,10 @@ impl RunSummary {
         }
         if self.skipped > 0 {
             parts.push(format!("{} skipped (changed meanwhile)", plural(self.skipped, "item")));
+        }
+        if self.left_out > 0 {
+            let them = if self.left_out == 1 { "it" } else { "them" };
+            parts.push(format!("{} left out (a drive couldn't hold {them})", plural(self.left_out, "item")));
         }
         if self.kept > 0 {
             parts.push(format!("kept {} that still hold files", plural(self.kept, "folder")));

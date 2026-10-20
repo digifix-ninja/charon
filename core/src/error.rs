@@ -1,6 +1,7 @@
 //! The one error type of the core. Messages are written for people, because the window
 //! shows them as they are.
 
+use crate::scan::Refusal;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +58,11 @@ pub enum Error {
     /// The drive can't hold symbolic links (FAT, exFAT, some network shares).
     #[error("this drive can't hold symbolic links")]
     NoLinks,
+
+    /// The drive refused to take an item (see `Refusal`): `path` is the item, or the folder
+    /// on the way to it, that couldn't be created.
+    #[error("Couldn't create {}: {}.", .path.display(), .why.reason("drive"))]
+    Refused { path: PathBuf, why: Refusal },
 
     /// Something written during a run landed on another drive than the folder's: the drive
     /// went away and left its mount folder behind. The run stops there.

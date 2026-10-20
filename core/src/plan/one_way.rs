@@ -68,15 +68,15 @@ impl OneWayPlanner {
                         && Entry::whole_hours_apart(existing.modified, wanted.modified) => {}
                 // Something of another kind is in the way (a file where a folder goes, a link…).
                 Some(existing) if existing.kind != wanted.kind => {
-                    if existing.is_dir() && wanted.is_link() {
-                        // Usually a folder moved elsewhere with a link left behind: the copy
-                        // here may be the only other copy of what's in it.
-                        plan.note(
-                            NoteKind::Blocked,
-                            Some(Side::Destination),
-                            destination.spelling(path),
-                            "kept: the source now has a link here instead of this folder, so Charon keeps the folder and what's in it",
-                        );
+                    if wanted.is_link() {
+                        // Usually a file or folder moved to another drive with a link left
+                        // behind: the copy here may be the only other copy of what it holds.
+                        let reason = if existing.is_dir() {
+                            "kept: the source now has a link here instead of this folder, so Charon keeps the folder and what's in it"
+                        } else {
+                            "kept: the source now has a link here instead of this file, so Charon keeps the file"
+                        };
+                        plan.note(NoteKind::Blocked, Some(Side::Destination), destination.spelling(path), reason);
                         ground.block(path);
                         continue;
                     }
@@ -237,6 +237,21 @@ mod tests {
         let plan = OneWayPlanner::mirror().plan(&src, &dst);
         assert!(plan.actions.is_empty(), "{:?}", paths(&plan));
         assert_eq!(plan.notes[0].kind, NoteKind::Blocked);
+    }
+
+    #[test]
+    fn a_link_never_replaces_a_file() {
+        // clip.mov moved to another drive, with a link left in its place.
+        let src: Snapshot = [("clip.mov".to_string(), Entry::link(b"/Volumes/SSD/clip.mov", 1))].into_iter().collect();
+        let dst = snap(&[("clip.mov", Some((4_000, 1)))]);
+        for planner in [OneWayPlanner::mirror(), OneWayPlanner::backup()] {
+            let plan = planner.plan(&src, &dst);
+            assert!(plan.actions.is_empty(), "{:?}", paths(&plan));
+            assert_eq!(plan.notes[0].kind, NoteKind::Blocked);
+        }
+        // A link that takes another link's place is simply carried.
+        let dst: Snapshot = [("clip.mov".to_string(), Entry::link(b"/Volumes/Old/clip.mov", 1))].into_iter().collect();
+        assert_eq!(OneWayPlanner::mirror().plan(&src, &dst).summary().replaces, 1);
     }
 
     #[test]
