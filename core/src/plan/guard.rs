@@ -185,13 +185,14 @@ impl Guard {
     /// The files this plan and the automatic runs since the last confirmed list (`earlier`)
     /// removed or replaced on `side` together, each counted once, if that's a good share of
     /// them. A day's count can't see damage that spreads more slowly than that (a broken
-    /// tool rewriting a few dozen files an hour); this one has no fixed ceiling, so even a
-    /// very large folder is held long before all of it is replaced.
+    /// tool rewriting a few dozen files an hour, or a few files a day in a small folder);
+    /// this one holds by the same rules without the day's fixed ceiling, so a folder of any
+    /// size is held long before all of it is replaced.
     fn since_confirmed(plan: &Plan, snapshot: &Snapshot, earlier: &Footprints, side: Side) -> Option<String> {
         let hit: BTreeSet<&str> = earlier.keys.iter().map(String::as_str).chain(plan.destructive_paths_on(side)).collect();
         let gone = earlier.keys.iter().filter(|key| !snapshot.contains(key)).count() as u64;
         let (hit, total) = (hit.len() as u64, snapshot.file_count() as u64 + gone);
-        (earlier.overflowing || Self::large_share(hit, total)).then(|| {
+        (earlier.overflowing || Self::large_share(hit, total) || Self::most_destructive(hit, total)).then(|| {
             format!(
                 "Automatic syncs since you last confirmed a list, and this one, would remove or replace {} of the {} files in the {}.",
                 human_count(hit),
@@ -433,6 +434,24 @@ mod tests {
         // Without the long count, the same pace is never held.
         let day_only = Recent { destination: names(hour - 23..hour).collect(), ..Recent::default() };
         assert!(with_recent(&replacing(names(hour..hour + 1)), &source, &destination, &day_only).is_empty());
+    }
+
+    #[test]
+    fn a_small_folder_damaged_more_slowly_than_a_day_needs_a_look() {
+        // 20 contracts, rewritten by a broken tool a few a day with more than a day between
+        // automatic runs: 9, then 9, then 2. No day ever sees half of them.
+        let names = |range: std::ops::Range<usize>| range.map(|i| format!("f{i}.txt"));
+        let (source, destination) = (files(20), files(20));
+        let first = Recent::default();
+        assert!(with_recent(&replacing(names(0..9)), &source, &destination, &first).is_empty(), "9 of 20 in a run is ordinary work");
+        let mut second = Recent::default();
+        second.since_confirmed.destination.keys.extend(names(0..9));
+        let found = with_recent(&replacing(names(9..18)), &source, &destination, &second);
+        assert!(found.iter().any(|concern| concern.contains("since you last confirmed a list")), "{found:?}");
+        // Edits of fewer than half the files since the last confirmed list are ordinary.
+        let mut few = Recent::default();
+        few.since_confirmed.destination.keys.extend(names(0..6));
+        assert!(with_recent(&replacing(names(6..9)), &source, &destination, &few).is_empty());
     }
 
     #[test]
