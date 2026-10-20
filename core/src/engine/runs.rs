@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Spellings, Trash};
-use crate::scan::{never_download_on_this_thread, EntryKind, ExcludeFilter, Keys, Scanner, Snapshot, MARKER_FOLDER};
+use crate::scan::{never_download_on_this_thread, ExcludeFilter, Keys, Scanner, Snapshot, MARKER_FOLDER};
 use crate::store::{Landings, Memory};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -364,13 +364,17 @@ impl Engine {
     /// whose contents the plan changes. A sync of a folder inside may have started since the
     /// scans (for a confirmed list, maybe hours ago) and made Charon's folder there: its
     /// notes must be seen before this run changes anything in its folder.
+    ///
+    /// The folders are taken as they are now, not as the scans saw them: since then a folder
+    /// may have been replaced by a link, or a link by a folder. (Where the scans met one is
+    /// checked the same way when the notes are read and left: see `run::Claim`.)
     fn folders_inside_now(survey: &Survey) -> Vec<PathBuf> {
         let mut inside: BTreeSet<PathBuf> = Self::folders_inside(&survey.setup, &survey.source, &survey.destination).into_iter().collect();
         let spellings = Spellings::new(&survey.source, &survey.destination);
         for side in [Side::Source, Side::Destination] {
             let changed: BTreeSet<&str> = survey.plan.actions.iter().filter(|action| action.changes(side)).flat_map(Action::folders).collect();
             // A folder comes before the folders inside it. One that isn't a folder of its own
-            // here (it's new to this side and not there yet, or it's a link) has nothing
+            // here now (it's new to this side and not there yet, or it's a link) has nothing
             // inside it to look at: Charon never looks through a link.
             let mut not_folders: HashSet<&str> = HashSet::new();
             for key in changed {
@@ -378,11 +382,7 @@ impl Engine {
                     continue;
                 }
                 let folder = survey.setup.root(side).join(spellings.disk(side, key));
-                let real = match survey.snapshot(side).get(key) {
-                    Some(entry) => entry.kind == EntryKind::Dir,
-                    None => fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir()),
-                };
-                if !real {
+                if !fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir()) {
                     not_folders.insert(key);
                     continue;
                 }
