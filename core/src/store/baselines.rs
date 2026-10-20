@@ -34,6 +34,10 @@ pub struct Memory {
     /// sync. They decide nothing: they only tell which of the items a fresh comparison
     /// brings back were most likely removed since.
     pub earlier: BTreeSet<String>,
+    /// Pairs that look alike (the same size and time) but were read and found to differ,
+    /// left for the person, with no record to go by: the next look reads them again rather
+    /// than take them for identical (see `Engine::compare_contents`).
+    pub unsettled: BTreeSet<String>,
 }
 
 impl Memory {
@@ -62,6 +66,8 @@ struct StoredMemory {
     #[serde(default)]
     folded: bool,
     pairs: Baseline,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    unsettled: BTreeSet<String>,
 }
 
 /// The file as it may be on disk: 0.2.0 and earlier stored a bare map of items.
@@ -118,6 +124,7 @@ impl Baselines {
                         folded: stored.folded,
                         distrust: None,
                         earlier: BTreeSet::new(),
+                        unsettled: stored.unsettled,
                     }
                 } else {
                     // Left behind when the job's folders changed (and it couldn't be removed
@@ -184,6 +191,7 @@ impl Baselines {
             generation: memory.generation,
             folded: memory.folded,
             pairs: memory.baseline.clone(),
+            unsettled: memory.unsettled.clone(),
         };
         let bytes = serde_json::to_vec(&stored)?;
         let header = Header {
@@ -242,7 +250,8 @@ mod tests {
     fn memory() -> Memory {
         let mut baseline = Baseline::new();
         baseline.insert("a.txt", Pair::new(Entry::file(1, 10_000), Entry::file(1, 11_000)));
-        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None, earlier: BTreeSet::new() }
+        let unsettled = BTreeSet::from(["vault.hc".to_string()]);
+        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None, earlier: BTreeSet::new(), unsettled }
     }
 
     #[test]

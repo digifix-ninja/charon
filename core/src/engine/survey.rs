@@ -145,8 +145,50 @@ struct Candidate {
     key: String,
     source: Entry,
     destination: Entry,
-    /// Both sides changed since the last sync and look alike by size and date.
+    /// Both sides look alike by size and date (and changed since the last sync, or have no
+    /// record of it).
     alike: bool,
+}
+
+/// Which pairs that look alike, with no record Charon can go by, are read all the same
+/// (see `Engine::candidate`): the pairs found to differ before and left for the person
+/// (`Memory::unsettled`), and, in a fresh comparison, those that a record of the last sync
+/// Charon can't trust (see `Engine::distrust`) shows changed since, on either side. It
+/// never decides what is carried or removed.
+#[derive(Default)]
+struct Guide {
+    /// The record Charon can't trust, if the comparison is a fresh one.
+    pairs: Baseline,
+    unsettled: BTreeSet<String>,
+    /// The memory was made with the other kind of keys (see `Keys::fold`), so it is keyed,
+    /// and looked up, folded.
+    folded: bool,
+}
+
+impl Guide {
+    /// What `memory` tells a look whose keys are `folded` or not; `afresh` when Charon
+    /// can't trust its record.
+    fn of(memory: &Memory, folded: bool, afresh: bool) -> Self {
+        let pairs = if afresh { memory.baseline.clone() } else { Baseline::new() };
+        if memory.folded == folded {
+            return Self { pairs, unsettled: memory.unsettled.clone(), folded: false };
+        }
+        Self {
+            pairs: pairs.iter().map(|(key, pair)| (Keys::fold(key), *pair)).collect(),
+            unsettled: memory.unsettled.iter().map(|key| Keys::fold(key)).collect(),
+            folded: true,
+        }
+    }
+
+    /// Whether the look-alike pair at `key` (`s` and `d` as they are now) is read all the same.
+    fn wants_read(&self, key: &str, s: &Entry, d: &Entry, source: &Snapshot, destination: &Snapshot) -> bool {
+        let key = if self.folded { Keys::fold(key) } else { key.to_string() };
+        self.unsettled.contains(&key)
+            || self.pairs.get(&key).is_some_and(|pair| {
+                !Entry::still_on(Some(s), Some(&pair.source), source.shifts_times())
+                    || !Entry::still_on(Some(d), Some(&pair.destination), destination.shifts_times())
+            })
+    }
 }
 
 /// What reading contents found.
@@ -186,6 +228,9 @@ pub(crate) struct Survey {
     pub left_for_later: Plan,
     /// Pairs of files found identical by their contents, though their dates differ.
     pub agreed: u64,
+    /// Pairs that look alike but were found to differ by their contents (see
+    /// `Memory::unsettled`).
+    pub different: BTreeSet<String>,
     /// Why this plan must not run at all.
     pub refusal: Option<String>,
     pub warnings: Vec<Warning>,
@@ -296,11 +341,13 @@ impl Engine {
         // can't, both folders are compared afresh this time, and the list says why once the
         // plan shows what that brings back.
         let mut afresh = None;
+        let mut guide = Guide::default();
         let (memory, trusted, mut baseline) = if setup.mode.is_two_way() {
             let memory = self.inner.baselines.load(&job.id, &setup);
             match self.distrust(job, &memory, folded, &markers) {
                 Some(reason) => {
                     afresh = Some(reason);
+                    guide = Guide::of(&memory, folded, true);
                     (Some(memory), false, Baseline::new())
                 }
                 None if memory.tokens.is_none() => {
@@ -316,6 +363,7 @@ impl Engine {
                 }
                 None => {
                     let baseline = memory.baseline.clone();
+                    guide = Guide::of(&memory, folded, false);
                     (Some(memory), true, baseline)
                 }
             }
@@ -329,7 +377,7 @@ impl Engine {
             self.inner.landings.load(&job.id, &setup, folded, &markers.destination)
         };
         let compared = if setup.mode.is_two_way() {
-            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, purpose, cancel))?
+            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, &guide, purpose, cancel))?
         } else {
             Compared::default()
         };
@@ -528,6 +576,7 @@ impl Engine {
             plan,
             left_for_later: Plan::default(),
             agreed,
+            different: compared.different,
             refusal,
             warnings,
             holds,
@@ -754,6 +803,11 @@ impl Engine {
     ///
     /// * no record of the last sync (or both sides changed since), the same size but
     ///   different dates: identical pairs are recorded as in sync;
+    /// * no record Charon can trust, the same size and date, but a record it can't trust
+    ///   shows that one side changed since, or an earlier look found them to differ (see
+    ///   `Guide`): an edit that kept the file's size and time (an encrypted container does)
+    ///   would otherwise be taken for identical, and recorded as in sync. If their contents
+    ///   differ, they're a conflict;
     /// * one side changed since the record but kept its size, and only its details or its
     ///   time moved, by a rounding or by quarter hours (a tag or permission change, a drive
     ///   that shifts or rounds times): identical to the other side, the record is renewed;
@@ -762,16 +816,18 @@ impl Engine {
     ///
     /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as identical
     /// for that look only.
+    #[allow(clippy::too_many_arguments)]
     fn compare_contents(
         &self,
         job: &Job,
         source: &Snapshot,
         destination: &Snapshot,
         baseline: &mut Baseline,
+        guide: &Guide,
         purpose: Purpose,
         cancel: &AtomicBool,
     ) -> Result<Compared> {
-        let candidates: Vec<Candidate> = source.iter().filter_map(|(key, s)| Self::candidate(key, s, source, destination, baseline)).collect();
+        let candidates: Vec<Candidate> = source.iter().filter_map(|(key, s)| Self::candidate(key, s, source, destination, baseline, guide)).collect();
         let total_bytes: u64 = candidates.iter().map(|c| c.source.size).sum();
         let total_files = candidates.len() as u64;
         let mut compared = Compared::default();
@@ -823,13 +879,13 @@ impl Engine {
     }
 
     /// Whether the pair at `key` needs its contents read (see `compare_contents`).
-    fn candidate(key: &str, s: &Entry, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> Option<Candidate> {
+    fn candidate(key: &str, s: &Entry, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, guide: &Guide) -> Option<Candidate> {
         let d = destination.get(key)?;
         if !(s.is_file() && d.is_file() && s.size == d.size) || source.frozen(key).is_some() || destination.frozen(key).is_some() {
             return None;
         }
         let wanted = match baseline.get(key) {
-            None => !s.same_as(d),
+            None => !s.same_as(d) || guide.wants_read(key, s, d, source, destination),
             Some(pair) => {
                 let source_still = Entry::still_on(Some(s), Some(&pair.source), source.shifts_times());
                 let destination_still = Entry::still_on(Some(d), Some(&pair.destination), destination.shifts_times());
@@ -841,7 +897,7 @@ impl Engine {
                 }
             }
         };
-        let alike = baseline.get(key).is_some() && s.same_as(d);
+        let alike = s.same_as(d);
         wanted.then(|| Candidate { key: key.to_string(), source: *s, destination: *d, alike })
     }
 

@@ -377,6 +377,55 @@ fn a_replacement_lost_on_a_drive_is_seen_even_when_both_versions_look_alike() {
     assert_eq!(read(&mac.join("box/vault.hc")), "NEW-CONTENTS", "the old version never replaces the new one");
 }
 
+/// The same drive, coming back without the run that carried an edit of the container. The
+/// next look compares both folders afresh, and the memory it can't trust shows that the
+/// container changed on the Mac since the last sync: the two look-alike versions are read,
+/// and they're a conflict for the person. Left open, it stays one on the looks after, so the
+/// container is never taken for synced, and a later edit on the drive (which keeps its date
+/// too) never replaces the Mac's edit unasked.
+#[cfg(unix)]
+#[test]
+fn an_edit_that_kept_its_date_stays_a_conflict_after_a_run_that_never_landed() {
+    let tmp = tempfile::tempdir().unwrap();
+    if !keeps_change_times(tmp.path()) {
+        return;
+    }
+    let (mac, drive, data) = (tmp.path().join("mac"), tmp.path().join("drive"), tmp.path().join("data"));
+    let (before, elsewhere) = (tmp.path().join("before"), tmp.path().join("elsewhere"));
+    write(&before.join("box/vault.hc"), "OLD-CONTENTS");
+    set_mtime(&before.join("box/vault.hc"), at(0));
+    wait_for_a_later_change_time(&before.join("box/vault.hc"));
+    write(&mac.join("box/vault.hc"), "OLD-CONTENTS");
+    set_mtime(&mac.join("box/vault.hc"), at(0));
+    let rig = Rig::open(&data);
+    let engine = &rig.engine;
+    let id = add(engine, job_setup(&mac, &drive, SyncMode::TwoWay));
+    synced(engine, &id);
+
+    write(&mac.join("box/vault.hc"), "NEW-CONTENTS");
+    set_mtime(&mac.join("box/vault.hc"), at(0));
+    let (folder, old) = (drive.join("box"), before.join("box"));
+    rig.at_the_end(move || {
+        fs::rename(&folder, &elsewhere).unwrap();
+        fs::rename(&old, &folder).unwrap();
+    });
+    confirm(engine, &id);
+    assert!(rig.hook_fired());
+    let review = assert_not_recorded(engine, &id, "“box/vault.hc” on the destination is a version older than the one this sync replaced");
+    assert_eq!(review.tally.conflicts, 1, "the fresh comparison reads the container: {:?}", review.steps);
+
+    // The person confirms the list and leaves the conflict for later.
+    synced(engine, &id);
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.conflicts, 1, "still a conflict: {:?}", review.steps);
+    write(&drive.join("box/vault.hc"), "DRV-CONTENTS");
+    set_mtime(&drive.join("box/vault.hc"), at(0));
+    let review = synced(engine, &id);
+    assert_eq!((review.tally.conflicts, review.tally.source.replaced), (1, 0), "{:?}", review.steps);
+    assert_eq!(read(&mac.join("box/vault.hc")), "NEW-CONTENTS");
+    assert_eq!(read(&drive.join("box/vault.hc")), "DRV-CONTENTS");
+}
+
 /// The person sorts photos on the Mac while a long run copies them: a photo moved after its
 /// copy was made doesn't fail the run or stop it from running by itself. Only that photo is
 /// left out of the record, so the next look copies it back rather than take the move for a

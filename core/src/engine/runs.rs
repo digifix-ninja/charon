@@ -754,7 +754,14 @@ impl Engine {
                 return Err(fail(format!("couldn't leave its marker in the {} ({e})", side.word())));
             }
         }
-        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default() };
+        // Pairs found to differ though they look alike, still without a record: the next
+        // look reads them again (a list that settles one item keeps the others).
+        let found = match crossing.kind {
+            ReviewKind::Sync => survey.different.clone(),
+            ReviewKind::Resolve => memory.unsettled.union(&survey.different).cloned().collect(),
+        };
+        let unsettled = found.into_iter().filter(|key| !next.contains(key)).collect();
+        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default(), unsettled };
         self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
     }
 
@@ -1118,6 +1125,7 @@ impl Survey {
             plan: Default::default(),
             left_for_later: Default::default(),
             agreed: 0,
+            different: BTreeSet::new(),
             refusal: None,
             warnings: Vec::new(),
             holds: Vec::new(),
