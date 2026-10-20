@@ -949,7 +949,7 @@ impl Engine {
                 Side::Source => (&setup.source, source),
                 Side::Destination => (&setup.destination, destination),
             };
-            housekeeping.trash.push((side, Trash::look(root, trash_days, purpose != Purpose::Check)));
+            housekeeping.trash.push((side, Trash::look(root, trash_days, purpose != Purpose::Check, snapshot.shifts_times())));
             housekeeping.leftovers.push((side, Housekeeping::leftovers(snapshot, now, purpose)));
         }
         housekeeping

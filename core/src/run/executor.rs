@@ -2112,7 +2112,7 @@ mod tests {
         fs::remove_file(&staged.partial).unwrap();
         assert!(executor.commit(staged).is_err());
         assert_eq!(fs::read_to_string(&target).unwrap(), "old");
-        assert_eq!(Trash::look(&shores.destination, 0, true).bytes, 0, "no copy of the old version is left in the trash");
+        assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 0, "no copy of the old version is left in the trash");
     }
 
     /// After a failed replacement, only the old version itself counts as still in its place:
@@ -2148,7 +2148,7 @@ mod tests {
         executor.put_back(Side::Destination, &aside, &target, "notes.txt", None);
         assert_eq!(fs::read_to_string(&target).unwrap(), "newer");
         assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
-        let trash = Trash::look(&shores.destination, 0, true);
+        let trash = Trash::look(&shores.destination, 0, true, false);
         assert_eq!(trash.bytes, 3, "the old one is in the trash");
     }
 
@@ -2170,7 +2170,7 @@ mod tests {
             let planned = seen(&target);
             assert!(executor.remove(Side::Destination, "plan.txt", &target, keep, Some(&planned)).unwrap());
             assert!(names_in(&shores.destination).is_empty());
-            assert_eq!(Trash::look(&shores.destination, 0, true).bytes > 0, keep, "kept in the trash only with safe deletes");
+            assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes > 0, keep, "kept in the trash only with safe deletes");
         }
     }
 
@@ -2216,7 +2216,7 @@ mod tests {
         let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
         assert!(executor.remove(Side::Destination, "photos/x.jpg", &target, true, Some(&seen(&target))).unwrap());
         assert!(!other_drive.path().join("x.jpg").exists());
-        assert_eq!(Trash::look(&shores.destination, 0, true).bytes, 9, "the trash holds the copy");
+        assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 9, "the trash holds the copy");
     }
 
     /// A step that can't finish once it renamed the item aside puts it back as it was. The

@@ -15,7 +15,9 @@
 //! Each dated folder holds a list of what its run put there, with each file's size and time
 //! (`.charon`). A file that no longer matches it was changed after it went into the trash:
 //! an app may still be saving someone's work into it. A folder holding such a file is never
-//! cleared out, and reviews say where the file is.
+//! cleared out, and reviews say where the file is. The files the system scatters into folders
+//! (Finder's .DS_Store) never count, nor, on FAT and exFAT drives, does a time moved by whole
+//! hours (a daylight-saving change).
 //!
 //! The trash folder must be a real folder: if `.charon-trash` is a link or a file, nothing
 //! is moved into it and nothing is cleared out of it.
@@ -29,7 +31,7 @@ use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_partial, Keys, Refusal, Scanner, TRASH_FOLDER};
+use crate::scan::{is_clutter, is_partial, Entry, Keys, Refusal, Scanner, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -355,7 +357,8 @@ impl Trash {
     /// Looks at `root`'s trash: the dated folders older than `days` (none when `days` is 0,
     /// which keeps everything), and the files changed since they went in. Only a `thorough`
     /// look checks the younger folders too (a background look leaves them for a review).
-    pub fn look(root: &Path, days: u32, thorough: bool) -> TrashLook {
+    /// `shifting` says the drive keeps local times (see `Volume::shifts_times`).
+    pub fn look(root: &Path, days: u32, thorough: bool, shifting: bool) -> TrashLook {
         let mut look = TrashLook::default();
         let Ok(trash) = Self::real_trash(root, false) else { return look };
         let Ok(items) = fs::read_dir(&trash) else { return look };
@@ -367,7 +370,7 @@ impl Trash {
             if !expired && !thorough {
                 continue;
             }
-            let contents = Self::look_into(&item.path(), stamp, expired);
+            let contents = Self::look_into(&item.path(), stamp, expired, shifting);
             look.bytes += contents.bytes;
             look.revived.extend(contents.revived.iter().map(|path| format!("{TRASH_FOLDER}/{name}/{path}")));
             if expired && contents.revived.is_empty() && !contents.unreadable {
@@ -381,22 +384,22 @@ impl Trash {
 
     /// What the dated `folder` (made at `stamp`) holds. With a list and no `walk`, only the
     /// listed files are looked at; otherwise everything in it is.
-    fn look_into(folder: &Path, stamp: DateTime<Local>, walk: bool) -> Contents {
+    fn look_into(folder: &Path, stamp: DateTime<Local>, walk: bool, shifting: bool) -> Contents {
         let list = Self::read_list(folder);
         match &list {
-            Some(list) if !walk => Self::look_at_listed(folder, list),
-            _ => Self::walk(folder, stamp, list.as_ref()),
+            Some(list) if !walk => Self::look_at_listed(folder, list, shifting),
+            _ => Self::walk(folder, stamp, list.as_ref(), shifting),
         }
     }
 
-    fn look_at_listed(folder: &Path, list: &Listed) -> Contents {
+    fn look_at_listed(folder: &Path, list: &Listed, shifting: bool) -> Contents {
         let mut contents = Contents::default();
-        for (path, &(size, modified)) in list {
+        for (path, listed) in list {
             match fs::symlink_metadata(folder.join(path)) {
                 Ok(meta) => {
                     contents.items += 1;
                     contents.bytes += meta.len();
-                    if meta.is_dir() || meta.len() != size || Scanner::modified_ms(&meta) != modified {
+                    if !Self::is_nobodys_work(Keys::name(path)) && (meta.is_dir() || !Self::as_listed(&meta, listed, shifting)) {
                         contents.revived.push(path.clone());
                     }
                 }
@@ -411,7 +414,7 @@ impl Trash {
         contents
     }
 
-    fn walk(folder: &Path, stamp: DateTime<Local>, list: Option<&Listed>) -> Contents {
+    fn walk(folder: &Path, stamp: DateTime<Local>, list: Option<&Listed>, shifting: bool) -> Contents {
         let mut contents = Contents::default();
         let made = stamp.timestamp_millis();
         let now = Local::now().timestamp_millis();
@@ -438,14 +441,13 @@ impl Trash {
             };
             contents.items += 1;
             contents.bytes += meta.len();
-            // Charon's own half-written copies never count as someone's work.
-            if is_partial(&inner.file_name().to_string_lossy()) {
+            if Self::is_nobodys_work(&inner.file_name().to_string_lossy()) {
                 continue;
             }
             let modified = Scanner::modified_ms(&meta);
             let revived = match list {
                 Some(list) => match list.get(&path) {
-                    Some(&(size, at)) => meta.len() != size || modified != at,
+                    Some(listed) => !Self::as_listed(&meta, listed, shifting),
                     None => modified > made,
                 },
                 None => modified > made + UNLISTED_MARGIN_MS && modified <= now + 60_000,
@@ -457,10 +459,25 @@ impl Trash {
         contents
     }
 
+    /// Whether a file named `name` in the trash can't hold anyone's work, however it changed:
+    /// Charon's own half-written copies, and the files the system scatters into the folders
+    /// it shows (Finder's .DS_Store, when someone looks into the trash for a file).
+    fn is_nobodys_work(name: &str) -> bool {
+        is_partial(name) || is_clutter(name)
+    }
+
+    /// Whether a file in the trash is still as it landed there (`listed`). On a drive that
+    /// keeps local times (`shifting`: FAT, exFAT), a time moved by whole hours since (a
+    /// daylight-saving change, another time zone) is no change, as for any file it holds.
+    fn as_listed(meta: &fs::Metadata, &(size, modified): &(u64, i64), shifting: bool) -> bool {
+        let now = Entry::file(meta.len(), Scanner::modified_ms(meta));
+        Entry::still_on(Some(&now), Some(&Entry::file(size, modified)), shifting)
+    }
+
     /// Permanently removes the dated folders `names` from `root`'s trash (those a review
     /// listed). Anything else in the trash stays, and so does a folder in which something
-    /// changed since the review.
-    pub fn sweep(root: &Path, names: &[String]) {
+    /// changed since the review. `shifting` is as for `look`.
+    pub fn sweep(root: &Path, names: &[String], shifting: bool) {
         if names.is_empty() {
             return;
         }
@@ -472,7 +489,7 @@ impl Trash {
             if !fs::symlink_metadata(&folder).is_ok_and(|m| m.is_dir()) {
                 continue;
             }
-            let contents = Self::look_into(&folder, stamp, true);
+            let contents = Self::look_into(&folder, stamp, true, shifting);
             if !contents.revived.is_empty() || contents.unreadable {
                 log::warn!("kept {}: something in it changed after it went into the trash, or can't be read", folder.display());
                 continue;
@@ -630,8 +647,8 @@ mod tests {
         std::os::unix::fs::symlink(&elsewhere, root.join(TRASH_FOLDER)).unwrap();
         fs::write(root.join("a.txt"), "x").unwrap();
         assert!(Trash::for_run(Local::now()).put(&root, "a.txt").is_err());
-        assert!(Trash::look(&root, 1, true).expired.is_empty());
-        Trash::sweep(&root, &["2000-01-01_00-00-00".to_string()]);
+        assert!(Trash::look(&root, 1, true, false).expired.is_empty());
+        Trash::sweep(&root, &["2000-01-01_00-00-00".to_string()], false);
         assert!(elsewhere.join("2000-01-01_00-00-00/keep.txt").exists(), "sweeping never follows the link");
     }
 
@@ -645,11 +662,11 @@ mod tests {
         fs::create_dir_all(trash.join("not-a-stamp")).unwrap();
         let fresh = Local::now().format(STAMP_FORMAT).to_string();
         fs::create_dir_all(trash.join(&fresh)).unwrap();
-        let look = Trash::look(tmp.path(), 30, false);
+        let look = Trash::look(tmp.path(), 30, false, false);
         assert_eq!(look.expired, vec![Expired { name: "2000-01-01_00-00-00".into(), items: 1, bytes: 5 }]);
         assert!(look.revived.is_empty());
-        assert!(Trash::look(tmp.path(), 0, false).expired.is_empty(), "0 keeps everything");
-        Trash::sweep(tmp.path(), &[look.expired[0].name.clone(), "not-a-stamp".into()]);
+        assert!(Trash::look(tmp.path(), 0, false, false).expired.is_empty(), "0 keeps everything");
+        Trash::sweep(tmp.path(), &[look.expired[0].name.clone(), "not-a-stamp".into()], false);
         assert!(!trash.join("2000-01-01_00-00-00").exists());
         assert!(trash.join("not-a-stamp").exists());
         assert!(trash.join(fresh).exists());
@@ -669,16 +686,16 @@ mod tests {
         assert_eq!(trash.write_lists().len(), 1);
         let folder = kept.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
 
-        let look = Trash::look(tmp.path(), 30, false);
+        let look = Trash::look(tmp.path(), 30, false, false);
         assert_eq!(look.expired.iter().map(|e| (e.name.as_str(), e.items)).collect::<Vec<_>>(), vec![(folder.as_str(), 2)], "the list itself isn't an item");
 
         // Days later, the app saves the person's work into the file it followed.
         fs::write(&kept, "the report, with this week's work").unwrap();
         set_time(&kept, days_ago(2));
-        let look = Trash::look(tmp.path(), 30, false);
+        let look = Trash::look(tmp.path(), 30, false, false);
         assert!(look.expired.is_empty());
         assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{folder}/report.pages")]);
-        Trash::sweep(tmp.path(), std::slice::from_ref(&folder));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), false);
         assert_eq!(fs::read_to_string(&kept).unwrap(), "the report, with this week's work");
     }
 
@@ -690,10 +707,74 @@ mod tests {
         set_time(&tmp.path().join("notes.txt"), days_ago(3));
         let kept = trash.preserve(tmp.path(), "notes.txt").unwrap();
         trash.write_lists();
-        assert_eq!(Trash::look(tmp.path(), 30, true), TrashLook { bytes: 3, ..Default::default() });
+        assert_eq!(Trash::look(tmp.path(), 30, true, false), TrashLook { bytes: 3, ..Default::default() });
         fs::write(&kept, "edited in the trash").unwrap();
-        assert!(Trash::look(tmp.path(), 30, false).revived.is_empty(), "a quick look leaves young folders alone");
-        assert_eq!(Trash::look(tmp.path(), 30, true).revived.len(), 1);
+        assert!(Trash::look(tmp.path(), 30, false, false).revived.is_empty(), "a quick look leaves young folders alone");
+        assert_eq!(Trash::look(tmp.path(), 30, true, false).revived.len(), 1);
+    }
+
+    /// FAT and exFAT keep local times: after a daylight-saving change, the drive reports every
+    /// file there whole hours off. In the trash that's no change, so an old folder is still
+    /// cleared out. A time moved any other way still counts, and on other drives so does this.
+    #[test]
+    fn a_time_moved_by_whole_hours_is_no_change_on_a_drive_that_keeps_local_times() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut kept = Vec::new();
+        for (name, age) in [("old.docx", 40), ("young.docx", 1), ("edited.docx", 1)] {
+            let trash = Trash::for_run(days_ago(age));
+            let at = days_ago(age + 1);
+            fs::write(tmp.path().join(name), "the old version").unwrap();
+            set_time(&tmp.path().join(name), at);
+            kept.push((trash.put(tmp.path(), name).unwrap(), at));
+            trash.write_lists();
+        }
+        let old_folder = kept[0].0.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        // The clocks changed: the drive reports the files an hour later. One was edited.
+        set_time(&kept[0].0, kept[0].1 + chrono::Duration::hours(1));
+        set_time(&kept[1].0, kept[1].1 + chrono::Duration::hours(1));
+        set_time(&kept[2].0, kept[2].1 + chrono::Duration::minutes(90));
+        let edited = format!("{TRASH_FOLDER}/{}/edited.docx", kept[2].0.parent().unwrap().file_name().unwrap().to_string_lossy());
+
+        let look = Trash::look(tmp.path(), 30, true, true);
+        assert_eq!(look.revived, vec![edited]);
+        assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![old_folder.as_str()]);
+        assert_eq!(Trash::look(tmp.path(), 30, true, false).revived.len(), 3, "elsewhere a moved time is a change");
+        Trash::sweep(tmp.path(), std::slice::from_ref(&old_folder), true);
+        assert!(!kept[0].0.exists());
+    }
+
+    /// Finder leaves a .DS_Store in every folder someone looks into, the trash included, and
+    /// updates the ones Charon put there with their folders. They hold nobody's work: the
+    /// folder is still cleared out, with them.
+    #[test]
+    fn finders_files_in_the_trash_never_count_as_someones_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut folders = Vec::new();
+        for age in [40, 1] {
+            let trash = Trash::for_run(days_ago(age));
+            fs::create_dir_all(tmp.path().join("docs")).unwrap();
+            fs::write(tmp.path().join("docs/report.txt"), "the old report").unwrap();
+            fs::write(tmp.path().join("docs/.DS_Store"), "view settings").unwrap();
+            for name in ["docs/report.txt", "docs/.DS_Store"] {
+                set_time(&tmp.path().join(name), days_ago(age + 1));
+                trash.put(tmp.path(), name).unwrap();
+            }
+            trash.write_lists();
+            folders.push(tmp.path().join(TRASH_FOLDER).join(&trash.folder));
+        }
+        // Someone looks into the trash with Finder.
+        for folder in &folders {
+            fs::write(folder.join("docs/.DS_Store"), "other view settings").unwrap();
+            fs::write(folder.join(".DS_Store"), "view settings").unwrap();
+        }
+
+        let look = Trash::look(tmp.path(), 30, true, false);
+        assert!(look.revived.is_empty(), "{:?}", look.revived);
+        let old = folders[0].file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![old.as_str()]);
+        Trash::sweep(tmp.path(), &[old], false);
+        assert!(!folders[0].exists());
+        assert!(folders[1].exists());
     }
 
     /// A folder without a list (an interrupted run, an earlier version) is judged by the
@@ -708,10 +789,10 @@ mod tests {
             fs::write(folder.join(file), "x").unwrap();
             set_time(&folder.join(file), days_ago(age));
         }
-        assert_eq!(Trash::look(tmp.path(), 30, false).expired.len(), 1);
+        assert_eq!(Trash::look(tmp.path(), 30, false, false).expired.len(), 1);
         fs::write(folder.join("saved-later.txt"), "x").unwrap();
         set_time(&folder.join("saved-later.txt"), days_ago(10));
-        let look = Trash::look(tmp.path(), 30, false);
+        let look = Trash::look(tmp.path(), 30, false, false);
         assert!(look.expired.is_empty());
         assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{name}/saved-later.txt")]);
     }

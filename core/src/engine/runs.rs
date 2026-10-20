@@ -552,7 +552,7 @@ impl Engine {
         if complete && flushed.is_ok() && crossing.approved {
             for (side, look) in &survey.housekeeping.trash {
                 let names: Vec<String> = look.expired.iter().map(|e| e.name.clone()).collect();
-                Trash::sweep(survey.setup.root(*side), &names);
+                Trash::sweep(survey.setup.root(*side), &names, survey.snapshot(*side).shifts_times());
             }
         }
 
