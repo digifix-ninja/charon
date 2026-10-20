@@ -34,6 +34,7 @@ use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, 
 use crate::plan::Side;
 use crate::run::BusyWatch;
 use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
+pub(crate) use runtime::Moment;
 use runtime::{JobRuntime, Look, Missing};
 use std::collections::HashMap;
 use std::path::PathBuf;

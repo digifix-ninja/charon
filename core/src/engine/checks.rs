@@ -2,11 +2,11 @@
 //! for their OK.
 
 use crate::engine::survey::{Purpose, Survey, INTERNAL_LOOK};
-use crate::engine::{Engine, EngineEvent};
+use crate::engine::{Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{Job, JobId, JobStatus, Trigger, WaitingJob};
 use crate::scan::{ExcludeFilter, Keys};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -127,7 +127,7 @@ impl Engine {
     /// automatic run has tried them yet and ended before carrying anything. Removals that
     /// wait for an item to be missing a while longer don't count (see `Missing`).
     pub fn has_pending(&self, id: &JobId) -> bool {
-        let now = Utc::now();
+        let now = Moment::now();
         self.runtime().get(id).is_some_and(|rt| {
             rt.look.as_ref().is_some_and(|look| look.items > rt.missing.waiting(now) && rt.tried.is_none_or(|tried| look.at > tried))
         })
@@ -136,11 +136,11 @@ impl Engine {
     /// Whether removals a run left for later can be carried out now (see `Missing`): the job
     /// then syncs once more, whatever starts its syncs otherwise.
     pub fn take_follow_up(&self, id: &JobId) -> bool {
-        self.take_follow_up_at(id, Utc::now())
+        self.take_follow_up_at(id, Moment::now())
     }
 
-    /// `take_follow_up` at the time `now`.
-    pub(crate) fn take_follow_up_at(&self, id: &JobId, now: DateTime<Utc>) -> bool {
+    /// `take_follow_up` at the moment `now`.
+    pub(crate) fn take_follow_up_at(&self, id: &JobId, now: Moment) -> bool {
         if !self.runtime().get(id).is_some_and(|rt| rt.missing.follow_up_due(now)) {
             return false;
         }
@@ -274,14 +274,27 @@ impl Engine {
     /// A folder of the job came back (a drive plugged in again, a share reconnected). What
     /// the last look found, it found before: the row mustn't say "In sync" from then. The
     /// look is put aside, so is what a look still under way finds, and the job is looked
-    /// at again at once.
+    /// at again at once. A share that just came back may list a folder before it has loaded,
+    /// so the items found missing before have to be found missing again for a while before
+    /// a run nobody looks at follows them (see `Missing::look_again`).
     pub fn forget_look(&self, id: &JobId) {
         self.change_runtime(id, |rt| {
             rt.epoch += 1;
             rt.look = None;
             rt.tried = None;
             rt.last_checked = None;
+            rt.missing.look_again();
         });
+    }
+
+    /// Charon wasn't looking at the folders for a while (the computer slept, or the clock
+    /// on the wall jumped): the shares may have gone away and come back meanwhile, so the
+    /// items found missing on them have to be found missing again for a while before a run
+    /// nobody looks at follows them (see `Missing::look_again`).
+    pub fn after_a_gap(&self) {
+        for rt in self.runtime().values_mut() {
+            rt.missing.look_again();
+        }
     }
 }
 

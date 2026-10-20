@@ -320,6 +320,11 @@ impl Plan {
             .collect()
     }
 
+    /// Steps that remove an item (a file, a link or a folder), on either side.
+    pub fn removals(&self) -> u64 {
+        self.actions.iter().filter(|a| matches!(a, Action::Delete { .. })).count() as u64
+    }
+
     /// Files and links this plan removes from `side`.
     pub fn removed_on(&self, side: Side) -> u64 {
         self.actions

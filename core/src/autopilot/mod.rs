@@ -27,6 +27,10 @@
 //! A sync that is due waits (it isn't dropped) while another sync uses the same folders, and
 //! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
 //!
+//! When a tick comes long after the one before (the computer slept, or the clock on the wall
+//! jumped), the shares may have gone away and come back unseen: what looks found missing on
+//! them has to be found missing again for a while before a run follows it (see `Missing`).
+//!
 //! Paused jobs (and everything under "Pause everything") are still looked at, so the
 //! window shows what's waiting, but never sync by themselves.
 
@@ -36,7 +40,7 @@ mod watcher;
 pub use schedule::Schedule;
 pub use watcher::{FolderWatcher, Route};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, Moment};
 use crate::model::{Job, JobId, Trigger};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -58,6 +62,9 @@ const AFTER_A_PANIC: Duration = Duration::from_secs(60);
 /// How often a confirmed sync that waits for another sync tries again (each try asks the
 /// disk). A sync of this Charon that ends starts it at once; this is for other Charons'.
 const CONFIRMED_RETRY: Duration = Duration::from_secs(5);
+/// A tick that comes this long after the one before, by either clock, means Charon wasn't
+/// looking for a while: the computer slept, or the clock on the wall jumped.
+const AWAY: Duration = Duration::from_secs(30);
 
 pub struct Autopilot {
     engine: Engine,
@@ -74,6 +81,8 @@ pub struct Autopilot {
     real_roots: HashMap<PathBuf, Option<PathBuf>>,
     /// When each job's confirmed sync that waits last tried to start.
     confirmed_tried: HashMap<JobId, Instant>,
+    /// When the last tick began.
+    last_tick: Option<Moment>,
 }
 
 impl Autopilot {
@@ -93,6 +102,7 @@ impl Autopilot {
                 scheduled: HashMap::new(),
                 real_roots: HashMap::new(),
                 confirmed_tried: HashMap::new(),
+                last_tick: None,
             };
             thread::sleep(STARTUP_DELAY);
             loop {
@@ -114,6 +124,13 @@ impl Autopilot {
 
     /// One look at every job.
     fn tick(&mut self) {
+        // After a gap (the computer slept), the shares may have gone away and come back
+        // without any tick seeing it.
+        let moment = Moment::now();
+        if self.last_tick.is_some_and(|last| Self::away_between(last, moment)) {
+            self.engine.after_a_gap();
+        }
+        self.last_tick = Some(moment);
         // Notices an older Charon at work, so the window says so before anything tries to sync.
         self.engine.older_charon_running();
         // While Charon's state can't be saved, tries again now and then (at most once a
@@ -227,6 +244,15 @@ impl Autopilot {
         self.engine.remind();
     }
 
+    /// Whether Charon wasn't looking for a while between a tick at `last` and one at `now`:
+    /// they are far apart by Charon's own clock (which may stand still while the computer
+    /// sleeps) or by the clock on the wall (which may jump).
+    fn away_between(last: Moment, now: Moment) -> bool {
+        let own = now.own.saturating_duration_since(last.own);
+        let wall = (now.wall - last.wall).to_std().unwrap_or_default();
+        own.max(wall) >= AWAY
+    }
+
     /// Starts a sync of a job that runs by itself, or keeps it waiting until nothing stands
     /// in its way.
     fn run(&self, id: &JobId, reason: &str) {
@@ -273,5 +299,25 @@ impl Autopilot {
                 self.changed.insert(id, Instant::now());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tick_long_after_the_one_before_by_either_clock_means_charon_was_away() {
+        let last = Moment::now();
+        let next = last.after(TICK);
+        assert!(!Autopilot::away_between(last, next));
+        // The computer slept: Charon's own clock stood still (Linux, macOS), the wall's went on.
+        assert!(Autopilot::away_between(last, Moment { wall: last.wall + chrono::Duration::hours(5), own: next.own }));
+        // The computer slept, and Charon's own clock counted it too (Windows).
+        assert!(Autopilot::away_between(last, last.after(Duration::from_secs(5 * 60 * 60))));
+        // The clock on the wall jumped forward.
+        assert!(Autopilot::away_between(last, Moment { wall: next.wall + chrono::Duration::minutes(10), own: next.own }));
+        // A clock set back says nothing about time away.
+        assert!(!Autopilot::away_between(last, Moment { wall: last.wall - chrono::Duration::hours(1), own: next.own }));
     }
 }
