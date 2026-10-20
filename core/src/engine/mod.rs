@@ -137,7 +137,7 @@ impl Engine {
         let state_file = StateFile::new(folder.state_file(), folder.legacy_state_file());
         let state = state_file.load()?;
         let absences = Absences::new(folder.absences());
-        // What looks found missing before this launch, and since when.
+        // What looks found missing before this launch, and for how long.
         let launch = Moment::now();
         let runtime = state
             .jobs

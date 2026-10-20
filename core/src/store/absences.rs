@@ -1,11 +1,14 @@
-//! Items found missing on a drive that may show changes late, and since when.
+//! Items found missing on a drive that may show changes late, and for how long.
 //!
 //! A network share or a drive run by a program can list a folder before it has loaded, or
 //! from an old picture of it, so a run nobody looks at removes what follows from an item's
-//! absence only once looks have found it missing for a while (see `engine::Missing`). When
-//! each item was first found missing is kept here, by the clock on the wall: a job that
-//! only syncs when its drive is connected, or a computer that restarts every day, would
-//! otherwise start the wait over at every launch, and the removals would never happen.
+//! absence only once looks have found it missing for a while (see `engine::Missing`). How
+//! long looks have found each item missing is kept here, counted by Charon's own clock: a job
+//! that only syncs when its drive is connected, or a computer that restarts every day, would
+//! otherwise start the wait over at every launch, and the removals would never happen. The
+//! time while Charon isn't running doesn't count, and neither does a clock on the wall set
+//! forward or back: when each item was first found missing by that clock is kept only for
+//! whoever reads the record.
 //!
 //! The record belongs to the folders it was made with: for other folders it isn't used.
 
@@ -28,8 +31,13 @@ pub struct Absence {
     pub side: Side,
     /// The item's key (see `scan::Keys`).
     pub key: String,
-    /// When a look first found it missing.
+    /// When a look first found it missing, by the clock on the wall then. It never tells how
+    /// long the item has been missing: that clock may have been wrong, or set since.
     pub since: DateTime<Utc>,
+    /// How long looks had found it missing at the last look that did, in whole seconds by
+    /// Charon's own clock. A record an earlier Charon wrote has none: the wait starts over.
+    #[serde(default)]
+    pub counted_seconds: Option<u64>,
     /// A run nobody looked at left the removal that follows it for later.
     #[serde(default)]
     pub left_for_later: bool,
@@ -125,7 +133,7 @@ mod tests {
 
     fn items() -> Vec<Absence> {
         let since = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
-        vec![Absence { side: Side::Source, key: "photos/cat.jpg".into(), since, left_for_later: true }]
+        vec![Absence { side: Side::Source, key: "photos/cat.jpg".into(), since, counted_seconds: Some(4 * 60), left_for_later: true }]
     }
 
     #[test]
@@ -140,6 +148,24 @@ mod tests {
         absences.save(&job, &setup("/nas/photos", "/backup"), &[]).unwrap();
         assert!(!tmp.path().join("job.json").exists());
         absences.forget(&job).unwrap();
+    }
+
+    #[test]
+    fn a_record_an_earlier_charon_wrote_is_used_without_a_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absences = Absences::new(tmp.path().to_path_buf());
+        let job = "job".to_string();
+        let folders = setup("/nas/photos", "/backup");
+        absences.save(&job, &folders, &items()).unwrap();
+        // The same record, as a Charon that didn't count how long items were missing wrote it.
+        let file = tmp.path().join("job.json");
+        let mut record: serde_json::Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        for item in record["items"].as_array_mut().unwrap() {
+            item.as_object_mut().unwrap().remove("countedSeconds").expect("the count is saved");
+        }
+        std::fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+        let earlier = vec![Absence { counted_seconds: None, ..items()[0].clone() }];
+        assert_eq!(absences.load(&job, &folders), earlier, "what a run left for later is still known");
     }
 
     #[test]

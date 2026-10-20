@@ -1535,6 +1535,7 @@ mod tests {
         // The share has shown the file missing for 9 minutes: the removal waits.
         let start = Moment::now();
         run_from_a_share(&engine, &id, start, start.after(minutes(9)));
+        look_at_the_share(&engine, &id, &src, start.after(minutes(9)));
         assert!(dst.join("gone.txt").exists());
         let row = engine.job(&id).unwrap();
         assert_eq!(row.status, JobStatus::Pending, "never “In sync” while a removal waits");
@@ -1545,13 +1546,14 @@ mod tests {
         assert!(!engine.take_follow_up_at(&id, start.after(minutes(9))), "not due yet");
 
         // Charon restarts (a drive-connected job may not sync again for days): the wait
-        // goes on from when the file first went missing.
+        // goes on from the 9 minutes the looks had counted.
         drop(engine);
         let engine = Engine::open(&data, Arc::new(|_| {})).unwrap();
+        let launch = Moment::now();
         let kept = engine.runtime().get(&id).map(|rt| rt.missing.kept()).unwrap();
         assert_eq!(kept.len(), 1);
         assert!(kept[0].left_for_later && kept[0].since == start.wall);
-        let launch = start.after(minutes(60));
+        assert_eq!(kept[0].counted_seconds, Some(9 * 60));
         assert!(!engine.take_follow_up_at(&id, launch), "no look since the launch has found it missing yet");
         // A look after the launch finds the file missing still.
         look_at_the_share(&engine, &id, &src, launch);
