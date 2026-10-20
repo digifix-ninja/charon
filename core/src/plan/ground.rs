@@ -3,7 +3,7 @@
 
 use crate::model::human_count;
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side, Unit};
-use crate::scan::{Entry, EntryKind, Keys, Placeholder, Snapshot, Volume};
+use crate::scan::{is_sync_journal, Entry, EntryKind, Keys, Placeholder, Snapshot, Volume};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
@@ -147,6 +147,10 @@ impl<'a> Ground<'a> {
                             "left out: on the {}, “{disk}” is the placeholder {} left for a file that's only in the cloud, so Charon leaves this name alone",
                             side.word(),
                             placeholder.service.name()
+                        ),
+                        None if is_sync_journal(Keys::name(disk)) => format!(
+                            "left out: on the {}, “{disk}” is a file Nextcloud or ownCloud keeps to sync its folder, so Charon leaves this name alone",
+                            side.word()
                         ),
                         None => format!(
                             "left out: its name differs only in upper and lower case from “{disk}” on the {}, a name Charon or the drive keeps for itself",
@@ -476,6 +480,28 @@ mod tests {
         assert!(!ground.is_off_limits("fine.txt"));
         assert_eq!(plan.notes.len(), 3, "one note for each item left out: {:?}", plan.notes);
         assert!(plan.notes.iter().all(|n| n.kind == NoteKind::LeftOut && n.side == Some(Side::Destination)));
+    }
+
+    /// A name one side keeps for a sync client's journal is left alone on both, and the
+    /// note says whose it is.
+    #[test]
+    fn a_name_kept_for_a_sync_clients_journal_is_left_alone_on_both_sides() {
+        let source = snap(&[(".sync_0123456789ab.db", Entry::dir()), ("fine.txt", Entry::file(1, 1))], FsKind::Ext);
+        let mut destination = snap(&[], FsKind::Ext);
+        destination.reserve(".sync_0123456789ab.db", ".sync_0123456789ab.db");
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits(".sync_0123456789ab.db"));
+        assert!(!ground.is_off_limits("fine.txt"));
+        let notes: Vec<(&str, Option<Side>, &str)> = plan.notes.iter().map(|n| (n.path.as_str(), n.side, n.reason.as_str())).collect();
+        assert_eq!(
+            notes,
+            vec![(
+                ".sync_0123456789ab.db",
+                Some(Side::Source),
+                "left out: on the destination, “.sync_0123456789ab.db” is a file Nextcloud or ownCloud keeps to sync its folder, so Charon leaves this name alone"
+            )]
+        );
     }
 
     #[test]

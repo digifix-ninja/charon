@@ -395,6 +395,47 @@ fn permissions_bite(test: &str) -> bool {
     false
 }
 
+/// A folder bound at another place in the tree (`mount --bind`): the same drive, but another
+/// mount, which a rename never crosses. Unmounted when dropped.
+#[cfg(target_os = "linux")]
+struct BindMount(std::ffi::CString);
+
+#[cfg(target_os = "linux")]
+impl BindMount {
+    /// Binds `folder` at `at`. Mounting takes special rights (CAP_SYS_ADMIN): without them
+    /// the test says so where everyone sees it and skips, or fails when
+    /// CHARON_REQUIRE_PERMISSION_TESTS=1.
+    fn new(test: &str, folder: &Path, at: &Path) -> Option<BindMount> {
+        use std::os::unix::ffi::OsStrExt;
+        let (from, to) = (std::ffi::CString::new(folder.as_os_str().as_bytes()).unwrap(), std::ffi::CString::new(at.as_os_str().as_bytes()).unwrap());
+        // SAFETY: both paths are NUL-terminated and outlive the call; a bind mount reads
+        // neither a drive type nor options.
+        if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) } == 0 {
+            return Some(BindMount(to));
+        }
+        let why = format!("a folder can't be mounted in this process ({})", std::io::Error::last_os_error());
+        let how = "as root: cargo test -p charon-core --test safety_regressions";
+        if std::env::var("CHARON_REQUIRE_PERMISSION_TESTS").is_ok_and(|v| v == "1") {
+            panic!("{test} can't run: {why}. CHARON_REQUIRE_PERMISSION_TESTS=1 forbids skipping it. Run it {how}");
+        }
+        // Straight to stderr: the test harness swallows output of a test that passes, and a
+        // skipped safety test must never look like one that ran.
+        let _ = writeln!(
+            std::io::stderr(),
+            "SKIPPED {test}: {why}. It did NOT run. Run it {how} (or set CHARON_REQUIRE_PERMISSION_TESTS=1 to fail instead of skipping)"
+        );
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BindMount {
+    fn drop(&mut self) {
+        // SAFETY: the path is NUL-terminated.
+        unsafe { libc::umount2(self.0.as_ptr(), libc::MNT_DETACH) };
+    }
+}
+
 fn has_note(review: &Review, kind: NoteKind, side: Side, path: &str) -> bool {
     review.notes.iter().any(|note| note.kind == kind && note.side == Some(side) && note.path == path)
 }
@@ -1229,6 +1270,78 @@ fn a_two_way_removal_the_trash_cant_take_never_brings_the_file_back() {
 
     let review = engine.prepare_review(&id).unwrap();
     assert_eq!((review.tally.destination.removed, review.total_steps), (1, 1), "still the same removal, nothing copied back: {:?}", review.steps);
+}
+
+/// A folder mounted inside the job's folder (here a folder of the same drive, bound there)
+/// is another mount than the trash at the top of the job's folder, and nothing moves from
+/// one mount to another in one step. Whatever goes into the trash from it is copied there
+/// and then removed, so no step fails on every sync: a removed folder with nothing but
+/// Finder's .DS_Store left in it, a removed link, a replaced link, and a leftover of an
+/// interrupted sync, which the list says it moves into the trash.
+#[test]
+#[cfg(target_os = "linux")]
+fn whatever_goes_into_the_trash_from_a_folder_mounted_inside_the_jobs_gets_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data, store) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"), tmp.path().join("store"));
+    write(&a.join("keep.txt"), "keep");
+    write(&a.join("photos/2019/x.jpg"), "the photo");
+    write(&a.join("photos/2020/y.jpg"), "a newer photo");
+    for link in ["photos/latest", "photos/newest"] {
+        std::os::unix::fs::symlink("2019/x.jpg", a.join(link)).unwrap();
+    }
+    fs::create_dir_all(b.join("photos")).unwrap();
+    fs::create_dir_all(&store).unwrap();
+    let Some(_mounted) = BindMount::new("whatever_goes_into_the_trash_from_a_folder_mounted_inside_the_jobs_gets_there", &store, &b.join("photos")) else {
+        return;
+    };
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&a, &b, SyncMode::TwoWay));
+    confirm(&engine, &id);
+    assert_eq!(read(&store.join("2019/x.jpg")), "the photo", "the look went into the mounted folder");
+
+    // Finder looked into photos/2019 over the network, and a sync two hours ago was cut off
+    // with a link it had moved aside.
+    write(&b.join("photos/2019/.DS_Store"), "Finder's view settings");
+    let started = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() - 2 * 3600;
+    let leftover = format!("photos/.charon-{started:08x}{:08x}.part", 0x1234u32);
+    std::os::unix::fs::symlink("2019/x.jpg", b.join(&leftover)).unwrap();
+    let long_ago = filetime::FileTime::from_unix_time(started as i64, 0);
+    filetime::set_symlink_file_times(b.join(&leftover), long_ago, long_ago).unwrap();
+    // On the source, photos/2019 and one link are removed, and the other link is pointed elsewhere.
+    fs::remove_dir_all(a.join("photos/2019")).unwrap();
+    fs::remove_file(a.join("photos/latest")).unwrap();
+    fs::remove_file(a.join("photos/newest")).unwrap();
+    std::os::unix::fs::symlink("2020/y.jpg", a.join("photos/newest")).unwrap();
+
+    let review = engine.prepare_review(&id).unwrap();
+    let tidies = "Also moves 1 half-copied file left by an interrupted sync into .charon-trash on the destination.";
+    assert!(review.housekeeping.iter().any(|line| line == tidies), "{:?}", review.housekeeping);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    let run = view(&engine, &id).job.last_run.unwrap();
+    let log: Vec<String> = engine.log(&id, 8).into_iter().map(|line| line.text).collect();
+    assert_eq!((run.failed, run.error), (0, None), "{log:#?}");
+    assert!(!store.join("2019").exists());
+    assert!(fs::symlink_metadata(store.join("latest")).is_err());
+    assert_eq!(fs::read_link(store.join("newest")).unwrap(), Path::new("2020/y.jpg"));
+    assert!(fs::symlink_metadata(b.join(&leftover)).is_err(), "the leftover is tidied away");
+    // All of it is in the trash, as it was.
+    let kept: BTreeMap<String, String> = tree(&b.join(".charon-trash"))
+        .into_iter()
+        .filter_map(|(path, what)| path.split_once('/').map(|(_, inside)| (inside.to_string(), what)))
+        .filter(|(inside, what)| inside != ".charon" && what != "folder")
+        .collect();
+    let expected = [
+        ("photos/2019/.DS_Store", "file: Finder's view settings"),
+        ("photos/2019/x.jpg", "file: the photo"),
+        (leftover.as_str(), "link -> 2019/x.jpg"),
+        ("photos/latest", "link -> 2019/x.jpg"),
+        ("photos/newest", "link -> 2019/x.jpg"),
+    ];
+    assert_eq!(kept, expected.iter().map(|(path, what)| (path.to_string(), what.to_string())).collect::<BTreeMap<_, _>>());
+
+    let again = engine.prepare_review(&id).unwrap();
+    assert_eq!(again.total_steps, 0, "nothing is left to do: {:?}", again.steps);
 }
 
 // ------------------------------------------------------------------ probe 9: the wipe guard is narrow

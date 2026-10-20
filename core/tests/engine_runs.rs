@@ -1445,6 +1445,53 @@ fn what_finder_writes_into_the_trash_holds_nothing_up() {
     assert!(!old.exists(), "emptied");
 }
 
+/// iCloud Drive before macOS 14 frees up the files nobody used for long, the trash's old ones
+/// first: a trashed file goes, and a new hidden `.report.txt.icloud` stands in for it, which
+/// holds the file's size. That's the service's stand-in for a file Charon put there as it
+/// was, not someone's work: nothing is held up, nothing warns, and the folder is emptied with
+/// it when its time comes.
+#[test]
+fn what_icloud_leaves_for_a_trashed_file_holds_nothing_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for i in 0..10 {
+        write(&a.join(format!("f{i}.txt")), "x");
+    }
+    write(&a.join("report.txt"), "the report");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+    fs::remove_file(a.join("report.txt")).unwrap();
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    let trash = b.join(".charon-trash");
+    let kept = walk(&trash).into_iter().find(|p| p.ends_with("report.txt")).expect("in the trash");
+
+    // Weeks later, iCloud Drive frees the trashed file up.
+    let old = trash.join(format!("{}_0a0b0c", (chrono::Local::now() - chrono::Duration::days(40)).format("%Y-%m-%d_%H-%M-%S")));
+    fs::rename(kept.parent().unwrap(), &old).unwrap();
+    fs::remove_file(old.join("report.txt")).unwrap();
+    let mut about = plist::Dictionary::new();
+    about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String("NSURLFileResourceTypeRegular".into()));
+    about.insert("NSURLFileSizeKey".into(), ("the report".len() as u64).into());
+    about.insert("NSURLNameKey".into(), plist::Value::String("report.txt".into()));
+    plist::Value::Dictionary(about).to_writer_binary(fs::File::create(old.join(".report.txt.icloud")).unwrap()).unwrap();
+    write(&a.join("f0.txt"), "edited");
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    assert!(engine.job(&id).unwrap().job.held.is_none(), "{:?}", engine.job(&id).unwrap().job.held);
+    assert_eq!(fs::read_to_string(b.join("f0.txt")).unwrap(), "edited", "ran by itself");
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.warnings.iter().all(|w| !w.text.contains("changed after Charon put")), "{:?}", review.warnings);
+    assert!(review.housekeeping.iter().any(|line| line.contains("Also empties 1 item")), "{:?}", review.housekeeping);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait(&engine, &id);
+    assert!(!old.exists(), "emptied");
+}
+
 /// A sync that would fill a drive says so first, and its copies fail with the reason
 /// instead of filling the drive to the last byte.
 #[test]

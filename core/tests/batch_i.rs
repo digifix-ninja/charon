@@ -193,7 +193,8 @@ fn a_folder_named_like_a_drives_own_is_left_alone_and_listed() {
 }
 
 /// A folder a Nextcloud client syncs, in `tmp`: the client keeps its journal at the top of
-/// it. The job's folder is the folder `Work` inside it.
+/// it, which tells Charon so whatever the clients' settings on this computer say. The job's
+/// folder is the folder `Work` inside it.
 fn synced_by_nextcloud(tmp: &Path) -> std::path::PathBuf {
     write(&tmp.join("Nextcloud/.sync_0123456789ab.db"), "the client's journal");
     let work = tmp.join("Nextcloud/Work");
@@ -339,4 +340,47 @@ fn a_copy_of_a_placeholder_is_never_made_where_its_service_keeps_files() {
     assert_eq!(fs::read_to_string(src.join("Docs/Plans.odt")).unwrap(), "the plans");
     assert_eq!(fs::read_to_string(dst.join("Docs/a.txt")).unwrap(), "a");
     assert!(dst.join("Docs/Old.txt.nextcloud").exists() && src.join("Docs/Old.txt.nextcloud").exists());
+}
+
+/// A Nextcloud or ownCloud client's journal, and the files that go with it, are the
+/// client's own: a sync never copies them (a copy would make the other side look synced by
+/// the client), and never replaces or removes the other side's.
+#[test]
+fn a_sync_clients_journal_is_never_carried_or_removed() {
+    for mode in [SyncMode::Mirror, SyncMode::TwoWay] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("Nextcloud"), tmp.path().join("usb/Backup"), tmp.path().join("data"));
+        let journals = [
+            ".sync_0123456789ab.db",
+            ".sync_0123456789ab.db-wal",
+            ".sync_0123456789ab.db-shm",
+            "Old/.csync_journal.db",
+            "Old/._sync_ba9876543210.db-journal",
+        ];
+        for journal in journals {
+            write(&src.join(journal), "the client's journal");
+        }
+        write(&src.join("Docs/Notes.txt"), "notes");
+        // On the destination, an old copy of the journal, and another client's.
+        write(&dst.join(".sync_0123456789ab.db"), "an old copy");
+        write(&dst.join("Work/.sync_fedcba987654.db"), "another client's journal");
+        let engine = engine(&data);
+        let id = engine.add_job(setup(&src, &dst, mode, ConflictRule::Ask)).unwrap().job.id;
+        let review = confirm(&engine, &id);
+        // A Mirror keeps the folder that holds the other client's journal, and says why.
+        let notes: Vec<(NoteKind, &str, &str)> = review.notes.iter().map(|note| (note.kind, note.path.as_str(), note.reason.as_str())).collect();
+        let why = "kept: the source no longer has it, but it holds items Charon leaves alone (excluded, left out or unreadable items, or what Charon or a cloud service keeps for its own use)";
+        let kept = if mode == SyncMode::Mirror { vec![(NoteKind::KeptFolder, "Work", why)] } else { Vec::new() };
+        assert_eq!(notes, kept, "{mode:?}");
+        assert_eq!(fs::read_to_string(dst.join("Docs/Notes.txt")).unwrap(), "notes", "{mode:?}");
+        assert!(dst.join("Old").is_dir(), "{mode:?}: the folder is synced");
+        for journal in &journals[1..] {
+            assert!(!dst.join(journal).exists(), "{mode:?}: {journal} isn't copied");
+        }
+        assert_eq!(fs::read_to_string(dst.join(".sync_0123456789ab.db")).unwrap(), "an old copy", "{mode:?}: never replaced");
+        assert!(dst.join("Work/.sync_fedcba987654.db").exists(), "{mode:?}: never removed");
+        assert!(!src.join("Work/.sync_fedcba987654.db").exists(), "{mode:?}: never copied back");
+        assert!(journals.iter().all(|journal| src.join(journal).exists()), "{mode:?}");
+        assert_eq!(engine.prepare_review(&id).unwrap().total_steps, 0, "{mode:?}");
+    }
 }

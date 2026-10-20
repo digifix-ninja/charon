@@ -230,6 +230,10 @@ pub struct Note {
     pub reason: String,
 }
 
+/// What keeps a folder, in the notes about it (see `NoteKind::KeptFolder`): it holds
+/// something no step may touch, of any of these kinds.
+pub(crate) const LEFT_ALONE: &str = "items Charon leaves alone (excluded, left out or unreadable items, or what Charon or a cloud service keeps for its own use)";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NoteKind {

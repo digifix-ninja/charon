@@ -8,16 +8,19 @@
 //! replaced in place: an app that has the file open (Pages, TextEdit, Preview…) follows the
 //! file itself, not its name, so after a move it would go on saving the person's work into
 //! the trash. Replaced in place, the app notices the new version instead. (On APFS, where a
-//! copy takes no time and no room, a removed file is copied there too and then removed, and
-//! so is one on another drive than the trash, in a folder mounted inside the job's: see
-//! `Executor::remove`.)
+//! copy takes no time and no room, a removed file is copied there too and then removed. So is
+//! anything that goes into the trash from another drive than the trash's, in a folder
+//! mounted inside the job's: a removed file or link, the system's files left in a removed
+//! folder, a leftover of an interrupted sync. See `Executor::move_to_trash`.)
 //!
 //! Each dated folder holds a list of what its run put there, with each file's size and time
 //! (`.charon`). A file that no longer matches it was changed after it went into the trash:
 //! an app may still be saving someone's work into it. A folder holding such a file is never
 //! cleared out, and reviews say where the file is. The files the system scatters into folders
-//! (Finder's .DS_Store) never count, nor, on FAT and exFAT drives, does a time moved by whole
-//! hours (a daylight-saving change).
+//! (Finder's .DS_Store) never count, nor does the placeholder a cloud service leaves for a
+//! listed file it frees up, or for a package of listed files (iCloud Drive frees up a package
+//! as one item), as long as it says the file or the package was as listed. On FAT and exFAT
+//! drives, a time moved by whole hours (a daylight-saving change) doesn't count either.
 //!
 //! The trash folder must be a real folder: if `.charon-trash` is a link or a file, nothing
 //! is moved into it and nothing is cleared out of it.
@@ -27,11 +30,13 @@
 //! top of the dated folder instead of failing on every sync.
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use crate::run::identity::Identity;
 use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_clutter, is_partial, Entry, Keys, Refusal, Scanner, TRASH_FOLDER};
+use crate::scan::{is_clutter, is_partial, CloudService, Entry, Keys, Placeholder, Refusal, Scanner, MTIME_TOLERANCE_MS, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -55,6 +60,31 @@ const UNLISTED_MARGIN_MS: i64 = 60 * 60 * 1000;
 /// The files of one dated folder: path inside it (`/`-separated) → size and modification
 /// time (milliseconds since 1970) as they landed.
 type Listed = BTreeMap<String, (u64, i64)>;
+
+/// What a dated folder's list says about one item in it.
+#[derive(Debug, Clone, Copy)]
+enum ListedItem {
+    /// A file, with its size and time as it landed.
+    File(u64, i64),
+    /// A folder the list names files in, with their size together: a package Charon put
+    /// into the trash file by file (the list names files only, never a folder).
+    Folder(u64),
+}
+
+impl ListedItem {
+    /// What `list` says about the item at `item` (a path in the dated folder): the file it
+    /// names there, or else the listed files inside a folder there. `None` when it names
+    /// neither.
+    fn find(list: &Listed, item: &str) -> Option<Self> {
+        if let Some(&(size, modified)) = list.get(item) {
+            return Some(Self::File(size, modified));
+        }
+        let inside = format!("{item}/");
+        let mut sizes = list.range(inside.clone()..).take_while(|(path, _)| path.starts_with(&inside)).map(|(_, &(size, _))| size).peekable();
+        sizes.peek()?;
+        Some(Self::Folder(sizes.sum()))
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredList {
@@ -128,14 +158,17 @@ impl Trash {
         self.keep(root, &base, relative, |place| move_to_new_name(from, place).map_err(|e| Error::file(from, e)))
     }
 
-    /// Copies the file `root/relative` into the trash, leaving it where it is. On drives that
-    /// support it (APFS, Btrfs) the copy is a clone: instant, and it takes no room. When the
-    /// file can't be read, this fails as `Copier::unreadable` says. When the trash can't take
-    /// the copy (its folders, or the copy's place in it), it fails with that place in the
-    /// trash: that is never a file Charon couldn't read.
+    /// Copies the file or link `root/relative` into the trash, leaving it where it is. On
+    /// drives that support it (APFS, Btrfs) a file's copy is a clone: instant, and it takes no
+    /// room. When the file can't be read, this fails as `Copier::unreadable` says. When the
+    /// trash can't take the copy (its folders, or the copy's place in it), it fails with that
+    /// place in the trash: that is never a file Charon couldn't read.
     pub fn preserve(&self, root: &Path, relative: &str) -> Result<PathBuf> {
         let from = root.join(relative);
         let base = self.dated(root)?;
+        if fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_symlink()) {
+            return self.keep(root, &base, relative, |place| Self::copy_link(&from, place));
+        }
         // Written under a temporary name at the top of the dated folder first: a half-written
         // copy never takes a name, and nothing already in the trash is ever written over.
         let temp = Copier::partial_in(&base);
@@ -303,6 +336,27 @@ impl Trash {
         Ok(())
     }
 
+    /// Makes a link like the one at `from` at `to`, with its time: the link itself, never what
+    /// it points to. Fails with `AlreadyExists` when `to` is taken.
+    #[cfg(unix)]
+    fn copy_link(from: &Path, to: &Path) -> Result<()> {
+        let target = fs::read_link(from).map_err(|e| Error::file(from, e))?;
+        std::os::unix::fs::symlink(&target, to).map_err(|e| Error::file(to, e))?;
+        if let Ok(meta) = fs::symlink_metadata(from) {
+            let modified = filetime::FileTime::from_last_modification_time(&meta);
+            if let Err(e) = filetime::set_symlink_file_times(to, modified, modified) {
+                log::debug!("couldn't keep the time of the link {} in the trash: {e}", from.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// Windows plans never hold links (see `Copier::link`).
+    #[cfg(not(unix))]
+    fn copy_link(from: &Path, _to: &Path) -> Result<()> {
+        Err(Error::file(from, io::Error::other("only files are copied into the trash")))
+    }
+
     /// A copy of a file locked in the Finder is locked too (macOS copies a file's flags
     /// along): it could neither take its place in the trash nor ever be cleared out of it.
     /// The copy's lock is lifted; the file itself keeps its own.
@@ -449,6 +503,7 @@ impl Trash {
             let revived = match list {
                 Some(list) => match list.get(&path) {
                     Some(listed) => !Self::as_listed(&meta, listed, shifting),
+                    None if Self::stands_in_for_listed(folder, &path, &meta, list, shifting) => false,
                     None => modified > made,
                 },
                 None => modified > made + UNLISTED_MARGIN_MS && modified <= now + 60_000,
@@ -464,6 +519,42 @@ impl Trash {
     /// for `days` (none when `days` is 0, which keeps everything).
     fn cutoff(days: u32) -> Option<DateTime<Local>> {
         (days > 0).then(|| Local::now() - chrono::Duration::days(days as i64))
+    }
+
+    /// Whether the file at `path` in the dated `folder`, with the details `meta`, is a cloud
+    /// service's placeholder for a file the folder's list names, left when the service freed
+    /// that file up as it was listed: the file is no longer there, and the placeholder says
+    /// what the list says about it. Nextcloud and ownCloud give a placeholder the file's own
+    /// time; iCloud Drive before macOS 14 turns `report.txt` into a new, hidden
+    /// `.report.txt.icloud` that holds the file's size. It frees up a package (a folder the
+    /// Finder shows as one document, `Doc.rtfd`) as one item, with one `.Doc.rtfd.icloud` for
+    /// all of it, while the list names each file of the package: that placeholder must hold
+    /// the size of all of them together. Such a stand-in holds nobody's work, whatever its own
+    /// time, and goes along with its dated folder. One that says otherwise may stand for work
+    /// saved into the trash after Charon put it there, and one that says nothing can't tell:
+    /// either is judged by its time like any other file.
+    fn stands_in_for_listed(folder: &Path, path: &str, meta: &fs::Metadata, list: &Listed, shifting: bool) -> bool {
+        let Some(placeholder) = Placeholder::named(Keys::name(path)).filter(|_| meta.is_file()) else { return false };
+        let item = match Keys::parent(path) {
+            Some(parent) => format!("{parent}/{}", placeholder.item),
+            None => placeholder.item.to_string(),
+        };
+        let Some(listed) = ListedItem::find(list, &item) else { return false };
+        if !fs::symlink_metadata(folder.join(&item)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return false;
+        }
+        match (placeholder.service, listed) {
+            // The client's time is to the second; on FAT and exFAT it may have moved by whole
+            // hours since, as for any file there.
+            (CloudService::SyncClient, ListedItem::File(_, modified)) => {
+                let own = Scanner::modified_ms(meta);
+                (own - modified).abs() <= MTIME_TOLERANCE_MS || (shifting && Entry::whole_hours_apart(own, modified))
+            }
+            // Nextcloud and ownCloud leave placeholders for files only, and a folder of files
+            // has no one time to compare theirs with.
+            (CloudService::SyncClient, ListedItem::Folder(_)) => false,
+            (CloudService::ICloud, ListedItem::File(size, _) | ListedItem::Folder(size)) => placeholder.recorded_size(&folder.join(path)) == Some(size),
+        }
     }
 
     /// Whether a file named `name` in the trash never holds someone's work, whatever its
@@ -505,8 +596,7 @@ impl Trash {
                 log::warn!("kept {}: something in it changed after it went into the trash, or can't be read", folder.display());
                 continue;
             }
-            Self::lift_read_only_marks(&folder);
-            if let Err(e) = fs::remove_dir_all(&folder) {
+            if let Err(e) = Self::clear_out(&folder) {
                 log::warn!("couldn't clear old trash {}: {e}", folder.display());
             }
         }
@@ -514,12 +604,31 @@ impl Trash {
         let _ = fs::remove_dir(&trash);
     }
 
-    /// Windows: what went into the trash keeps its read-only mark, and FAT and exFAT drives
-    /// won't remove a read-only file or folder. The marks inside `folder` are lifted first,
-    /// never through a link.
+    /// Removes the dated `folder` with everything in it. On Windows what went into the trash
+    /// keeps its read-only mark: NTFS removes a marked item all the same, FAT and exFAT
+    /// refuse to. Only when the drive refuses are the marks lifted (see
+    /// `lift_read_only_marks`), and the folder removed once more.
+    fn clear_out(folder: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(folder) {
+            Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {
+                Self::lift_read_only_marks(folder);
+                fs::remove_dir_all(folder)
+            }
+            removed => removed,
+        }
+    }
+
+    /// Windows: lifts the read-only marks of `folder` and of everything in it, never through
+    /// a link. A file with more than one name (hard links) keeps its mark: the mark is the
+    /// file's, so it would be lifted for every one of its names, which may be the person's
+    /// files outside the trash. (FAT and exFAT, which need the marks lifted, have no hard
+    /// links.)
     #[cfg(windows)]
     fn lift_read_only_marks(folder: &Path) {
         for item in walkdir::WalkDir::new(folder).follow_links(false).into_iter().flatten() {
+            if item.file_type().is_file() && Identity::names(item.path()) != Some(1) {
+                continue;
+            }
             Copier::make_writable(item.path());
         }
     }
@@ -583,6 +692,39 @@ mod tests {
 
     fn set_time(path: &Path, at: DateTime<Local>) {
         filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(at.timestamp(), 0)).unwrap();
+    }
+
+    /// Writes at `path` the placeholder iCloud Drive before macOS 14 leaves when it frees up a
+    /// file of `size` bytes: a property list about the file, written now.
+    fn icloud_placeholder(path: &Path, size: u64) {
+        icloud_stand_in(path, "NSURLFileResourceTypeRegular", Some(size));
+    }
+
+    /// Writes at `path` the placeholder iCloud Drive before macOS 14 leaves when it frees up a
+    /// package as one item: a property list about the package, with the size of all it held
+    /// when there is one.
+    fn icloud_package_placeholder(path: &Path, size: Option<u64>) {
+        icloud_stand_in(path, "NSURLFileResourceTypeDirectory", size);
+    }
+
+    /// A property list about the item of type `kind` that the placeholder at `path` stands
+    /// for, with the item's size when there is one, written now.
+    fn icloud_stand_in(path: &Path, kind: &str, size: Option<u64>) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut about = plist::Dictionary::new();
+        about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String(kind.into()));
+        if let Some(size) = size {
+            about.insert("NSURLFileSizeKey".into(), size.into());
+        }
+        about.insert("NSURLNameKey".into(), plist::Value::String(Placeholder::named(&name).unwrap().item.into()));
+        plist::Value::Dictionary(about).to_writer_binary(fs::File::create(path).unwrap()).unwrap();
+    }
+
+    /// Writes at `path` the placeholder Nextcloud leaves when it frees up a file: one space,
+    /// with the file's own time, `time`.
+    fn nextcloud_placeholder(path: &Path, time: DateTime<Local>) {
+        fs::write(path, " ").unwrap();
+        set_time(path, time);
     }
 
     #[test]
@@ -789,6 +931,170 @@ mod tests {
         assert!(!dated.exists());
     }
 
+    /// iCloud Drive before macOS 14 frees up the files nobody used for long, the trash's old
+    /// ones first: the file goes, and a new hidden `.report.txt.icloud` stands in for it, which
+    /// holds the file's size. Nextcloud's `plans.odt.nextcloud` has the file's own time
+    /// instead. Such a stand-in is nobody's work: the folder is still cleared out when its time
+    /// comes, with it. A placeholder for a file the list doesn't name, or for one that's still
+    /// there, is judged by its time like any other file.
+    #[test]
+    fn a_cloud_placeholder_for_a_listed_file_is_nobodys_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        fs::create_dir_all(tmp.path().join("Docs")).unwrap();
+        let mut kept = Vec::new();
+        // The plans were saved while the run was under way, after its folder's time.
+        for (name, time) in [("report.txt", days_ago(41)), ("Docs/plans.odt", days_ago(39)), ("notes.txt", days_ago(41))] {
+            fs::write(tmp.path().join(name), "the old version").unwrap();
+            set_time(&tmp.path().join(name), time);
+            kept.push(trash.put(tmp.path(), name).unwrap());
+        }
+        trash.write_lists();
+        let dated = kept[0].parent().unwrap().to_path_buf();
+        let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
+
+        // Freed up days later.
+        fs::remove_file(dated.join("report.txt")).unwrap();
+        icloud_placeholder(&dated.join(".report.txt.icloud"), "the old version".len() as u64);
+        fs::remove_file(dated.join("Docs/plans.odt")).unwrap();
+        nextcloud_placeholder(&dated.join("Docs/plans.odt.nextcloud"), days_ago(39));
+        for thorough in [false, true] {
+            let look = Trash::look(tmp.path(), 30, thorough, false);
+            assert!(look.revived.is_empty(), "{:?}", look.revived);
+            assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![folder.as_str()]);
+        }
+        for placeholder in [".notes.txt.icloud", ".other.txt.icloud"] {
+            icloud_placeholder(&dated.join(placeholder), "the old version".len() as u64);
+        }
+        let look = Trash::look(tmp.path(), 30, false, false);
+        assert!(look.expired.is_empty());
+        assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{folder}/.notes.txt.icloud"), format!("{TRASH_FOLDER}/{folder}/.other.txt.icloud")]);
+
+        for placeholder in [".notes.txt.icloud", ".other.txt.icloud"] {
+            fs::remove_file(dated.join(placeholder)).unwrap();
+        }
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
+        assert!(!dated.exists(), "cleared out, the stand-ins with it");
+    }
+
+    /// iCloud Drive before macOS 14 frees up a package (an `.rtfd`, a Logic project: a folder
+    /// the Finder shows as one document) as one item: the folder goes with all it holds, and
+    /// one hidden `.Doc.rtfd.icloud` stands in for it, which holds the size of all of it.
+    /// Charon put the package's files into the trash one by one and listed each, never the
+    /// folder. When they add up to that size, the stand-in is nobody's work: the folder is
+    /// still cleared out when its time comes, with it.
+    #[test]
+    fn a_cloud_placeholder_for_a_package_of_listed_files_is_nobodys_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let files = [
+            ("Doc.rtfd/TXT.rtf", "the text of the document"),
+            ("Doc.rtfd/photo.png", "a picture in it"),
+            // Named like the package, next to it: no part of it.
+            ("Doc.rtfd.zip", "a zipped copy of the document"),
+            ("Music/Song.logicx/Alternatives/000/ProjectData", "the song"),
+            ("Music/Song.logicx/Resources/Info.plist", "about the song"),
+        ];
+        for (name, text) in files {
+            let path = tmp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            set_time(&path, days_ago(41));
+            trash.put(tmp.path(), name).unwrap();
+        }
+        trash.write_lists();
+        let dated = tmp.path().join(TRASH_FOLDER).join(&trash.folder);
+        let size_of = |package: &str| files.iter().filter(|(name, _)| name.starts_with(&format!("{package}/"))).map(|(_, text)| text.len() as u64).sum::<u64>();
+
+        // Freed up weeks later, each package as one item.
+        for (package, placeholder) in [("Doc.rtfd", ".Doc.rtfd.icloud"), ("Music/Song.logicx", "Music/.Song.logicx.icloud")] {
+            fs::remove_dir_all(dated.join(package)).unwrap();
+            icloud_package_placeholder(&dated.join(placeholder), Some(size_of(package)));
+        }
+        for thorough in [false, true] {
+            let look = Trash::look(tmp.path(), 30, thorough, false);
+            assert!(look.revived.is_empty(), "{:?}", look.revived);
+            assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![trash.folder.as_str()]);
+        }
+        Trash::sweep(tmp.path(), std::slice::from_ref(&trash.folder), 30, false);
+        assert!(!dated.exists(), "cleared out, the stand-ins with it");
+    }
+
+    /// Someone's work saved into a trashed file holds its dated folder. When the cloud service
+    /// then frees that file up, its placeholder says the file changed after it went in:
+    /// Nextcloud's has the time of the work, iCloud Drive's its size. The folder stays held,
+    /// the work in the cloud with it, and so it does for a placeholder that can't be read and
+    /// came after the folder.
+    #[test]
+    fn a_file_changed_in_the_trash_still_holds_its_folder_once_its_service_frees_it_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let mut kept = Vec::new();
+        for name in ["plans.odt", "report.txt", "notes.txt"] {
+            fs::write(tmp.path().join(name), "the old version").unwrap();
+            set_time(&tmp.path().join(name), days_ago(41));
+            kept.push(trash.put(tmp.path(), name).unwrap());
+        }
+        trash.write_lists();
+        let dated = kept[0].parent().unwrap().to_path_buf();
+        let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
+        // Apps that had them open saved someone's work into them, ten days ago.
+        let work = "someone's work, saved into the trash";
+        for file in &kept {
+            fs::write(file, work).unwrap();
+            set_time(file, days_ago(10));
+        }
+        assert_eq!(Trash::look(tmp.path(), 30, true, false).revived.len(), 3, "held while the work is on disk");
+
+        // The services free them up.
+        for file in &kept {
+            fs::remove_file(file).unwrap();
+        }
+        nextcloud_placeholder(&dated.join("plans.odt.nextcloud"), days_ago(10));
+        icloud_placeholder(&dated.join(".report.txt.icloud"), work.len() as u64);
+        fs::write(dated.join(".notes.txt.icloud"), "not a property list").unwrap();
+        let look = Trash::look(tmp.path(), 30, true, false);
+        assert!(look.expired.is_empty(), "{look:?}");
+        let held = [".notes.txt.icloud", ".report.txt.icloud", "plans.odt.nextcloud"];
+        assert_eq!(look.revived, held.map(|placeholder| format!("{TRASH_FOLDER}/{folder}/{placeholder}")));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
+        assert!(held.iter().all(|placeholder| dated.join(placeholder).exists()), "never cleared out");
+    }
+
+    /// A package's placeholder that doesn't say the package held just what Charon listed in
+    /// it is judged by its time like any other file, and holds its folder: one with another
+    /// size (someone's work saved into the package after it went in), one with no size, and
+    /// one next to a package that's still there.
+    #[test]
+    fn a_cloud_placeholder_for_a_package_changed_in_the_trash_holds_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let text = "the text of the document";
+        for package in ["Present.rtfd", "Saved.rtfd", "Unsized.rtfd"] {
+            let name = format!("{package}/TXT.rtf");
+            fs::create_dir_all(tmp.path().join(package)).unwrap();
+            fs::write(tmp.path().join(&name), text).unwrap();
+            set_time(&tmp.path().join(&name), days_ago(41));
+            trash.put(tmp.path(), &name).unwrap();
+        }
+        trash.write_lists();
+        let dated = tmp.path().join(TRASH_FOLDER).join(&trash.folder);
+
+        // An app that had one open saved someone's work into it before iCloud freed it up.
+        let work = "someone's work, saved into the trash";
+        fs::remove_dir_all(dated.join("Saved.rtfd")).unwrap();
+        icloud_package_placeholder(&dated.join(".Saved.rtfd.icloud"), Some((text.len() + work.len()) as u64));
+        fs::remove_dir_all(dated.join("Unsized.rtfd")).unwrap();
+        icloud_package_placeholder(&dated.join(".Unsized.rtfd.icloud"), None);
+        icloud_package_placeholder(&dated.join(".Present.rtfd.icloud"), Some(text.len() as u64));
+        let look = Trash::look(tmp.path(), 30, true, false);
+        assert!(look.expired.is_empty(), "{look:?}");
+        let held = [".Present.rtfd.icloud", ".Saved.rtfd.icloud", ".Unsized.rtfd.icloud"];
+        assert_eq!(look.revived, held.map(|placeholder| format!("{TRASH_FOLDER}/{}/{placeholder}", trash.folder)));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&trash.folder), 30, false);
+        assert!(held.iter().all(|placeholder| dated.join(placeholder).exists()), "never cleared out");
+    }
+
     #[test]
     fn a_younger_folder_is_checked_by_its_list_when_the_look_is_thorough() {
         let tmp = tempfile::tempdir().unwrap();
@@ -891,27 +1197,63 @@ mod tests {
         assert!(!tmp.path().join(TRASH_FOLDER).exists());
     }
 
-    /// Windows: clearing out a dated folder first lifts the read-only marks of everything in
-    /// it, the folder itself included. (FAT and exFAT drives won't remove a marked item; NTFS
-    /// removes it anyway, so this looks at the marks themselves.)
+    /// Windows: where a drive won't remove a marked item (FAT, exFAT), the read-only marks in
+    /// a dated folder are lifted, the folder's own included. A file with a name outside the
+    /// folder too keeps its mark. (NTFS removes a marked item all the same, so this looks at
+    /// the marks themselves.)
     #[cfg(windows)]
     #[test]
     fn the_read_only_marks_in_a_dated_folder_are_lifted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let folder = tmp.path().join("2000-01-01_00-00-00");
-        let inner = folder.join("from a cd");
-        let file = inner.join("photo.jpg");
-        fs::create_dir_all(&inner).unwrap();
-        fs::write(&file, "photo").unwrap();
-        for item in [&file, &inner, &folder] {
+        let read_only = |item: &Path| {
             let mut permissions = fs::metadata(item).unwrap().permissions();
             permissions.set_readonly(true);
             fs::set_permissions(item, permissions).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("2000-01-01_00-00-00");
+        let inner = folder.join("from a cd");
+        let (file, shared, outside) = (inner.join("photo.jpg"), inner.join("shared.jpg"), tmp.path().join("shared.jpg"));
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(&file, "photo").unwrap();
+        fs::write(&outside, "a file with two names").unwrap();
+        fs::hard_link(&outside, &shared).unwrap();
+        for item in [&file, &outside, &inner, &folder] {
+            read_only(item);
         }
         Trash::lift_read_only_marks(&folder);
         for item in [&file, &inner, &folder] {
             assert!(!fs::metadata(item).unwrap().permissions().readonly(), "{} is still read-only", item.display());
         }
+        assert!(fs::metadata(&outside).unwrap().permissions().readonly(), "the file's other name keeps its mark");
+    }
+
+    /// Windows: a file in the trash may have other names outside it (hard links: a git clone
+    /// of a repository on the same drive shares its objects' files with it), and a read-only
+    /// mark is the file's, shared by all of its names. Clearing out old trash leaves that
+    /// mark as it is: NTFS removes the trash's name all the same.
+    #[cfg(windows)]
+    #[test]
+    fn clearing_out_the_trash_keeps_the_mark_of_a_file_with_names_outside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (original, clone) = (tmp.path().join("repository/objects/ab12"), tmp.path().join("clone/objects/ab12"));
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        fs::write(&original, "an object").unwrap();
+        set_time(&original, days_ago(41));
+        fs::hard_link(&original, &clone).unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let kept = trash.put(tmp.path(), "clone/objects/ab12").unwrap();
+        trash.write_lists();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+
+        let look = Trash::look(tmp.path(), 30, false, false);
+        assert_eq!(look.expired.len(), 1, "{look:?}");
+        Trash::sweep(tmp.path(), &[look.expired[0].name.clone()], 30, false);
+        assert!(!kept.exists(), "cleared out");
+        assert!(fs::metadata(&original).unwrap().permissions().readonly(), "the repository's object keeps its mark");
+        assert_eq!(fs::read_to_string(&original).unwrap(), "an object");
     }
 
     /// A folder without a list (an interrupted run, an earlier version) is judged by the

@@ -3,11 +3,12 @@
 //! empty one (that would look like "everything in it was deleted").
 
 use crate::error::{Error, Result};
+use crate::scan::clients::ClientSettings;
 use crate::scan::cloud::CloudFolders;
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, Placeholder,
-    RootId, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_sync_journal, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys,
+    Placeholder, RootId, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -24,11 +25,13 @@ pub struct Scanner<'a> {
     /// The scan stops early as soon as one of these becomes true.
     stops: Vec<&'a AtomicBool>,
     counter: Option<&'a (dyn Fn(u64) + Sync)>,
+    /// Where the Nextcloud and ownCloud clients keep their settings.
+    clients: ClientSettings,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(filter: &'a ExcludeFilter) -> Self {
-        Self { filter, stops: Vec::new(), counter: None }
+        Self { filter, stops: Vec::new(), counter: None, clients: ClientSettings::here() }
     }
 
     /// Stops the scan early when `cancel` becomes true (any of them, when called again).
@@ -56,8 +59,8 @@ impl<'a> Scanner<'a> {
         let drive_top = Self::top_of_drive(root);
         let mut walker = WalkDir::new(root).follow_links(false).min_depth(1).into_iter();
         let mut seen: u64 = 0;
-        let mut cloud = CloudFolders::of(root);
-        // Files a cloud service freed up, by their keys, with the placeholder left for each.
+        let mut cloud = CloudFolders::of(root, &self.clients);
+        // Files a cloud service freed up, by their keys, with why each is left alone.
         let mut freed_up: Vec<(String, String)> = Vec::new();
 
         while let Some(item) = walker.next() {
@@ -105,6 +108,13 @@ impl<'a> Scanner<'a> {
                 }
                 continue;
             }
+            if file_type.is_file() && is_sync_journal(name) {
+                // A Nextcloud or ownCloud client's journal of the folder it syncs: the
+                // client's own, never synced or removed, and its folder isn't empty.
+                snapshot.reserve(&key, &disk);
+                snapshot.occupy_folders_of(&key);
+                continue;
+            }
             let placeholder = Placeholder::named(name).filter(|placeholder| file_type.is_file() && cloud.is_placeholder(&disk, placeholder.service));
             if let Some(placeholder) = placeholder {
                 // A cloud service's placeholder for a file it freed up: the service's own,
@@ -115,7 +125,8 @@ impl<'a> Scanner<'a> {
                 snapshot.reserve(&key, &disk);
                 snapshot.occupy_folders_of(&key);
                 if !self.filter.excludes(&item) {
-                    freed_up.push((item, disk));
+                    let why = Self::freed_up_reason(&disk, cloud.journal_of(&disk, placeholder.service));
+                    freed_up.push((item, why));
                 }
                 continue;
             }
@@ -233,15 +244,9 @@ impl<'a> Scanner<'a> {
                 snapshot.leave_out(disk, Some(&key), "isn't a file or a folder (a socket, pipe or device)");
             }
         }
-        for (item, placeholder) in freed_up {
+        for (item, why) in freed_up {
             if !snapshot.contains(&item) && !snapshot.leaves_alone(&item) {
-                snapshot.freeze(
-                    &item,
-                    format!(
-                        "it's only in the cloud (only its placeholder “{}” is on this computer), so Charon leaves it alone (if that placeholder is an old copy, remove it)",
-                        Keys::name(&placeholder)
-                    ),
-                );
+                snapshot.freeze(&item, why);
             }
         }
         snapshot.facts_mut().clouds = cloud.places();
@@ -257,6 +262,20 @@ impl<'a> Scanner<'a> {
         match Keys::parent(key) {
             Some(folder) => format!("{folder}/{}", placeholder.item),
             None => placeholder.item.to_string(),
+        }
+    }
+
+    /// Why a file a cloud service freed up is left alone, when only its placeholder at `disk`
+    /// is here. Where only a sync client's `journal` says a client syncs the folder, the note
+    /// names it: in a copy of a synced folder (a backup made by a tool that copied it as it
+    /// was), the journal and the placeholder are both old copies.
+    fn freed_up_reason(disk: &str, journal: Option<&str>) -> String {
+        let placeholder = Keys::name(disk);
+        match journal {
+            Some(journal) => format!(
+                "it's only in the cloud (only its placeholder “{placeholder}” is here, inside a folder that holds a Nextcloud or ownCloud client's journal, “{journal}”), so Charon leaves it alone (if no such client on any computer syncs that folder, the journal and the placeholder are old copies: remove them)"
+            ),
+            None => format!("it's only in the cloud (only its placeholder “{placeholder}” is on this computer), so Charon leaves it alone (if that placeholder is an old copy, remove it)"),
         }
     }
 
@@ -536,9 +555,15 @@ mod tests {
         fs::write(path, text).unwrap();
     }
 
+    /// The snapshot of `root`, without the patterns, where no sync client's settings can be
+    /// read.
     fn scan(root: &Path, patterns: &[&str]) -> Snapshot {
+        scan_with(root, patterns, ClientSettings::at(Vec::new()))
+    }
+
+    fn scan_with(root: &Path, patterns: &[&str], clients: ClientSettings) -> Snapshot {
         let filter = ExcludeFilter::new(&patterns.iter().map(|p| p.to_string()).collect::<Vec<_>>(), false).unwrap();
-        Scanner::new(&filter).scan(root, Volume::of(root)).unwrap()
+        Scanner { clients, ..Scanner::new(&filter) }.scan(root, Volume::of(root)).unwrap()
     }
 
     #[test]
@@ -696,7 +721,8 @@ mod tests {
         let mut frozen: Vec<&str> = s.frozen_places().map(|(key, _)| key.as_str()).collect();
         frozen.sort();
         assert_eq!(frozen, vec!["Docs/Budget.xlsx", "Docs/Report.pdf", "Plans.odt"]);
-        assert!(s.frozen("Docs/Report.pdf").is_some_and(|why| why.contains("only in the cloud") && why.contains("Report.pdf.nextcloud") && why.contains("remove it")));
+        let why = s.frozen("Docs/Report.pdf").unwrap();
+        assert!(why.contains("only in the cloud") && why.contains("“Report.pdf.nextcloud”") && why.contains("“.sync_0123456789ab.db”") && why.contains("remove them"), "{why}");
         assert!(s.get("Docs/Back.pdf").is_some());
         assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/Back.pdf"], "placeholders are never synced");
         assert!(s.leaves_alone("Docs/Report.pdf.nextcloud") && s.leaves_alone("Docs/Back.pdf.nextcloud") && s.leaves_alone("Docs/draft.tmp.nextcloud"));
@@ -730,6 +756,67 @@ mod tests {
         assert!(s.get("Backup/Docs/Report.pdf.nextcloud").is_some() && s.get("Nextcloud/Docs/Report.pdf.nextcloud").is_none());
         assert!(s.placeholder_service("Nextcloud/New.txt.nextcloud").is_some() && s.placeholder_service("Backup/New.txt.nextcloud").is_none());
         assert!(s.placeholder_service("ownCloud/Docs/New.txt.owncloud").is_some());
+    }
+
+    /// Where the sync clients' settings can be read, a folder they don't list but that holds a
+    /// client's journal is still one a client syncs: a client on another computer may sync
+    /// it. Charon can't tell it from a copy of a synced folder (a backup made by a tool that
+    /// copied it as it was), so the note on a file only its placeholder stands for names the
+    /// journal: if no client syncs that folder, both are old copies. In a folder the settings
+    /// list, the note needs no journal.
+    #[test]
+    fn a_journal_in_a_folder_the_settings_dont_list_is_named_in_the_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings/nextcloud.cfg");
+        let synced = tmp.path().join("Nextcloud");
+        write(&settings, &format!("[Accounts]\n0\\Folders\\1\\localPath={}/\n", synced.display().to_string().replace('\\', "/")));
+        for folder in [&synced, &tmp.path().join("Backup")] {
+            write(&folder.join(".sync_0123456789ab.db"), "journal");
+            write(&folder.join("Docs/Report.pdf.nextcloud"), " ");
+        }
+        let clients = || ClientSettings::at(vec![settings.clone()]);
+
+        let s = scan_with(&tmp.path().join("Backup"), &[], clients());
+        assert_eq!(s.frozen_places().map(|(key, _)| key.as_str()).collect::<Vec<_>>(), vec!["Docs/Report.pdf"]);
+        let why = s.frozen("Docs/Report.pdf").unwrap();
+        assert!(why.contains("“Report.pdf.nextcloud”") && why.contains("“.sync_0123456789ab.db”") && why.contains("old copies: remove them"), "{why}");
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs"]);
+        assert!(s.placeholder_service("Docs/New.txt.nextcloud").is_some(), "nothing named so is made there");
+        let s = scan_with(&synced, &[], clients());
+        assert_eq!(s.frozen_places().map(|(key, _)| key.as_str()).collect::<Vec<_>>(), vec!["Docs/Report.pdf"]);
+        let why = s.frozen("Docs/Report.pdf").unwrap();
+        assert!(why.contains("“Report.pdf.nextcloud”") && why.contains("remove it") && !why.contains("journal"), "{why}");
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs"]);
+    }
+
+    /// A Nextcloud or ownCloud client's journal, and the files that go with it, are the
+    /// client's own wherever they are: never synced, so they never make the other side look
+    /// synced by the client, and never removed.
+    #[test]
+    fn a_sync_clients_journal_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let journals = [
+            ".sync_0123456789ab.db",
+            ".sync_0123456789ab.db-wal",
+            ".sync_0123456789ab.db-shm",
+            "Old/.csync_journal.db",
+            "Old/._sync_ba9876543210.db-journal",
+        ];
+        for journal in journals {
+            write(&tmp.path().join(journal), "journal");
+        }
+        write(&tmp.path().join("Docs/notes.txt"), "notes");
+        // Only named like a journal: a folder.
+        fs::create_dir_all(tmp.path().join("Docs/.sync_0123456789ab.db")).unwrap();
+        let s = scan(tmp.path(), &[]);
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/.sync_0123456789ab.db", "Docs/notes.txt", "Old"]);
+        let mut reserved: Vec<&str> = s.reserved().map(|(key, _)| key.as_str()).collect();
+        reserved.sort();
+        let mut expected = journals.to_vec();
+        expected.sort();
+        assert_eq!(reserved, expected);
+        assert!(s.is_occupied("Old"), "a folder holding a journal isn't empty");
+        assert!(s.skipped().is_empty());
     }
 
     #[test]

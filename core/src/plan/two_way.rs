@@ -41,6 +41,7 @@
 //! whole unit becomes one conflict (see `plan::units`).
 
 use crate::model::ConflictRule;
+use crate::plan::action::LEFT_ALONE;
 use crate::plan::ground::Ground;
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side, Unit};
 use crate::scan::{Entry, Snapshot};
@@ -206,7 +207,7 @@ impl TwoWayPlanner {
                         NoteKind::KeptFolder,
                         Some(to),
                         here.spelling(path),
-                        "kept: it was removed on the other side, but it holds items Charon leaves alone",
+                        format!("kept: it was removed on the other side, but it holds {LEFT_ALONE}"),
                     );
                 } else {
                     plan.push(Action::delete(to, path, *existing, None));
@@ -633,6 +634,7 @@ mod tests {
         let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert_eq!(plan.actions, vec![Action::delete(Side::Destination, "f/a.txt", file(1, 10_000), None)]);
         assert_eq!(plan.notes[0].kind, NoteKind::KeptFolder);
+        assert_eq!(plan.notes[0].reason, "kept: it was removed on the other side, but it holds items Charon leaves alone (excluded, left out or unreadable items, or what Charon or a cloud service keeps for its own use)");
     }
 
     #[test]

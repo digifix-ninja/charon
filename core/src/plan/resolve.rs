@@ -8,6 +8,7 @@
 //! by file, and what it replaces or removes goes to .charon-trash.
 
 use crate::model::ConflictChoice;
+use crate::plan::action::LEFT_ALONE;
 use crate::plan::ground::Ground;
 use crate::plan::{Action, Plan, Side, Unit};
 use crate::scan::{Entry, Keys, Snapshot};
@@ -71,7 +72,7 @@ impl Resolution {
             });
             if !settled {
                 return Err(format!(
-                    "The {} has a folder “{}” holding items Charon leaves alone (excluded or unreadable), so it can't be replaced. Move them out of it first, or choose the other version.",
+                    "The {} has a folder “{}” holding {LEFT_ALONE}, so it can't be replaced. Choose the other version, or move your own items out of it first.",
                     loser.word(),
                     ground.side(loser).spelling(key)
                 ));
@@ -275,7 +276,10 @@ mod tests {
         let mut destination = snap(&[("x", Entry::dir()), ("x/a.txt", Entry::file(1, 1)), ("x/b.txt", Entry::file(1, 1))]);
         destination.occupy("x"); // cache.tmp, excluded, is in there too
         let refused = Resolution::plan(&source, &destination, "x", ConflictChoice::KeepSource).unwrap_err();
-        assert!(refused.contains("“x”"), "{refused}");
+        assert_eq!(
+            refused,
+            "The destination has a folder “x” holding items Charon leaves alone (excluded, left out or unreadable items, or what Charon or a cloud service keeps for its own use), so it can't be replaced. Choose the other version, or move your own items out of it first."
+        );
     }
 
     #[test]
