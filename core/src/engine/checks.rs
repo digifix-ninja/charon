@@ -299,6 +299,27 @@ impl Engine {
 }
 
 #[cfg(test)]
+impl Engine {
+    /// A run nobody looked at found `key` missing at `now` on the job's source, as if that
+    /// were a network share, and left its removal from the destination for later.
+    pub(crate) fn leave_a_removal_for_later(&self, id: &JobId, key: &str, now: Moment) {
+        use crate::plan::{Action, Plan, Side};
+        use crate::scan::{Entry, Snapshot, Volume};
+        let job = self.stored_job(id).unwrap();
+        let mut share = Snapshot::new();
+        share.facts_mut().volume = Some(Volume { network: true, ..Volume::of(&job.setup.source) });
+        let mine: Snapshot = [(key.to_string(), Entry::file(1, 1))].into_iter().collect();
+        let mut plan = Plan::default();
+        plan.push(Action::delete(Side::Destination, key, Entry::file(1, 1), None));
+        self.change_missing(&job, |missing| {
+            missing.note(&plan, &share, &mine, now);
+            missing.hold_back_recent(&mut plan, &share, &mine, now);
+        });
+        assert!(plan.actions.is_empty(), "the removal was carried out");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ConflictRule, JobSetup, ReviewKind, SyncMode};

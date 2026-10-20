@@ -461,4 +461,25 @@ mod tests {
         // A clock set back says nothing about time away.
         assert!(!Autopilot::away_between(last, Moment { wall: last.wall - chrono::Duration::hours(1), own: next.own }));
     }
+
+    #[test]
+    fn after_a_tick_long_after_the_one_before_items_missing_on_a_share_are_looked_for_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, _, _) = on_change_job(tmp.path(), 30);
+        let (mut pilot, _changes) = pilot(&engine);
+        let minutes = |n: u64| Duration::from_secs(n * 60);
+        // A run left the removal of photo.jpg for later: it had only just gone missing on a share.
+        let start = Moment::now();
+        engine.leave_a_removal_for_later(&id, "photo.jpg", start);
+        // The tick before this one was five hours ago by the clock on the wall: the computer
+        // slept, and the share may have gone away and come back meanwhile.
+        pilot.last_tick = Some(Moment { wall: start.wall - chrono::Duration::hours(5), own: start.own });
+        pilot.tick();
+        assert!(!engine.take_follow_up_at(&id, start.after(minutes(10))), "no look since the computer woke up has found it missing");
+        // The looks since then have to find it missing for a while first.
+        let looked = start.after(minutes(10));
+        engine.leave_a_removal_for_later(&id, "photo.jpg", looked);
+        assert!(!engine.take_follow_up_at(&id, looked.after(minutes(1))));
+        assert!(engine.take_follow_up_at(&id, looked.after(minutes(2))));
+    }
 }

@@ -138,12 +138,13 @@ impl Engine {
         let state = state_file.load()?;
         let absences = Absences::new(folder.absences());
         // What looks found missing before this launch, and since when.
+        let launch = Moment::now();
         let runtime = state
             .jobs
             .iter()
             .map(|job| (job.id.clone(), absences.load(&job.id, &job.setup)))
             .filter(|(_, kept)| !kept.is_empty())
-            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept), ..JobRuntime::default() }))
+            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept, launch), ..JobRuntime::default() }))
             .collect();
         let legacy_seen = state_file.legacy_changed_at();
         let engine = Self {
