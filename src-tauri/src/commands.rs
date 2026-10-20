@@ -1,8 +1,9 @@
 //! Everything the window can ask for. Errors reach the window as plain sentences.
 //!
 //! Commands that touch the disk (preparing and confirming lists, editing jobs, picking
-//! folders) are `async` and do their work on a background thread, so the window never
-//! freezes, even when a network share is slow to answer.
+//! folders, and anything that redraws the rows, which look at the jobs' folders) are `async`
+//! and do their work on a background thread, so the window never freezes, even when a
+//! network share is slow to answer.
 
 use crate::about::About;
 use crate::desktop::Desktop;
@@ -144,9 +145,15 @@ pub async fn sync_all(state: State<'_, AppState>) -> Answer<Vec<JobId>> {
     in_background(state, |engine| Ok(engine.sync_all())).await
 }
 
+/// Stops a running sync, or calls off a confirmed one that waits. Off the window's thread:
+/// calling one off redraws the rows, which ask the disk.
 #[tauri::command]
-pub fn cancel(state: State<AppState>, id: JobId) {
-    state.engine.cancel(&id);
+pub async fn cancel(state: State<'_, AppState>, id: JobId) -> Answer<()> {
+    in_background(state, move |engine| {
+        engine.cancel(&id);
+        Ok(())
+    })
+    .await
 }
 
 /// Looks for changes in the background (changes nothing).
@@ -198,10 +205,15 @@ pub async fn approve(state: State<'_, AppState>, id: JobId, review_id: String, a
     in_background(state, move |engine| engine.approve(&id, &review_id, acknowledged)).await
 }
 
-/// The list was closed without confirming it.
+/// The list was closed without confirming it. Off the window's thread: calling off a
+/// confirmed sync that waits redraws the rows, which ask the disk.
 #[tauri::command]
-pub fn discard_review(state: State<AppState>, id: JobId, review_id: String) {
-    state.engine.discard_review(&id, &review_id);
+pub async fn discard_review(state: State<'_, AppState>, id: JobId, review_id: String) -> Answer<()> {
+    in_background(state, move |engine| {
+        engine.discard_review(&id, &review_id);
+        Ok(())
+    })
+    .await
 }
 
 /// Prepares the list that settles one conflict the way the person chose.

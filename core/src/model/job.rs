@@ -160,10 +160,20 @@ impl JobSetup {
     /// (The other job would bring files in, Mirror would remove them, and a two-way job would
     /// carry that removal back to where the files came from.) Asks the disk.
     pub fn clashes_with(&self, other: &JobSetup) -> bool {
+        self.clashes_as(other, |paths| paths.iter().map(|path| Some(Folder::of(path))).collect())
+    }
+
+    /// `clashes_with`, with each folder as `resolve` finds it, in the order given: `None`
+    /// for one it can't tell now (a share that doesn't answer), which is compared with nothing.
+    pub fn clashes_as(&self, other: &JobSetup, resolve: impl Fn(&[&Path]) -> Vec<Option<Folder>>) -> bool {
         let clash = |mirror: &JobSetup, writer: &JobSetup| {
-            mirror.mode == SyncMode::Mirror && {
-                let removes_in = Folder::of(&mirror.destination);
-                writer.written_folders().iter().any(|folder| removes_in.overlaps(&Folder::of(folder)))
+            if mirror.mode != SyncMode::Mirror {
+                return false;
+            }
+            let paths: Vec<&Path> = std::iter::once(mirror.destination.as_path()).chain(writer.written_folders()).collect();
+            match resolve(&paths).split_first() {
+                Some((Some(removes_in), written)) => written.iter().flatten().any(|folder| removes_in.overlaps(folder)),
+                _ => false,
             }
         };
         clash(self, other) || clash(other, self)
@@ -201,13 +211,6 @@ impl JobSetup {
             SyncMode::TwoWay => vec![&self.source, &self.destination],
             SyncMode::Mirror | SyncMode::Backup => vec![&self.destination],
         }
-    }
-
-    /// Whether this job and `other` touch a common folder (read or written).
-    pub fn shares_folders_with(&self, other: &JobSetup) -> bool {
-        let mine = [Folder::of(&self.source), Folder::of(&self.destination)];
-        let theirs = [Folder::of(&other.source), Folder::of(&other.destination)];
-        mine.iter().any(|a| theirs.iter().any(|b| a.overlaps(b)))
     }
 
     /// Whether a change from `before` to `self` changes what a sync does, so the next sync
@@ -388,13 +391,16 @@ impl Job {
         self.setup.full_automation && !self.needs_review
     }
 
-    /// The time automatic schedules count from: the last run, the last time the schedule
-    /// came due, or the job's creation, whichever is latest.
-    pub fn schedule_reference(&self) -> DateTime<Utc> {
-        [self.last_run.as_ref().map(|run| run.finished_at), self.last_scheduled]
+    /// The time automatic schedules count from at `now`: the last run, the last time the
+    /// schedule came due, or the job's creation, whichever is latest. A time later than `now`
+    /// was taken while the clock was ahead, and has been set right since: it doesn't count.
+    /// None when none of them is earlier than `now`.
+    pub fn schedule_reference(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        [Some(self.created_at), self.last_run.as_ref().map(|run| run.finished_at), self.last_scheduled]
             .into_iter()
             .flatten()
-            .fold(self.created_at, DateTime::max)
+            .filter(|time| *time <= now)
+            .max()
     }
 
     /// Files and links removed or replaced by automatic runs within the last day, per side.
@@ -595,7 +601,11 @@ mod tests {
         let mut job = Job::new(setup(SyncMode::Backup, "/a", "/b"));
         let later = job.created_at + chrono::Duration::hours(3);
         job.last_scheduled = Some(later);
-        assert_eq!(job.schedule_reference(), later);
+        assert_eq!(job.schedule_reference(later), Some(later));
+        // Seen an hour after the job was made, the later time was taken while the clock was ahead.
+        let an_hour_in = job.created_at + chrono::Duration::hours(1);
+        assert_eq!(job.schedule_reference(an_hour_in), Some(job.created_at));
+        assert_eq!(job.schedule_reference(job.created_at - chrono::Duration::hours(1)), None);
     }
 
     #[test]

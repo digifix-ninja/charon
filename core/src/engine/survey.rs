@@ -4,7 +4,7 @@
 //! Every look goes through here: the background checks, the reviews the person confirms,
 //! and the runs of jobs with full automation. Nothing in a survey changes a file.
 
-use crate::engine::{runs, Engine, EngineEvent};
+use crate::engine::{runs, Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
@@ -392,7 +392,7 @@ impl Engine {
 
         let record = if setup.mode.is_two_way() { &baseline } else { &landed };
         let plan = plan::plan_for(&setup, &source, &destination, record, &compared.different);
-        self.change_missing(job, |missing| missing.note(&plan, &source, &destination, Utc::now()));
+        self.change_missing(job, |missing| missing.note(&plan, &source, &destination, Moment::now()));
         if let (Some(reason), Some(memory)) = (&afresh, &memory) {
             let mut text = format!(
                 "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and {}.",

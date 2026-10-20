@@ -11,11 +11,11 @@
 //! stopped) is recognised at the next look, which then doesn't trust the memory.
 
 use crate::engine::checks::ChangeAt;
-use crate::engine::runtime::{OwnWrites, Wanted, MISSING_FOR};
+use crate::engine::runtime::{Moment, OwnWrites, Wanted, MISSING_FOR};
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
-use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
+use crate::model::{plural, Drives, Finished, Folder, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Spellings, Trash};
 use crate::scan::{never_download_on_this_thread, ExcludeFilter, Keys, Scanner, Snapshot, MARKER_FOLDER};
@@ -149,10 +149,12 @@ impl Engine {
     /// and returns the other jobs that could sync now: their lists need the person's OK.
     pub fn sync_all(&self) -> Vec<JobId> {
         let mut asking = Vec::new();
-        for job in self.job_list() {
-            let reachable = job.setup.source.is_dir() && job.setup.destination.is_dir();
+        let jobs = self.job_list();
+        // Folders that don't answer in time count as away.
+        let whereabouts = self.whereabouts_of(&jobs);
+        for (job, found) in jobs.into_iter().zip(whereabouts) {
             // A job whose confirmed list waits for another sync is on its way already.
-            if job.paused || !reachable || self.is_running(&job.id) || self.confirmed_waits(&job.id) {
+            if job.paused || !found.both_there() || self.is_running(&job.id) || self.confirmed_waits(&job.id) {
                 continue;
             }
             if job.runs_by_itself() && !self.must_ask(&job.id) {
@@ -267,12 +269,11 @@ impl Engine {
         self.runtime().get(id).is_some_and(|rt| rt.is_running())
     }
 
-    /// Whether the job is running or just finished: the moment its own writes would look
-    /// like changes to the folder watcher.
-    pub fn is_settling(&self, id: &JobId, quiet: Duration) -> bool {
+    /// Whether a sync of the job is running, or one ended less than `time` ago.
+    pub fn synced_within(&self, id: &JobId, time: Duration) -> bool {
         self.runtime()
             .get(id)
-            .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < quiet))
+            .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < time))
     }
 
     /// Notes that a job with full automation should sync, for a trigger (`reason` is for
@@ -388,7 +389,7 @@ impl Engine {
         self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
             Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
             Ok(mut survey) => {
-                engine.hold_back_recent_removals(&job, &mut survey);
+                engine.hold_back_recent_removals(&job, &mut survey, Moment::now());
                 match engine.claim_folders(&job, &survey) {
                     Ok(claim) => engine.cross(&job, &survey, &cancel, &crossing, claim),
                     Err(who) => {
@@ -401,24 +402,31 @@ impl Engine {
     }
 
     /// Leaves for a later run the removals that follow an item missing for only a few
-    /// minutes on a drive that may show changes late (see `Missing`), and says so in the log.
-    /// That run comes by itself once they've waited long enough, whatever starts the job's
-    /// syncs otherwise (see `take_follow_up`).
-    fn hold_back_recent_removals(&self, job: &Job, survey: &mut Survey) {
-        let held = self.change_missing(job, |missing| missing.hold_back_recent(&mut survey.plan, &survey.source, &survey.destination, Utc::now()));
+    /// minutes on a drive that may show changes late (see `Missing`), with the other changes
+    /// to their databases, and says so in the log. That run comes by itself once they've
+    /// waited long enough, whatever starts the job's syncs otherwise (see `take_follow_up`).
+    fn hold_back_recent_removals(&self, job: &Job, survey: &mut Survey, now: Moment) {
+        let held = self.change_missing(job, |missing| missing.hold_back_recent(&mut survey.plan, &survey.source, &survey.destination, now));
         survey.left_for_later = Plan { actions: held, notes: Vec::new() };
-        let count = survey.left_for_later.actions.len() as u64;
-        if count > 0 {
-            self.inner.journal.info(
-                &job.id,
-                &format!(
-                    "left {} for a later sync: the items are missing on a network share or a cloud drive, which can show changes late, \
-                     so Charon waits until looks have found them missing for {} minutes",
-                    plural(count, "removal"),
-                    MISSING_FOR.as_secs() / 60
-                ),
-            );
+        let removals = survey.left_for_later.removals();
+        if removals == 0 {
+            return;
         }
+        let mut line = format!(
+            "left {} for a later sync: the items are missing on a network share or a cloud drive, which can show changes late, \
+             so Charon waits until looks have found them missing for {} minutes",
+            plural(removals, "removal"),
+            MISSING_FOR.as_secs() / 60
+        );
+        let along = survey.left_for_later.actions.len() as u64 - removals;
+        if along > 0 {
+            line.push_str(&format!(
+                ". {} to the same database {} with them, as a database's files only go together",
+                plural(along, "more change"),
+                if along == 1 { "waits" } else { "wait" }
+            ));
+        }
+        self.inner.journal.info(&job.id, &line);
     }
 
     /// Marks the job as running for `crossing`, if it may run now: Charon isn't quitting, the
@@ -587,18 +595,36 @@ impl Engine {
         true
     }
 
-    /// Which other jobs share a folder with `id` (asks the disk; done before locking).
+    /// Which other jobs share a folder with `id` (asks the disk, with a time limit; done
+    /// before locking). A job whose folders don't answer in time counts as sharing: where
+    /// they lead can't be told, so a sync of it at work keeps this job waiting.
     pub(crate) fn neighbours(&self, id: &JobId) -> Neighbours {
         let jobs = self.job_list();
         let Some(me) = jobs.iter().find(|job| &job.id == id) else {
             return Neighbours { mine: Self::nowhere(), others: HashMap::new() };
         };
-        let others = jobs
+        let others: Vec<&Job> = jobs.iter().filter(|other| other.id != me.id).collect();
+        let paths: Vec<&Path> =
+            std::iter::once(me).chain(others.iter().copied()).flat_map(|job| [job.setup.source.as_path(), job.setup.destination.as_path()]).collect();
+        let folders = self.folders_of(&paths);
+        let (mine, theirs) = folders.split_at(2);
+        let others = others
             .iter()
-            .filter(|other| other.id != me.id)
-            .map(|other| (other.id.clone(), (other.setup.clone(), me.setup.shares_folders_with(&other.setup))))
+            .zip(theirs.chunks_exact(2))
+            .map(|(other, theirs)| (other.id.clone(), (other.setup.clone(), Self::may_share(mine, theirs))))
             .collect();
         Neighbours { mine: me.setup.clone(), others }
+    }
+
+    /// Whether two jobs' folders may be one place, or one inside the other: they are, or
+    /// one of them didn't answer (`None`).
+    fn may_share(mine: &[Option<Folder>], theirs: &[Option<Folder>]) -> bool {
+        mine.iter().any(|a| {
+            theirs.iter().any(|b| match (a, b) {
+                (Some(a), Some(b)) => a.overlaps(b),
+                _ => true,
+            })
+        })
     }
 
     /// The name of a running job that shares a folder with `job`, if there is one. A job
@@ -759,7 +785,7 @@ impl Engine {
         let settled = if crossing.kind == ReviewKind::Sync { Self::settled_by_newest(survey, &outcome) } else { Vec::new() };
         summary.settled = settled.len() as u64;
         summary.unkept = outcome.unkept.len() as u64;
-        summary.left_for_later = survey.left_for_later.actions.len() as u64;
+        summary.left_for_later = survey.left_for_later.removals();
 
         self.change_runtime(id, |rt| {
             if let Some(own) = rt.own_writes.as_mut() {
@@ -1345,16 +1371,24 @@ impl Survey {
 }
 
 #[cfg(test)]
+impl Engine {
+    /// Makes the job's last sync look as if it ended at `at`, by both clocks.
+    pub(crate) fn pretend_the_last_sync_ended(&self, id: &JobId, at: Moment) {
+        self.change_job(id, |job| job.last_synced = Some(at.wall)).unwrap();
+        self.change_runtime(id, |rt| rt.finished_at = Some(at.own));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{ConflictRule, JobStatus, SyncMode, Trigger};
     use crate::SyncStart;
     use crate::scan::{Entry, Snapshot, Volume};
-    use chrono::DateTime;
     use std::path::Path;
 
-    fn minutes(n: i64) -> chrono::Duration {
-        chrono::Duration::minutes(n)
+    fn minutes(n: u64) -> Duration {
+        Duration::from_secs(n * 60)
     }
 
     /// A Mirror that runs by itself whenever its drive is connected, synced once.
@@ -1391,10 +1425,10 @@ mod tests {
         snapshot.facts_mut().volume = Some(Volume { network: true, ..Volume::of(folder) });
     }
 
-    /// A run nobody looks at, as the autopilot starts one, with the source folder on a
-    /// network share. The folders are on this computer's own drive, so the run's look notes
-    /// nothing by itself: what a look at the share notes is added, as of `missing_since`.
-    fn run_from_a_share(engine: &Engine, id: &JobId, missing_since: DateTime<Utc>) {
+    /// A run nobody looks at, as the autopilot starts one at `now`, with the source folder on
+    /// a network share. The folders are on this computer's own drive, so the run's look notes
+    /// nothing by itself: what a look at the share notes is added, as of `noted`.
+    fn run_from_a_share(engine: &Engine, id: &JobId, noted: Moment, now: Moment) {
         let crossing = Crossing::unattended("drive connected", false);
         let (job, cancel) = engine
             .begin_run(id, &crossing, |job, _| {
@@ -1405,8 +1439,8 @@ mod tests {
         let mut survey = engine.survey(&job, &cancel, Purpose::Automatic).unwrap();
         assert!(survey.holds.is_empty(), "{:?}", survey.holds);
         on_a_share(&mut survey.source, &job.setup.source);
-        engine.change_missing(&job, |missing| missing.note(&survey.plan, &survey.source, &survey.destination, missing_since));
-        engine.hold_back_recent_removals(&job, &mut survey);
+        engine.change_missing(&job, |missing| missing.note(&survey.plan, &survey.source, &survey.destination, noted));
+        engine.hold_back_recent_removals(&job, &mut survey, now);
         let claim = engine.claim_folders(&job, &survey).unwrap();
         engine.cross(&job, &survey, &cancel, &crossing, claim);
     }
@@ -1497,8 +1531,8 @@ mod tests {
         std::fs::remove_file(src.join("gone.txt")).unwrap();
 
         // The share has shown the file missing for 9 minutes: the removal waits.
-        let start = Utc::now();
-        run_from_a_share(&engine, &id, start - minutes(9));
+        let start = Moment::now();
+        run_from_a_share(&engine, &id, start, start.after(minutes(9)));
         assert!(dst.join("gone.txt").exists());
         let row = engine.job(&id).unwrap();
         assert_eq!(row.status, JobStatus::Pending, "never “In sync” while a removal waits");
@@ -1506,7 +1540,7 @@ mod tests {
         assert!(!engine.has_pending(&id), "a removal that waits starts no run by itself");
         assert!(engine.log(&id, 10).iter().any(|line| line.text.starts_with("left 1 removal for a later sync")));
         assert_eq!(row.job.last_run.as_ref().map(|run| run.left_for_later), Some(1), "the run doesn't say “already in sync”");
-        assert!(!engine.take_follow_up_at(&id, start), "not due yet");
+        assert!(!engine.take_follow_up_at(&id, start.after(minutes(9))), "not due yet");
 
         // Charon restarts (a drive-connected job may not sync again for days): the wait
         // goes on from when the file first went missing.
@@ -1514,26 +1548,101 @@ mod tests {
         let engine = Engine::open(&data, Arc::new(|_| {})).unwrap();
         let kept = engine.runtime().get(&id).map(|rt| rt.missing.kept()).unwrap();
         assert_eq!(kept.len(), 1);
-        assert!(kept[0].left_for_later && kept[0].since == start - minutes(9));
-        assert!(!engine.take_follow_up_at(&id, start + minutes(60)), "no look since the launch has found it missing yet");
+        assert!(kept[0].left_for_later && kept[0].since == start.wall);
+        let launch = start.after(minutes(60));
+        assert!(!engine.take_follow_up_at(&id, launch), "no look since the launch has found it missing yet");
         // A look after the launch finds the file missing still.
-        let job = engine.stored_job(&id).unwrap();
-        let mut share: Snapshot = ["a.txt", "b.txt", "c.txt"].into_iter().map(|name| (name.to_string(), Entry::file(5, 1))).collect();
-        on_a_share(&mut share, &src);
-        let mine: Snapshot = [("gone.txt".to_string(), Entry::file(8, 1))].into_iter().collect();
-        let mut plan = Plan::default();
-        plan.push(Action::delete(Side::Destination, "gone.txt", Entry::file(8, 1), None));
-        engine.change_missing(&job, |missing| missing.note(&plan, &share, &mine, start));
-        assert!(!engine.take_follow_up_at(&id, start + minutes(1)));
-        assert!(engine.take_follow_up_at(&id, start + minutes(2)), "the job syncs once more, whatever its trigger");
-        assert!(!engine.take_follow_up_at(&id, start + minutes(3)), "once");
+        look_at_the_share(&engine, &id, &src, launch);
+        assert!(!engine.take_follow_up_at(&id, launch.after(minutes(1))));
+        assert!(engine.take_follow_up_at(&id, launch.after(minutes(2))), "the job syncs once more, whatever its trigger");
+        assert!(!engine.take_follow_up_at(&id, launch.after(minutes(3))), "once");
 
         // That run carries out the removal.
-        run_from_a_share(&engine, &id, start - minutes(11));
+        run_from_a_share(&engine, &id, launch, launch.after(minutes(11)));
         assert!(!dst.join("gone.txt").exists());
         let row = engine.job(&id).unwrap();
         assert_eq!(row.status, JobStatus::InSync);
         assert!(row.pending.is_none());
+    }
+
+    /// A look at the Mirror of `synced_mirror` at `now`, with its source on a network share
+    /// where gone.txt is still missing.
+    fn look_at_the_share(engine: &Engine, id: &JobId, src: &Path, now: Moment) {
+        let job = engine.stored_job(id).unwrap();
+        let mut share: Snapshot = ["a.txt", "b.txt", "c.txt"].into_iter().map(|name| (name.to_string(), Entry::file(5, 1))).collect();
+        on_a_share(&mut share, src);
+        let mine: Snapshot = [("gone.txt".to_string(), Entry::file(8, 1))].into_iter().collect();
+        let mut plan = Plan::default();
+        plan.push(Action::delete(Side::Destination, "gone.txt", Entry::file(8, 1), None));
+        engine.change_missing(&job, |missing| missing.note(&plan, &share, &mine, now));
+    }
+
+    #[test]
+    fn removals_left_for_later_wait_again_when_the_share_comes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        std::fs::remove_file(src.join("gone.txt")).unwrap();
+        let start = Moment::now();
+        run_from_a_share(&engine, &id, start, start);
+        assert!(dst.join("gone.txt").exists(), "left for later");
+
+        // Minutes later the share goes away, and hours later it comes back.
+        engine.forget_look(&id);
+        let back = start.after(minutes(5 * 60));
+        assert!(!engine.take_follow_up_at(&id, back), "no look since it came back has found it missing");
+        // It may list the folder before it has loaded: the looks since must find the file
+        // missing for a while first.
+        look_at_the_share(&engine, &id, &src, back);
+        assert!(!engine.take_follow_up_at(&id, back.after(minutes(1))));
+        assert!(engine.take_follow_up_at(&id, back.after(minutes(2))));
+    }
+
+    #[test]
+    fn removals_left_for_later_wait_again_after_the_computer_slept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        std::fs::remove_file(src.join("gone.txt")).unwrap();
+        let start = Moment::now();
+        run_from_a_share(&engine, &id, start, start);
+        // The share was back before the autopilot's first tick after the computer woke up.
+        engine.after_a_gap();
+        let awake = start.after(minutes(5 * 60));
+        assert!(!engine.take_follow_up_at(&id, awake));
+        look_at_the_share(&engine, &id, &src, awake);
+        assert!(!engine.take_follow_up_at(&id, awake.after(minutes(1))));
+        assert!(engine.take_follow_up_at(&id, awake.after(minutes(2))));
+    }
+
+    #[test]
+    fn a_database_whose_journals_are_left_for_later_is_left_for_later_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        // The app on the share closed its database: it was saved one last time, and its
+        // journals went. The backup still has the database as it was, with its journals.
+        std::fs::write(src.join("notes.db"), "the database, saved at closing").unwrap();
+        let saved = filetime::FileTime::from_system_time(std::time::SystemTime::now() - Duration::from_secs(60));
+        filetime::set_file_mtime(src.join("notes.db"), saved).unwrap();
+        std::fs::write(dst.join("notes.db"), "the database while open").unwrap();
+        std::fs::write(dst.join("notes.db-wal"), "changes that only fit the database while open").unwrap();
+        std::fs::write(dst.join("notes.db-shm"), "their index").unwrap();
+
+        // The journals went missing only now: the new database must not land next to them.
+        let start = Moment::now();
+        run_from_a_share(&engine, &id, start, start);
+        assert_eq!(std::fs::read_to_string(dst.join("notes.db")).unwrap(), "the database while open");
+        assert!(dst.join("notes.db-wal").exists() && dst.join("notes.db-shm").exists());
+        let row = engine.job(&id).unwrap();
+        assert_eq!(row.pending.map(|pending| pending.items), Some(3), "all three wait");
+        assert!(!engine.has_pending(&id), "what waits starts no run by itself");
+        assert!(engine.log(&id, 10).iter().any(|line| line.text.contains("1 more change to the same database waits with them")));
+
+        // Once the journals have been missing long enough, the database goes over whole.
+        run_from_a_share(&engine, &id, start, start.after(minutes(10)));
+        assert_eq!(std::fs::read_to_string(dst.join("notes.db")).unwrap(), "the database, saved at closing");
+        assert!(!dst.join("notes.db-wal").exists() && !dst.join("notes.db-shm").exists());
     }
 
     #[test]
@@ -1581,5 +1690,44 @@ mod tests {
         assert_ne!(view.status, JobStatus::Syncing);
         assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review);
         assert!(engine.sync_all().contains(&id), "Sync all asks for it");
+    }
+
+    #[test]
+    fn a_job_whose_folders_dont_answer_counts_as_sharing_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [home, usb, share, copy] = ["home", "usb", "share", "copy"].map(|name| tmp.path().join(name));
+        for folder in [&home, &usb, &share, &copy] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_| {})).unwrap();
+        let job = |name: &str, source: &Path, destination: &Path| JobSetup {
+            name: name.into(),
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        };
+        let local = engine.add_job(job("Home", &home, &usb)).unwrap().job.id;
+        let shared = engine.add_job(job("Share", &share, &copy)).unwrap().job.id;
+        assert!(!engine.neighbours(&local).others[&shared].1, "different folders");
+
+        // The share stops answering: where its folders lead can't be told, so a sync of that
+        // job at work would keep this one waiting. Nothing waits for the share itself.
+        let answer = engine.silence(&share);
+        let asked = Instant::now();
+        assert!(engine.neighbours(&local).others[&shared].1);
+        assert!(asked.elapsed() < crate::engine::reach::LIMIT, "waited {:?}", asked.elapsed());
+
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.is_silent(&share) {
+            assert!(Instant::now() < deadline, "the share took too long to answer");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!engine.neighbours(&local).others[&shared].1);
     }
 }

@@ -2,7 +2,7 @@
 
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
-use crate::plan::{Action, Plan, Side};
+use crate::plan::{Action, Plan, Side, Unit};
 use crate::run::{Refused, Unread};
 use crate::scan::{Entry, ExcludeFilter, Keys, Snapshot, Volume};
 use crate::store::Absence;
@@ -256,19 +256,44 @@ impl OwnWrites {
     }
 }
 
+/// A moment by two clocks: the one on the wall, which is kept across launches but can be
+/// set forward or back (by the person, or by the system when it finds the clock wrong), and
+/// Charon's own, which only ever moves forward while Charon runs.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Moment {
+    pub wall: DateTime<Utc>,
+    pub own: Instant,
+}
+
+impl Moment {
+    pub fn now() -> Self {
+        Self { wall: Utc::now(), own: Instant::now() }
+    }
+}
+
 /// Items missing on a drive that may show changes late (a network share, a cloud drive),
 /// and since when looks have found them missing. Such a drive can list a folder before it
 /// has loaded, or from an old picture of it, so a run nobody looks at removes what follows
 /// from an item's absence only once it has been missing for a while (`MISSING_FOR`). A list
 /// the person confirms shows every removal and isn't held back.
 ///
-/// When each item was first found missing is kept across launches (see `store::Absences`).
-/// Right after Charon starts, a share may list a folder before it has loaded again, so an
-/// item found missing before the launch also has to be found missing by the looks since
-/// then for a while (`MISSING_AGAIN_FOR`).
+/// The wait is counted by Charon's own clock, so a clock set forward never shortens it.
+/// When each item was first found missing is also kept across launches, by the clock on the
+/// wall (see `store::Absences`): that clock is read for it once, when Charon starts, to tell
+/// how long the item had been missing by then. Whenever Charon begins to look at the folders
+/// again (it started, a folder went away and came back, the computer slept, the clock
+/// jumped), a share may list a folder before it has loaded again, so an item found missing
+/// before then also has to be found missing by the looks since then for a while
+/// (`MISSING_AGAIN_FOR`).
+///
+/// A database's files only go together (see `plan::Unit`): the other changes to a database
+/// one of whose files waits here wait with it.
 #[derive(Debug, Default)]
 pub(crate) struct Missing {
     noted: HashMap<(Side, String), Noted>,
+    /// The databases with a file noted here, each with how many other steps of the last
+    /// look's plan change it.
+    databases: Vec<(Unit, u64)>,
 }
 
 /// One item of `Missing`.
@@ -276,26 +301,52 @@ pub(crate) struct Missing {
 struct Noted {
     /// When a look first found it missing, by the clock on the wall.
     since: DateTime<Utc>,
-    /// When a look since Charon started first found it missing.
-    this_launch: Option<DateTime<Utc>>,
+    /// Since when Charon has counted how long it is missing, by its own clock: when a look
+    /// first found it missing, or, for an item missing before Charon started, when Charon
+    /// started.
+    counted_from: Instant,
+    /// How long it had been missing before `counted_from`, by the clock on the wall when
+    /// Charon started: nothing for an item first found missing since then.
+    before: Duration,
+    /// When a look first found it missing since Charon last began to look at the folders,
+    /// by Charon's own clock.
+    seen: Option<Instant>,
     /// A run nobody looked at left the removal that follows it for later.
     left_for_later: bool,
 }
 
+impl Noted {
+    /// An item a look found missing for the first time, at `now`.
+    fn first(now: Moment) -> Self {
+        Self { since: now.wall, counted_from: now.own, before: Duration::ZERO, seen: Some(now.own), left_for_later: false }
+    }
+
+    /// An item kept from before Charon started, at `now`. A time it was first found missing
+    /// later than `now` (the clock was ahead then) counts as no time at all.
+    fn restored(absence: &Absence, now: Moment) -> Self {
+        let before = (now.wall - absence.since).to_std().unwrap_or_default();
+        Self { since: absence.since, counted_from: now.own, before, seen: None, left_for_later: absence.left_for_later }
+    }
+}
+
 /// How long an item must have been missing before a run nobody looks at follows it.
 pub(crate) const MISSING_FOR: Duration = Duration::from_secs(10 * 60);
-/// How long the looks since Charon started must have found an item missing that was
-/// already missing before.
+/// How long the looks since Charon last began to look at the folders (it started, a folder
+/// came back, the computer woke up) must have found an item missing that was already missing
+/// before.
 pub(crate) const MISSING_AGAIN_FOR: Duration = Duration::from_secs(2 * 60);
 
 impl Missing {
-    /// The items kept from before Charon started.
-    pub fn restored(kept: Vec<Absence>) -> Self {
+    /// The items kept from before Charon started, as Charon starts at `now`.
+    pub fn restored(kept: Vec<Absence>, now: Moment) -> Self {
         let noted = kept
             .into_iter()
-            .map(|absence| ((absence.side, absence.key), Noted { since: absence.since, this_launch: None, left_for_later: absence.left_for_later }))
+            .map(|absence| {
+                let noted = Noted::restored(&absence, now);
+                ((absence.side, absence.key), noted)
+            })
             .collect();
-        Self { noted }
+        Self { noted, databases: Vec::new() }
     }
 
     /// The items to keep for after Charon starts again, in a steady order.
@@ -311,24 +362,50 @@ impl Missing {
 
     /// Notes the items whose absence `plan` follows with a removal on the other side, where
     /// they are missing on a drive that may show changes late. Every other item is
-    /// forgotten: one that came back starts afresh if it goes missing again.
-    pub fn note(&mut self, plan: &Plan, source: &Snapshot, destination: &Snapshot, now: DateTime<Utc>) {
+    /// forgotten: one that came back starts afresh if it goes missing again. An item first
+    /// found missing later than `now` by the clock on the wall (the clock was ahead then,
+    /// or was set back since) starts afresh too: how long it has been missing can't be told.
+    pub fn note(&mut self, plan: &Plan, source: &Snapshot, destination: &Snapshot, now: Moment) {
         let found: HashSet<(Side, String)> = plan.actions.iter().filter_map(|action| Self::absence(action, source, destination)).collect();
         self.noted.retain(|item, _| found.contains(item));
-        for item in found {
-            let noted = self.noted.entry(item).or_insert(Noted { since: now, this_launch: None, left_for_later: false });
-            noted.this_launch.get_or_insert(now);
+        for item in &found {
+            let noted = self.noted.entry(item.clone()).or_insert_with(|| Noted::first(now));
+            if noted.since > now.wall {
+                *noted = Noted { left_for_later: noted.left_for_later, ..Noted::first(now) };
+            }
+            noted.seen.get_or_insert(now.own);
+        }
+        self.databases = Vec::new();
+        for (_, key) in &found {
+            if let Some(database) = Self::database_of(key, source, destination) {
+                if !self.databases.iter().any(|(known, _)| *known == database) {
+                    let along = plan.actions.iter().filter(|action| Self::goes_with(action, &database, &found, source, destination)).count();
+                    self.databases.push((database, along as u64));
+                }
+            }
+        }
+    }
+
+    /// Charon begins to look at the job's folders again (a folder went away and came back,
+    /// the computer slept, the clock jumped): what looks found missing before has to be
+    /// found missing again by the looks from now on, for a while, as after a launch. How
+    /// long each item has been missing in all is still counted from when it was.
+    pub fn look_again(&mut self) {
+        for noted in self.noted.values_mut() {
+            noted.seen = None;
         }
     }
 
     /// Takes out of `plan` the removals that follow an item missing on such a drive for less
     /// than `MISSING_FOR` (or not noted at all), and returns them. They are left for later:
     /// a later run carries them out if the item is still missing then (`take_follow_up`).
-    pub fn hold_back_recent(&mut self, plan: &mut Plan, source: &Snapshot, destination: &Snapshot, now: DateTime<Utc>) -> Vec<Action> {
+    /// A database's files only go together, so every other change to a database one of whose
+    /// removals waits is left for later with it.
+    pub fn hold_back_recent(&mut self, plan: &mut Plan, source: &Snapshot, destination: &Snapshot, now: Moment) -> Vec<Action> {
         for noted in self.noted.values_mut() {
             noted.left_for_later = false;
         }
-        let (carried, held): (Vec<Action>, Vec<Action>) =
+        let (carried, mut held): (Vec<Action>, Vec<Action>) =
             std::mem::take(&mut plan.actions).into_iter().partition(|action| match Self::absence(action, source, destination) {
                 Some(item) => match self.noted.get_mut(&item) {
                     Some(noted) if Self::lasted(noted, now) => true,
@@ -340,24 +417,38 @@ impl Missing {
                 },
                 None => true,
             });
+        let waiting: Vec<Unit> = held.iter().filter_map(|action| Self::database_of(action.path(), source, destination)).collect();
+        let (carried, along): (Vec<Action>, Vec<Action>) = carried
+            .into_iter()
+            .partition(|action| matches!(action, Action::Conflict { .. }) || !waiting.iter().any(|database| database.holds(action.path())));
+        held.extend(along);
         plan.actions = carried;
         held
     }
 
-    /// How many of the noted removals a run nobody looks at would still leave at `now`.
-    pub fn waiting(&self, now: DateTime<Utc>) -> u64 {
-        self.noted.values().filter(|noted| !Self::lasted(noted, now)).count() as u64
+    /// How many steps of the last look's plan a run nobody looks at would still leave at
+    /// `now`: the noted removals that haven't waited long enough, and every other change to
+    /// a database one of them belongs to.
+    pub fn waiting(&self, now: Moment) -> u64 {
+        let waits = |database: &Unit| self.noted.iter().any(|((_, key), noted)| database.holds(key) && !Self::lasted(noted, now));
+        let whole: Vec<&(Unit, u64)> = self.databases.iter().filter(|(database, _)| waits(database)).collect();
+        let items = self
+            .noted
+            .iter()
+            .filter(|((_, key), noted)| !Self::lasted(noted, now) || whole.iter().any(|(database, _)| database.holds(key)))
+            .count() as u64;
+        items + whole.iter().map(|(_, steps)| steps).sum::<u64>()
     }
 
     /// Whether a removal a run left for later can be carried out at `now`.
-    pub fn follow_up_due(&self, now: DateTime<Utc>) -> bool {
+    pub fn follow_up_due(&self, now: Moment) -> bool {
         self.noted.values().any(|noted| noted.left_for_later && Self::lasted(noted, now))
     }
 
     /// `follow_up_due`, after which such removals are no longer marked: the run that
     /// carries them marks what it leaves again, and a run that ends before (a folder out of
     /// reach) doesn't start again every second.
-    pub fn take_follow_up(&mut self, now: DateTime<Utc>) -> bool {
+    pub fn take_follow_up(&mut self, now: Moment) -> bool {
         let due = self.follow_up_due(now);
         if due {
             for noted in self.noted.values_mut() {
@@ -367,11 +458,15 @@ impl Missing {
         due
     }
 
-    /// Whether an item has been missing long enough at `now` for a run nobody looks at. A
-    /// clock set back never makes it so.
-    fn lasted(noted: &Noted, now: DateTime<Utc>) -> bool {
-        let since = |start: DateTime<Utc>, wait: Duration| (now - start).to_std().is_ok_and(|gone| gone >= wait);
-        since(noted.since, MISSING_FOR) && noted.this_launch.is_some_and(|first| since(first, MISSING_AGAIN_FOR))
+    /// Whether an item has been missing long enough at `now` for a run nobody looks at: for
+    /// `MISSING_FOR` in all, counted by Charon's own clock since it was first found missing
+    /// (or since Charon started, plus how long it had been missing by then), and for
+    /// `MISSING_AGAIN_FOR` by the looks since Charon last began to look at the folders. A
+    /// clock set forward or back while Charon runs never makes it so.
+    fn lasted(noted: &Noted, now: Moment) -> bool {
+        let Some(seen) = noted.seen else { return false };
+        let missing = noted.before + now.own.saturating_duration_since(noted.counted_from);
+        now.own.saturating_duration_since(seen) >= MISSING_AGAIN_FOR && missing >= MISSING_FOR
     }
 
     /// The item whose absence `action` follows, if it's a removal that does and the item is
@@ -384,6 +479,18 @@ impl Missing {
             Side::Destination => destination,
         };
         snapshot.volume().is_some_and(Volume::shows_changes_late).then(|| (missing_on, path.clone()))
+    }
+
+    /// The database `key` is a file of, on either side.
+    fn database_of(key: &str, source: &Snapshot, destination: &Snapshot) -> Option<Unit> {
+        Unit::database_of(key, source, destination).map(Unit::Database)
+    }
+
+    /// Whether `action` is another change to `database` than the removals that follow its
+    /// noted files (`found`): one that waits with them.
+    fn goes_with(action: &Action, database: &Unit, found: &HashSet<(Side, String)>, source: &Snapshot, destination: &Snapshot) -> bool {
+        let noted = Self::absence(action, source, destination).is_some_and(|item| found.contains(&item));
+        !noted && !matches!(action, Action::Conflict { .. }) && database.holds(action.path())
     }
 }
 
@@ -425,6 +532,14 @@ pub(crate) struct Reminder {
 }
 
 #[cfg(test)]
+impl Moment {
+    /// The moment `by` after this one, by both clocks.
+    pub fn after(self, by: Duration) -> Moment {
+        Moment { wall: self.wall + chrono::Duration::from_std(by).unwrap(), own: self.own + by }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::scan::FsKind;
@@ -446,26 +561,32 @@ mod tests {
     }
 
     /// How many steps of `removing(path)` a run nobody looks at would carry out at `now`.
-    fn carried(missing: &mut Missing, path: &str, source: &Snapshot, destination: &Snapshot, now: DateTime<Utc>) -> usize {
+    fn carried(missing: &mut Missing, path: &str, source: &Snapshot, destination: &Snapshot, now: Moment) -> usize {
         let mut plan = removing(path);
         missing.hold_back_recent(&mut plan, source, destination, now);
         plan.actions.len()
     }
 
-    fn minutes(n: i64) -> chrono::Duration {
-        chrono::Duration::minutes(n)
+    fn minutes(n: u64) -> Duration {
+        Duration::from_secs(n * 60)
+    }
+
+    /// `now` with the clock on the wall moved by `by` (forward or back), and Charon's own
+    /// clock where it was.
+    fn wall_moved(now: Moment, by: chrono::Duration) -> Moment {
+        Moment { wall: now.wall + by, own: now.own }
     }
 
     #[test]
     fn a_removal_that_follows_a_share_waits_until_the_item_has_been_missing_a_while() {
         let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
         let mut missing = Missing::default();
-        let start = Utc::now();
+        let start = Moment::now();
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start), 0, "never noted: it waits");
         missing.note(&removing("a.txt"), &source, &destination, start);
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start), 0);
         // Still missing at a later look: the removal goes ahead.
-        let later = start + minutes(10);
+        let later = start.after(minutes(10));
         missing.note(&removing("a.txt"), &source, &destination, later);
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, later), 1);
     }
@@ -474,11 +595,11 @@ mod tests {
     fn an_item_that_came_back_starts_afresh() {
         let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
         let mut missing = Missing::default();
-        let start = Utc::now();
+        let start = Moment::now();
         missing.note(&removing("a.txt"), &source, &destination, start);
         // A look in between finds it again (nothing to remove).
-        missing.note(&Plan::default(), &source, &destination, start + minutes(5));
-        let later = start + minutes(10);
+        missing.note(&Plan::default(), &source, &destination, start.after(minutes(5)));
+        let later = start.after(minutes(10));
         missing.note(&removing("a.txt"), &source, &destination, later);
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, later), 0);
     }
@@ -486,7 +607,7 @@ mod tests {
     #[test]
     fn removals_that_follow_the_computers_own_drive_or_make_room_never_wait() {
         let mut missing = Missing::default();
-        let now = Utc::now();
+        let now = Moment::now();
         let (source, destination) = (folder(&[], false), folder(&["a.txt"], false));
         missing.note(&removing("a.txt"), &source, &destination, now);
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, now), 1);
@@ -501,41 +622,206 @@ mod tests {
     #[test]
     fn an_item_missing_before_charon_started_is_looked_for_again_first() {
         let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
-        let start = Utc::now();
+        let start = Moment::now();
         let mut before = Missing::default();
-        before.note(&removing("a.txt"), &source, &destination, start - minutes(60 * 24));
-        let mut missing = Missing::restored(before.kept());
+        before.note(&removing("a.txt"), &source, &destination, wall_moved(start, -chrono::Duration::days(1)));
+        let mut missing = Missing::restored(before.kept(), start);
         assert_eq!(missing.kept(), before.kept(), "kept as it was");
         // Missing for a day, but no look since the launch has found it missing yet.
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start), 0);
         missing.note(&removing("a.txt"), &source, &destination, start);
-        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start + minutes(1)), 0);
-        missing.note(&removing("a.txt"), &source, &destination, start + minutes(2));
-        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start + minutes(2)), 1);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start.after(minutes(1))), 0);
+        missing.note(&removing("a.txt"), &source, &destination, start.after(minutes(2)));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start.after(minutes(2))), 1);
+    }
+
+    #[test]
+    fn an_item_missing_before_its_share_went_away_is_looked_for_again_when_it_comes_back() {
+        let (source, destination) = (folder(&[], true), folder(&["photos/x.jpg"], false));
+        let mut missing = Missing::default();
+        let start = Moment::now();
+        missing.note(&removing("photos/x.jpg"), &source, &destination, start);
+        assert_eq!(carried(&mut missing, "photos/x.jpg", &source, &destination, start), 0);
+        // The share goes away five minutes later, and comes back hours later (the time asleep
+        // counts on some systems' own clocks too).
+        missing.look_again();
+        let back = start.after(minutes(5 * 60));
+        assert!(!missing.take_follow_up(back), "no look since it came back has found it missing");
+        missing.note(&removing("photos/x.jpg"), &source, &destination, back);
+        assert_eq!(carried(&mut missing, "photos/x.jpg", &source, &destination, back), 0, "it may list the folder before it has loaded");
+        let later = back.after(minutes(1));
+        missing.note(&removing("photos/x.jpg"), &source, &destination, later);
+        assert_eq!(carried(&mut missing, "photos/x.jpg", &source, &destination, later), 0);
+        let due = back.after(minutes(2));
+        missing.note(&removing("photos/x.jpg"), &source, &destination, due);
+        assert!(missing.take_follow_up(due));
+        assert_eq!(carried(&mut missing, "photos/x.jpg", &source, &destination, due), 1);
     }
 
     #[test]
     fn removals_left_for_later_are_followed_up_once_they_are_due() {
         let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
         let mut missing = Missing::default();
-        let start = Utc::now();
+        let start = Moment::now();
         missing.note(&removing("a.txt"), &source, &destination, start);
         assert_eq!(missing.waiting(start), 1);
-        assert!(!missing.take_follow_up(start + minutes(10)), "no run left anything for later");
+        assert!(!missing.take_follow_up(start.after(minutes(10))), "no run left anything for later");
         assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start), 0);
         assert!(missing.kept()[0].left_for_later);
-        assert!(!missing.take_follow_up(start + minutes(9)));
-        assert!(missing.take_follow_up(start + minutes(10)));
-        assert_eq!(missing.waiting(start + minutes(10)), 0);
-        assert!(!missing.take_follow_up(start + minutes(11)), "one follow-up, until a run leaves something for later again");
+        assert!(!missing.take_follow_up(start.after(minutes(9))));
+        assert!(missing.take_follow_up(start.after(minutes(10))));
+        assert_eq!(missing.waiting(start.after(minutes(10))), 0);
+        assert!(!missing.take_follow_up(start.after(minutes(11))), "one follow-up, until a run leaves something for later again");
+    }
+
+    #[test]
+    fn a_clock_set_forward_never_shortens_the_wait() {
+        let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
+        let mut missing = Missing::default();
+        let boot = Moment::now();
+        missing.note(&removing("a.txt"), &source, &destination, boot);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, boot), 0);
+        // Seconds later the system finds its clock five hours behind, and sets it forward.
+        let stepped = wall_moved(boot.after(Duration::from_secs(6)), chrono::Duration::hours(5));
+        assert!(!missing.take_follow_up(stepped));
+        missing.note(&removing("a.txt"), &source, &destination, stepped);
+        assert_eq!(missing.waiting(stepped), 1);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, stepped), 0);
+        let due = stepped.after(minutes(10));
+        missing.note(&removing("a.txt"), &source, &destination, due);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, due), 1);
+
+        // An item found missing before the launch looks again for the whole while too.
+        let yesterday = Absence { side: Side::Source, key: "a.txt".into(), since: boot.wall - chrono::Duration::days(1), left_for_later: true };
+        let mut missing = Missing::restored(vec![yesterday], boot);
+        missing.note(&removing("a.txt"), &source, &destination, boot);
+        let stepped = wall_moved(boot.after(Duration::from_secs(5)), chrono::Duration::hours(5));
+        assert!(!missing.take_follow_up(stepped));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, stepped), 0);
+    }
+
+    #[test]
+    fn a_clock_set_forward_never_shortens_the_wait_when_it_counts_as_a_gap() {
+        let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
+        let ahead = |moment: Moment| wall_moved(moment, chrono::Duration::hours(5));
+        let mut missing = Missing::default();
+        let boot = Moment::now();
+        missing.note(&removing("a.txt"), &source, &destination, boot);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, boot), 0);
+        // Seconds later the clock is set five hours forward. The autopilot takes the jump for
+        // a time Charon wasn't looking, so the looks from then on find it missing again.
+        let stepped = ahead(boot.after(Duration::from_secs(6)));
+        missing.look_again();
+        missing.note(&removing("a.txt"), &source, &destination, stepped);
+        let again = stepped.after(MISSING_AGAIN_FOR);
+        missing.note(&removing("a.txt"), &source, &destination, again);
+        assert!(!missing.take_follow_up(again));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, again), 0, "missing for two minutes, not five hours");
+        let almost = ahead(boot.after(minutes(9)));
+        missing.note(&removing("a.txt"), &source, &destination, almost);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, almost), 0);
+        // Ten minutes by Charon's own clock since it was first found missing.
+        let due = ahead(boot.after(minutes(10)));
+        missing.note(&removing("a.txt"), &source, &destination, due);
+        assert!(missing.take_follow_up(due));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, due), 1);
+
+        // An item found missing a minute before Charon started waits the other nine minutes
+        // by Charon's own clock.
+        let launch = Moment::now();
+        let a_minute_ago = Absence { side: Side::Source, key: "a.txt".into(), since: launch.wall - chrono::Duration::minutes(1), left_for_later: true };
+        let mut missing = Missing::restored(vec![a_minute_ago], launch);
+        missing.note(&removing("a.txt"), &source, &destination, launch);
+        let stepped = ahead(launch.after(Duration::from_secs(6)));
+        missing.look_again();
+        missing.note(&removing("a.txt"), &source, &destination, stepped);
+        let again = stepped.after(MISSING_AGAIN_FOR);
+        missing.note(&removing("a.txt"), &source, &destination, again);
+        assert!(!missing.take_follow_up(again));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, again), 0);
+        let due = ahead(launch.after(minutes(9)));
+        missing.note(&removing("a.txt"), &source, &destination, due);
+        assert!(missing.take_follow_up(due));
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, due), 1);
     }
 
     #[test]
     fn a_clock_set_back_never_makes_a_removal_due() {
         let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
         let mut missing = Missing::default();
-        let start = Utc::now();
+        let start = Moment::now();
         missing.note(&removing("a.txt"), &source, &destination, start);
-        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, start - minutes(60)), 0);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, wall_moved(start, -chrono::Duration::hours(1))), 0);
+    }
+
+    #[test]
+    fn an_item_noted_while_the_clock_was_ahead_starts_its_wait_over() {
+        let (source, destination) = (folder(&[], true), folder(&["a.txt"], false));
+        let now = Moment::now();
+        // Noted at the last launch, while the clock was a day ahead; it has been set right since.
+        let ahead = Absence { side: Side::Source, key: "a.txt".into(), since: now.wall + chrono::Duration::days(1), left_for_later: true };
+        let mut missing = Missing::restored(vec![ahead], now);
+        missing.note(&removing("a.txt"), &source, &destination, now);
+        assert_eq!(missing.kept()[0].since, now.wall, "kept for the next launch as found missing now");
+        assert!(missing.kept()[0].left_for_later);
+        let almost = now.after(minutes(9));
+        missing.note(&removing("a.txt"), &source, &destination, almost);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, almost), 0);
+        // The wait ends after the usual while, not once the clock reaches tomorrow.
+        let due = now.after(minutes(10));
+        missing.note(&removing("a.txt"), &source, &destination, due);
+        assert_eq!(carried(&mut missing, "a.txt", &source, &destination, due), 1);
+    }
+
+    /// A two-way plan: the share's notes.db was saved again and its journals went (the app
+    /// closed), so the computer's copy is replaced and its journals are removed.
+    fn database_closed_on_the_share() -> (Plan, Snapshot, Snapshot) {
+        let share = folder(&["notes.db"], true);
+        let mine = folder(&["notes.db", "notes.db-wal", "notes.db-shm"], false);
+        let mut plan = Plan::default();
+        plan.push(Action::copy(Side::Destination, "notes.db", Entry::file(2, 2), Some(Entry::file(1, 1))));
+        plan.push(Action::delete(Side::Destination, "notes.db-wal", Entry::file(1, 1), None));
+        plan.push(Action::delete(Side::Destination, "notes.db-shm", Entry::file(1, 1), None));
+        (plan, share, mine)
+    }
+
+    #[test]
+    fn a_database_whose_journals_wait_waits_as_a_whole() {
+        let (plan, share, mine) = database_closed_on_the_share();
+        let mut missing = Missing::default();
+        let start = Moment::now();
+        missing.note(&plan, &share, &mine, start);
+        assert_eq!(missing.waiting(start), 3, "the new database waits with its old journals");
+        let mut run = plan.clone();
+        let held = missing.hold_back_recent(&mut run, &share, &mine, start);
+        assert!(run.actions.is_empty(), "nothing of the database is carried: {:?}", run.actions);
+        assert_eq!(held.len(), 3);
+
+        // The journals have been missing long enough: all three go together.
+        let due = start.after(minutes(10));
+        missing.note(&plan, &share, &mine, due);
+        assert_eq!(missing.waiting(due), 0);
+        let mut run = plan.clone();
+        assert!(missing.hold_back_recent(&mut run, &share, &mine, due).is_empty());
+        assert_eq!(run.actions.len(), 3);
+    }
+
+    #[test]
+    fn a_database_waits_as_long_as_any_of_its_journals_does() {
+        let (plan, share, mine) = database_closed_on_the_share();
+        let mut missing = Missing::default();
+        let start = Moment::now();
+        // The -wal went missing first; the -shm five minutes later.
+        let mut wal_only = plan.clone();
+        wal_only.actions.retain(|action| action.path() != "notes.db-shm");
+        missing.note(&wal_only, &share, &mine, start);
+        let later = start.after(minutes(5));
+        missing.note(&plan, &share, &mine, later);
+        let due = start.after(minutes(10));
+        missing.note(&plan, &share, &mine, due);
+        let mut run = plan.clone();
+        let held = missing.hold_back_recent(&mut run, &share, &mine, due);
+        assert!(run.actions.is_empty());
+        assert_eq!(held.len() as u64, missing.waiting(due), "what waits is what a run leaves for later");
     }
 }

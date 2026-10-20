@@ -3,15 +3,27 @@
 //! coming back.
 
 use charon_core::model::SyncMode;
-use charon_core::{ConflictRule, Engine, EngineEvent, JobSetup, JobStatus, Trigger};
+use charon_core::{ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, Trigger};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Opens the engine once a previous one on `data` has let go of it (its threads may still
+/// hold it for a moment after the last handle is dropped).
 fn engine(data: &Path) -> Engine {
-    Engine::open(data, Arc::new(|_: EngineEvent| {})).unwrap()
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match Engine::open(data, Arc::new(|_: EngineEvent| {})) {
+            Ok(engine) => return engine,
+            Err(Error::AlreadyRunning) => {
+                assert!(Instant::now() < deadline, "the previous engine never let go of the data folder");
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the engine doesn't open: {e}"),
+        }
+    }
 }
 
 fn setup(src: &Path, dst: &Path, mode: SyncMode, full_automation: bool) -> JobSetup {
@@ -51,7 +63,7 @@ fn look_until(engine: &Engine, id: &String, found: impl Fn(&Engine) -> bool) {
     while !found(engine) {
         assert!(Instant::now() < deadline, "the look never finished");
         thread::sleep(Duration::from_millis(20));
-        if engine.check_due(id, 1) {
+        if engine.check_due(id, Duration::from_secs(60)) {
             engine.check(id);
         }
     }

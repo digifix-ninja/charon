@@ -1,12 +1,15 @@
 //! Turning a stored job and its live state into the row the window shows.
 
 use crate::autopilot::Schedule;
-use crate::engine::{Engine, JobRuntime, Look};
+use crate::engine::{Engine, JobRuntime, Look, Presence, Whereabouts};
 use crate::model::{Job, JobStatus, JobView, Pending, Progress, RunSummary, Settings, Trigger, VolumeLabel, Waiting};
-use crate::plan::Side;
-use crate::scan::Volume;
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
 use std::sync::atomic::Ordering;
+
+/// The row of a job whose source folder doesn't answer.
+pub(crate) const SOURCE_SILENT: &str = "The source folder doesn't answer. If it's on a network share, the server may be off or out of reach.";
+/// The row of a job whose destination doesn't answer.
+pub(crate) const DESTINATION_SILENT: &str = "The destination doesn't answer. If it's on a network share, the server may be off or out of reach.";
 
 /// A job's live state at the moment its row was taken, with the row's number. Both are
 /// taken under the same locks, so a row with a higher number never shows an older state.
@@ -45,27 +48,31 @@ impl Engine {
         Snapshot { rev: self.inner.rev.fetch_add(1, Ordering::Relaxed) + 1, ..snapshot }
     }
 
-    /// The side whose folder is now on another drive than at the last sync, with that
-    /// drive: an unplugged drive's leftover mount folder, or another disk under the name.
-    pub(crate) fn drive_moved(job: &Job) -> Option<(Side, Volume, Volume)> {
-        let drives = job.drives.as_ref()?;
-        [(Side::Source, &drives.source), (Side::Destination, &drives.destination)].into_iter().find_map(|(side, before)| {
-            let now = Volume::basics(job.setup.root(side))?;
-            (!Self::same_drive(before, &now)).then(|| (side, before.clone(), now))
-        })
+    /// The rows the window shows, made outside the locks: they ask the disk about every
+    /// job's folders, all at once and with a time limit (see `whereabouts_of`).
+    pub(crate) fn views_of(&self, snapshots: Vec<Snapshot>, settings: &Settings) -> Vec<JobView> {
+        let whereabouts = self.whereabouts_of(snapshots.iter().map(|snapshot| &snapshot.job));
+        snapshots.into_iter().zip(whereabouts).map(|(snapshot, found)| Self::view_with(snapshot, settings, &found)).collect()
     }
 
-    /// The row the window shows, made outside the locks (it asks the disk).
+    /// The row the window shows, made outside the locks (it asks the disk, with a time limit).
     pub(crate) fn view_of(&self, snapshot: Snapshot, settings: &Settings) -> JobView {
+        let found = self.whereabouts(&snapshot.job);
+        Self::view_with(snapshot, settings, &found)
+    }
+
+    /// The row of a job whose folders were found as `found`.
+    fn view_with(snapshot: Snapshot, settings: &Settings, found: &Whereabouts) -> JobView {
         let Snapshot { job, running, looking, must_ask, progress, look, problem, waiting_for, confirmed, rev } = snapshot;
         let waiting_since = job.waiting_since;
         // A look made with another setup says nothing about this one.
         let look = look.filter(|look| look.setup == job.setup);
-        let source_online = job.setup.source.is_dir();
-        let destination_online = job.setup.destination.is_dir();
+        // A folder that doesn't answer in time (a share whose server is away) counts as away.
+        let source_online = found.source.is_there();
+        let destination_online = found.destination.is_there();
         // A folder that's there, but on another drive than at the last sync, counts as
         // offline: its row says why, and a sync still shows the list with that warning.
-        let moved = (source_online && destination_online).then(|| Self::drive_moved(&job)).flatten();
+        let moved = found.both_there().then(|| found.moved(&job)).flatten();
         let paused = job.paused || settings.paused_all;
         // A run nobody looks at is refused while the job must ask, even when its record
         // couldn't be saved to say so: the row, the tray and Sync all go by the same rule.
@@ -147,6 +154,7 @@ impl Engine {
         };
 
         let problem = match (status, &moved) {
+            (JobStatus::Offline, _) if found.source == Presence::Silent => Some(SOURCE_SILENT.into()),
             (JobStatus::Offline, _) if !source_online => Some("The source folder isn't reachable.".into()),
             (JobStatus::Offline, Some((side, before, now))) => Some(format!(
                 "The {} folder is now on {}, but at the last sync it was on {}. If that drive isn't connected, this is a leftover folder: connect the drive, or sync to look at the list if the drive really changed.",
@@ -154,6 +162,7 @@ impl Engine {
                 now.describe(),
                 before.describe()
             )),
+            (JobStatus::Offline, None) if found.destination == Presence::Silent => Some(DESTINATION_SILENT.into()),
             (JobStatus::Offline, None) => Some("The destination isn't reachable. Is the drive connected?".into()),
             // A failed run always says what went wrong, naming the items that failed.
             _ => problem.or_else(|| job.last_run.as_ref().and_then(RunSummary::problem)),

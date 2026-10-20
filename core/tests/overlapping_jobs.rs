@@ -346,6 +346,7 @@ fn a_link_made_after_two_jobs_were_saved_cannot_let_them_undo_each_other_unnotic
     confirm(&engine, &docs);
     write(&tmp.path().join("work/plan.txt"), "plan");
     let work = add(&engine, job_setup("Work", &tmp.path().join("work"), &nas_again.join("Docs/Work"), SyncMode::Mirror));
+    eventually("the first look", || !view(&engine, &work).looking);
     // Then NAS-1 turns out to be the share under another name, where Work's folder is too.
     fs::remove_dir_all(&nas_again).unwrap();
     std::os::unix::fs::symlink(&nas, &nas_again).unwrap();
@@ -527,7 +528,7 @@ fn a_confirmed_sync_waits_for_another_charon_and_starts_once_it_is_done() {
     // What changed while it waited isn't in it: the row doesn't say "In sync", and the
     // folders are looked at again at once.
     assert_ne!(row.status, JobStatus::InSync);
-    assert!(engine.check_due(&id, 15));
+    assert!(engine.check_due(&id, Duration::from_secs(15 * 60)));
 }
 
 #[test]
@@ -554,7 +555,7 @@ fn a_confirmed_sync_that_waited_leaves_newer_changes_on_its_row() {
     assert!(dst.join("a.txt").exists() && !dst.join("b.txt").exists(), "only what the person confirmed");
     let row = view(&engine, &id);
     assert_ne!(row.status, JobStatus::InSync, "b.txt still waits");
-    assert!(engine.check_due(&id, 15), "looked at again at once");
+    assert!(engine.check_due(&id, Duration::from_secs(15 * 60)), "looked at again at once");
     engine.check(&id);
     eventually("the new look: b.txt waits for an OK", || view(&engine, &id).waiting.is_some_and(|waiting| waiting.items == 1));
 }
@@ -580,7 +581,7 @@ fn a_confirmed_sync_that_waited_for_another_computer_leaves_what_it_wrote_on_its
     assert!(nas.join("a.txt").exists() && !laptop.join("from-studio.txt").exists(), "only what the person confirmed");
     let row = view(&engine, &id);
     assert_ne!(row.status, JobStatus::InSync, "from-studio.txt still waits");
-    assert!(engine.check_due(&id, 15), "looked at again at once");
+    assert!(engine.check_due(&id, Duration::from_secs(15 * 60)), "looked at again at once");
     engine.check(&id);
     eventually("the new look: from-studio.txt waits for an OK", || view(&engine, &id).waiting.is_some_and(|waiting| waiting.items == 1));
 }
@@ -938,9 +939,11 @@ fn another_charons_sync_in_a_folder_inside_makes_the_job_wait() {
     let engine = plain_engine(&tmp.path().join("data"));
     let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
     write(&src.join("Work/plan.txt"), "plan");
-    // Another Charon syncs src/Work (reached on its computer under another name).
-    another_charons_note(&src.join("Work"), Some("studio-mac"));
     let id = add(&engine, job_setup("Everything", &src, &dst, SyncMode::Backup));
+    eventually("the first look", || !view(&engine, &id).looking);
+    // Another Charon syncs src/Work (reached on its computer under another name). It began
+    // after the first look, so only the list's look meets it.
+    another_charons_note(&src.join("Work"), Some("studio-mac"));
     let review = engine.prepare_review(&id).unwrap();
     engine.approve(&id, &review.review_id, true).unwrap();
     assert!(view(&engine, &id).confirmed);
@@ -1237,7 +1240,7 @@ fn changes_made_during_a_sync_have_the_folders_looked_at_once_it_is_done() {
     confirm(engine, &id);
     assert!(rig.hook_fired());
     assert_eq!(*heard.lock().unwrap(), vec![false, false], "kept for the sync's end");
-    assert!(engine.check_due(&id, 15), "the folders are looked at again at once");
+    assert!(engine.check_due(&id, Duration::from_secs(15 * 60)), "the folders are looked at again at once");
 
     // Right after it, the sync's own items are still told apart; anything else counts.
     assert!(!engine.note_change_while_syncing(&id, &src.join("a.txt")));
@@ -1252,7 +1255,7 @@ fn changes_made_during_a_sync_have_the_folders_looked_at_once_it_is_done() {
     let_progress_throttle_pass();
     confirm(engine, &id);
     assert!(rig.hook_fired());
-    assert!(!engine.check_due(&id, 15));
+    assert!(!engine.check_due(&id, Duration::from_secs(15 * 60)));
 }
 
 // ==================================================================== Charon itself can't work as it should

@@ -10,16 +10,20 @@
 //! * `checks.rs`   – background looks for changes, and reminders when changes wait
 //! * `status.rs`   – turning a job and its live state into the row the window shows
 //! * `runtime.rs`  – the live state of each job (running, progress, last look, review)
+//! * `reach.rs`    – questions to the disk about the jobs' folders, with a time limit
 //!
 //! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
 //! the same order, the stored state before the live state. Nothing that looks at a job's
 //! folders or tells the window happens while either is held (saving in the app's own data
 //! folder does: the state file, so a change counts only once it's saved, and what looks
-//! found missing, so two saves never come in the wrong order).
+//! found missing, so two saves never come in the wrong order). What the autopilot and the
+//! rows ask about the jobs' folders is asked with a time limit (see `reach.rs`), so a share
+//! that doesn't answer holds up neither the other jobs nor the window.
 
 mod checks;
 mod jobs;
 mod overlaps;
+pub(crate) mod reach;
 mod review;
 mod runs;
 mod runtime;
@@ -34,6 +38,9 @@ use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, 
 use crate::plan::Side;
 use crate::run::BusyWatch;
 use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
+pub(crate) use reach::{Presence, Whereabouts};
+use reach::Reach;
+pub(crate) use runtime::Moment;
 use runtime::{JobRuntime, Look, Missing};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -99,6 +106,8 @@ struct Inner {
     /// The busy notes of syncs at work in the folders, this Charon's own and others' (see
     /// `run::BusyWatch`).
     busy: Arc<BusyWatch>,
+    /// Asks the disk about the jobs' folders, with a time limit.
+    reach: Reach,
     /// When the last save of the state file failed, if it did (a full disk?): runs nobody
     /// looks at are refused until a save works again (see `can_save`), and a run the person
     /// starts fails before it changes anything. Its lock is taken last, and no other lock is
@@ -129,12 +138,13 @@ impl Engine {
         let state = state_file.load()?;
         let absences = Absences::new(folder.absences());
         // What looks found missing before this launch, and since when.
+        let launch = Moment::now();
         let runtime = state
             .jobs
             .iter()
             .map(|job| (job.id.clone(), absences.load(&job.id, &job.setup)))
             .filter(|(_, kept)| !kept.is_empty())
-            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept), ..JobRuntime::default() }))
+            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept, launch), ..JobRuntime::default() }))
             .collect();
         let legacy_seen = state_file.legacy_changed_at();
         let engine = Self {
@@ -152,6 +162,7 @@ impl Engine {
                 quitting: AtomicBool::new(false),
                 opened: Instant::now(),
                 busy: Arc::new(BusyWatch::open(&folder.instances())),
+                reach: Reach::new(reach::LIMIT),
                 cannot_save: Mutex::new(None),
                 legacy_seen,
                 older_charon: AtomicBool::new(false),
@@ -194,7 +205,7 @@ impl Engine {
             let snapshots: Vec<_> = state.jobs.iter().map(|job| self.snapshot(job, runtime.get(&job.id))).collect();
             (snapshots, state.settings.clone())
         };
-        snapshots.into_iter().map(|snapshot| self.view_of(snapshot, &settings)).collect()
+        self.views_of(snapshots, &settings)
     }
 
     /// One job as a row.

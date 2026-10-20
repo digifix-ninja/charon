@@ -2,11 +2,11 @@
 //! for their OK.
 
 use crate::engine::survey::{Purpose, Survey, INTERNAL_LOOK};
-use crate::engine::{Engine, EngineEvent};
+use crate::engine::{Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{Job, JobId, JobStatus, Trigger, WaitingJob};
 use crate::scan::{ExcludeFilter, Keys};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -114,10 +114,9 @@ impl Engine {
         self.publish(&job.id);
     }
 
-    /// Whether the last look is older than `minutes` (or there was none), and nothing is
+    /// Whether the last look is older than `interval` (or there was none), and nothing is
     /// looking or running now.
-    pub fn check_due(&self, id: &JobId, minutes: u32) -> bool {
-        let interval = Duration::from_secs(minutes.max(1) as u64 * 60);
+    pub fn check_due(&self, id: &JobId, interval: Duration) -> bool {
         self.runtime().get(id).is_none_or(|rt| {
             !rt.is_checking() && !rt.is_running() && rt.preparing.is_none() && rt.last_checked.is_none_or(|t| t.elapsed() >= interval)
         })
@@ -127,7 +126,7 @@ impl Engine {
     /// automatic run has tried them yet and ended before carrying anything. Removals that
     /// wait for an item to be missing a while longer don't count (see `Missing`).
     pub fn has_pending(&self, id: &JobId) -> bool {
-        let now = Utc::now();
+        let now = Moment::now();
         self.runtime().get(id).is_some_and(|rt| {
             rt.look.as_ref().is_some_and(|look| look.items > rt.missing.waiting(now) && rt.tried.is_none_or(|tried| look.at > tried))
         })
@@ -136,11 +135,11 @@ impl Engine {
     /// Whether removals a run left for later can be carried out now (see `Missing`): the job
     /// then syncs once more, whatever starts its syncs otherwise.
     pub fn take_follow_up(&self, id: &JobId) -> bool {
-        self.take_follow_up_at(id, Utc::now())
+        self.take_follow_up_at(id, Moment::now())
     }
 
-    /// `take_follow_up` at the time `now`.
-    pub(crate) fn take_follow_up_at(&self, id: &JobId, now: DateTime<Utc>) -> bool {
+    /// `take_follow_up` at the moment `now`.
+    pub(crate) fn take_follow_up_at(&self, id: &JobId, now: Moment) -> bool {
         if !self.runtime().get(id).is_some_and(|rt| rt.missing.follow_up_due(now)) {
             return false;
         }
@@ -274,14 +273,64 @@ impl Engine {
     /// A folder of the job came back (a drive plugged in again, a share reconnected). What
     /// the last look found, it found before: the row mustn't say "In sync" from then. The
     /// look is put aside, so is what a look still under way finds, and the job is looked
-    /// at again at once.
+    /// at again at once. A share that just came back may list a folder before it has loaded,
+    /// so the items found missing before have to be found missing again for a while before
+    /// a run nobody looks at follows them (see `Missing::look_again`).
     pub fn forget_look(&self, id: &JobId) {
         self.change_runtime(id, |rt| {
             rt.epoch += 1;
             rt.look = None;
             rt.tried = None;
             rt.last_checked = None;
+            rt.missing.look_again();
         });
+    }
+
+    /// Charon wasn't looking at the folders for a while (the computer slept, or the clock
+    /// on the wall jumped): the shares may have gone away and come back meanwhile, so the
+    /// items found missing on them have to be found missing again for a while before a run
+    /// nobody looks at follows them (see `Missing::look_again`).
+    pub fn after_a_gap(&self) {
+        for rt in self.runtime().values_mut() {
+            rt.missing.look_again();
+        }
+    }
+
+    /// A job whose last sync is dated later than now synced while the clock on the wall was
+    /// ahead, or the clock is behind now. How long ago it really synced can't be told, so the
+    /// sync counts as made now: the row's "Not synced for N days" then comes once the job
+    /// hasn't synced for days from here, not days after the clock reaches the old date (see
+    /// `stale`). The new date holds while Charon runs even when it can't be saved.
+    pub fn correct_syncs_dated_ahead(&self) {
+        let now = Utc::now();
+        let ahead: Vec<JobId> = self.state().jobs.iter().filter(|job| job.last_synced.is_some_and(|at| at > now)).map(|job| job.id.clone()).collect();
+        for id in ahead {
+            if let Err(e) = self.change_job_anyway(&id, |job| job.last_synced = job.last_synced.map(|at| at.min(now))) {
+                log::warn!("couldn't save when job {id} last synced: {e}");
+            }
+            self.publish(&id);
+        }
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    /// A run nobody looked at found `key` missing at `now` on the job's source, as if that
+    /// were a network share, and left its removal from the destination for later.
+    pub(crate) fn leave_a_removal_for_later(&self, id: &JobId, key: &str, now: Moment) {
+        use crate::plan::{Action, Plan, Side};
+        use crate::scan::{Entry, Snapshot, Volume};
+        let job = self.stored_job(id).unwrap();
+        let mut share = Snapshot::new();
+        share.facts_mut().volume = Some(Volume { network: true, ..Volume::of(&job.setup.source) });
+        let mine: Snapshot = [(key.to_string(), Entry::file(1, 1))].into_iter().collect();
+        let mut plan = Plan::default();
+        plan.push(Action::delete(Side::Destination, key, Entry::file(1, 1), None));
+        self.change_missing(&job, |missing| {
+            missing.note(&plan, &share, &mine, now);
+            missing.hold_back_recent(&mut plan, &share, &mine, now);
+        });
+        assert!(plan.actions.is_empty(), "the removal was carried out");
     }
 }
 
@@ -289,7 +338,7 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::engine::runs::Crossing;
-    use crate::model::{ConflictRule, JobSetup, ReviewKind, SyncMode};
+    use crate::model::{ConflictRule, JobSetup, ReviewKind, Settings, SyncMode};
     use std::fs;
     use std::sync::atomic::Ordering;
 
@@ -371,7 +420,7 @@ mod tests {
             assert!(rt.look.is_none() && !rt.is_checking());
             assert!(rt.last_checked.is_none(), "the next tick looks at the new setup");
         }
-        assert!(engine.check_due(&job.id, 15));
+        assert!(engine.check_due(&job.id, Settings::default().check_interval()));
     }
 
     #[test]
