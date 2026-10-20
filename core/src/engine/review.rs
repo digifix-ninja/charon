@@ -855,6 +855,7 @@ impl Look {
                 .collect()
         };
         let mut unreadable = places(&[NoteKind::Unreadable]);
+        let unreadable_count = unreadable.len() as u64;
         unreadable.truncate(crate::model::PLACES_SHOWN);
         let mut not_synced = places(&[NoteKind::LeftOut, NoteKind::NameClash, NoteKind::Blocked]);
         let not_synced_count = not_synced.len() as u64;
@@ -872,6 +873,7 @@ impl Look {
             replacements,
             conflicts,
             unreadable,
+            unreadable_count,
             not_synced,
             not_synced_count,
             volumes,

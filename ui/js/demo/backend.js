@@ -100,6 +100,7 @@ function job(id, fields) {
     progress: null,
     conflicts: [],
     unreadable: [],
+    unreadableCount: 0,
     notSynced: [],
     notSyncedCount: 0,
     problem: null,
@@ -432,6 +433,7 @@ export class DemoBackend {
     const places = checked && w.looked ? w.notes.filter(n => NOT_SYNCED.includes(n.kind) && n.side) : [];
     j.notSynced = places.slice(0, 100).map(({ kind, side, path, reason }) => ({ kind, side, path, reason, privacy: false }));
     j.notSyncedCount = places.length;
+    j.unreadableCount = j.unreadable.length;
     const failedRun = j.lastRun && !j.lastRun.cancelled && (j.lastRun.error || j.lastRun.failed > 0);
     j.status = this.timers.has(j.id) ? "syncing"
       : !this.online(j) ? "offline"

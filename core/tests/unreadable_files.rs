@@ -12,7 +12,7 @@
 
 #![cfg(unix)]
 
-use charon_core::model::{StepKind, SyncMode};
+use charon_core::model::{StepKind, SyncMode, PLACES_SHOWN};
 use charon_core::plan::{NoteKind, Side};
 use charon_core::{ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, Review, SyncStart, Trigger};
 use std::fs;
@@ -186,6 +186,44 @@ fn a_backup_leaves_out_a_file_it_cannot_read_and_never_turns_red() {
     let after = engine.prepare_review(&id).unwrap();
     assert!(after.notes.iter().all(|note| note.path != "Outlook Files/me.pst"), "{:?}", after.notes);
     assert!(steps_for(&after, "Outlook Files/me.pst").is_empty());
+}
+
+#[test]
+fn a_row_counts_every_place_it_cannot_read_although_it_lists_only_the_first_hundred() {
+    if !permissions_bite("a_row_counts_every_place_it_cannot_read_although_it_lists_only_the_first_hundred") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    // One folder more than a row lists, and a file only the copy finds it can't read.
+    let folder = |i: usize| src.join(format!("locked {i:03}"));
+    for i in 0..=PLACES_SHOWN {
+        write(&folder(i).join("a.txt"), "a");
+        chmod(&folder(i), 0o000);
+    }
+    write(&src.join("me.pst"), "mail");
+    chmod(&src.join("me.pst"), 0o000);
+    fs::create_dir_all(&dst).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::Backup)).unwrap().job.id;
+    let shown = |engine: &Engine| {
+        let view = engine.job(&id).unwrap();
+        (view.unreadable.len(), view.unreadable_count)
+    };
+
+    look(&engine, &id);
+    assert_eq!(shown(&engine), (PLACES_SHOWN, PLACES_SHOWN as u64 + 1));
+
+    // The sync finds the file; the row counts it, although its list is full.
+    confirm(&engine, &id);
+    assert_eq!(engine.job(&id).unwrap().job.last_run.unwrap().unreadable, PLACES_SHOWN as u64 + 2);
+    assert_eq!(shown(&engine), (PLACES_SHOWN, PLACES_SHOWN as u64 + 2));
+    look(&engine, &id);
+    assert_eq!(shown(&engine), (PLACES_SHOWN, PLACES_SHOWN as u64 + 2));
+
+    for i in 0..=PLACES_SHOWN {
+        chmod(&folder(i), 0o755);
+    }
 }
 
 #[test]

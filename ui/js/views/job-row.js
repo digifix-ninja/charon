@@ -142,10 +142,10 @@ export class JobRow {
       flags.push(html`<button class="flag review" data-action="review" title="Look at the list of changes">
         <span class="ico">${raw(Icons.review)}</span><span>${Format.waiting(job.waiting)}</span></button>`);
     }
-    if (job.unreadable?.length) {
-      const n = job.unreadable.length;
+    const unread = job.unreadableCount || job.unreadable?.length || 0;
+    if (unread) {
       flags.push(html`<button class="flag unreadable" data-action="unreadable" title="Show the places">
-        <span class="ico">${raw(Icons.warn)}</span><span>${n === 1 ? "1 place couldn't be read" : `${Format.count(n)} places couldn't be read`}</span></button>`);
+        <span class="ico">${raw(Icons.warn)}</span><span>${unread === 1 ? "1 place couldn't be read" : `${Format.count(unread)} places couldn't be read`}</span></button>`);
     }
     const missing = job.notSyncedCount || job.notSynced?.length || 0;
     if (missing) {
@@ -184,11 +184,12 @@ export class JobRow {
   static detail(job, tab, log, trashDays) {
     const tabs = [["activity", "Activity"], ["details", "Details"]];
     const missing = job.notSyncedCount || job.notSynced?.length || 0;
+    const unread = job.unreadableCount || job.unreadable?.length || 0;
     if (job.notSynced?.length) tabs.unshift(["not-synced", "Not synced", missing]);
-    if (job.unreadable?.length) tabs.unshift(["unreadable", "Couldn't read", job.unreadable.length]);
+    if (job.unreadable?.length) tabs.unshift(["unreadable", "Couldn't read", unread]);
     if (job.conflicts.length) tabs.unshift(["conflicts", "Conflicts", job.conflicts.length]);
     const body = tab === "conflicts" && job.conflicts.length ? JobRow.conflicts(job)
-      : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job)
+      : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job, unread)
       : tab === "not-synced" && job.notSynced?.length ? JobRow.notSynced(job, missing)
       : tab === "details" ? JobRow.facts(job, trashDays)
       : JobRow.log(log);
@@ -253,7 +254,8 @@ export class JobRow {
   }
 
   /** Places the last look couldn't read. Nothing in them is synced until they can be. */
-  static unreadable(job) {
+  static unreadable(job, total) {
+    const more = total - job.unreadable.length;
     return `<div class="place-list">
       <p class="tab-hint">Nothing in these places is synced until Charon can read them. This isn't an error: everything else crosses as usual.</p>
       ${job.unreadable.map((place, i) => html`
@@ -267,7 +269,8 @@ export class JobRow {
           ${raw(place.privacy ? '<button class="btn" data-action="privacy">Open Privacy settings</button>' : "")}
           <button class="btn" data-action="leave-out" data-list="unreadable" data-index="${i}">Leave this folder out</button>
         </div>
-      </div>`).join("")}</div>`;
+      </div>`).join("")}
+      ${more > 0 ? html`<p class="tab-hint">And ${Format.count(more)} more. The list of changes shows them all, under Notes.</p>` : ""}</div>`;
   }
 
   /**

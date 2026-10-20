@@ -960,6 +960,7 @@ impl Engine {
                 for place in unread {
                     if !look.unreadable.contains(&place) {
                         look.unreadable.push(place);
+                        look.unreadable_count += 1;
                     }
                 }
                 look.unreadable.truncate(PLACES_SHOWN);

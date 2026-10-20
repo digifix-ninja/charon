@@ -406,8 +406,10 @@ pub struct JobView {
     pub pending: Option<Pending>,
     pub progress: Option<Progress>,
     pub conflicts: Vec<ConflictItem>,
-    /// Places the last look couldn't read (at most `PLACES_SHOWN`).
+    /// Places the last look couldn't read (at most `PLACES_SHOWN`; `unreadable_count`
+    /// counts them all).
     pub unreadable: Vec<Place>,
+    pub unreadable_count: u64,
     /// Items the last look had to leave out, name clashes and blocked items: they aren't
     /// synced (at most `PLACES_SHOWN`; `not_synced_count` counts them all).
     pub not_synced: Vec<Place>,
@@ -623,6 +625,7 @@ mod tests {
             progress: None,
             conflicts: Vec::new(),
             unreadable: Vec::new(),
+            unreadable_count: 0,
             not_synced: Vec::new(),
             not_synced_count: 0,
             problem: None,
