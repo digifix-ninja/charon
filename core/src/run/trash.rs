@@ -24,6 +24,7 @@
 //! id>/`). Where that is too long for the drive, the item goes in under its own name at the
 //! top of the dated folder instead of failing on every sync.
 
+use crate::error::{Error, Result};
 use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
@@ -124,19 +125,21 @@ impl Trash {
     }
 
     /// Copies the file `root/relative` into the trash, leaving it where it is. On drives that
-    /// support it (APFS, Btrfs) the copy is a clone: instant, and it takes no room.
-    pub fn preserve(&self, root: &Path, relative: &str) -> io::Result<PathBuf> {
+    /// support it (APFS, Btrfs) the copy is a clone: instant, and it takes no room. When the
+    /// file can't be read, this fails as `Copier::unreadable` says. When the trash can't take
+    /// the copy (its folders, or the copy's place in it), it fails with that place in the
+    /// trash: that is never a file Charon couldn't read.
+    pub fn preserve(&self, root: &Path, relative: &str) -> Result<PathBuf> {
         let from = root.join(relative);
-        let base = self.dated(root)?;
+        let base = self.dated(root).map_err(|e| Error::file(root.join(TRASH_FOLDER).join(&self.folder), e))?;
         // Written under a temporary name at the top of the dated folder first: a half-written
         // copy never takes a name, and nothing already in the trash is ever written over.
         let temp = Copier::partial_in(&base);
         Self::copy_file(&from, &temp)?;
-        let kept = self.keep(root, &base, relative, |place| rename_new(&temp, place));
-        if kept.is_err() {
+        self.keep(root, &base, relative, |place| rename_new(&temp, place)).map_err(|e| {
             let _ = fs::remove_file(&temp);
-        }
-        kept
+            Error::file(base.join(relative), e)
+        })
     }
 
     /// Gives an item a place in the dated folder `base` of `root`'s trash with `make`, which
@@ -268,24 +271,58 @@ impl Trash {
         format!("{folder}{}", names::fit(name, &format!(" ({n})")))
     }
 
-    /// The contents, permissions and modification time of a regular file.
-    fn copy_file(from: &Path, to: &Path) -> io::Result<()> {
-        let meta = fs::symlink_metadata(from)?;
+    /// The contents, permissions and modification time of a regular file. Looking at the
+    /// file, opening it and copying it fail as `Copier::unreadable` says: the copy goes into
+    /// the folder this run just made, so a refusal there is about reading the file (another
+    /// program holds it, or part of it). What's left to do to the copy fails with its path.
+    fn copy_file(from: &Path, to: &Path) -> Result<()> {
+        let unreadable = |e| Copier::unreadable(from, e, 0);
+        let meta = fs::symlink_metadata(from).map_err(unreadable)?;
         if !meta.is_file() {
-            return Err(io::Error::other("only files are copied into the trash"));
+            return Err(Error::file(from, io::Error::other("only files are copied into the trash")));
         }
         // A file only in the cloud is refused rather than downloaded (see
         // `scan::Contents::open`); it stays open while it's copied.
-        let _reading = crate::scan::Contents::open(from)?;
-        // The copy must be on the drive before the original is replaced.
-        if let Err(e) = fs::copy(from, to).and_then(|_| Self::flush(to)) {
+        let _reading = crate::scan::Contents::open(from).map_err(unreadable)?;
+        if let Err(e) = fs::copy(from, to) {
             let _ = fs::remove_file(to);
-            return Err(e);
+            return Err(unreadable(e));
+        }
+        // The copy must be on the drive before the original is replaced.
+        if let Err(e) = Self::unlock(to).and_then(|()| Self::flush(to)) {
+            let _ = fs::remove_file(to);
+            return Err(Error::file(to, e));
         }
         let modified = filetime::FileTime::from_last_modification_time(&meta);
         if let Err(e) = filetime::set_file_mtime(to, modified) {
             log::debug!("couldn't keep the time of {} in the trash: {e}", from.display());
         }
+        Ok(())
+    }
+
+    /// A copy of a file locked in the Finder is locked too (macOS copies a file's flags
+    /// along): it could neither take its place in the trash nor ever be cleared out of it.
+    /// The copy's lock is lifted; the file itself keeps its own.
+    #[cfg(target_os = "macos")]
+    fn unlock(copy: &Path) -> io::Result<()> {
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+        let flags = fs::symlink_metadata(copy)?.st_flags();
+        let locks = libc::UF_IMMUTABLE | libc::UF_APPEND;
+        if flags & locks == 0 {
+            return Ok(());
+        }
+        let path = std::ffi::CString::new(copy.as_os_str().as_bytes())?;
+        // SAFETY: `path` is a valid NUL-terminated string that lives through the call.
+        if unsafe { libc::chflags(path.as_ptr(), flags & !locks) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Only macOS copies a file's lock along with it.
+    #[cfg(not(target_os = "macos"))]
+    fn unlock(_copy: &Path) -> io::Result<()> {
         Ok(())
     }
 
@@ -531,6 +568,31 @@ mod tests {
         assert_ne!(kept, again);
         let leftovers: Vec<_> = fs::read_dir(kept.parent().unwrap()).unwrap().flatten().filter(|i| is_partial(&i.file_name().to_string_lossy())).collect();
         assert!(leftovers.is_empty(), "no temporary copy is left behind");
+    }
+
+    /// macOS: a file locked in the Finder is kept in the trash like any other, and its copy
+    /// there carries no lock, so it can be cleared out later. The file keeps its own.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_locked_file_is_kept_in_the_trash_without_its_lock() {
+        use std::os::macos::fs::MetadataExt;
+        use std::os::unix::ffi::OsStrExt;
+        let lock = |path: &Path, flags: u32| {
+            let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            // SAFETY: `path` is a valid NUL-terminated string that lives through the call.
+            assert_eq!(unsafe { libc::chflags(path.as_ptr(), flags) }, 0);
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("locked.txt");
+        fs::write(&file, "locked").unwrap();
+        lock(&file, libc::UF_IMMUTABLE);
+        let kept = Trash::for_run(Local::now()).preserve(tmp.path(), "locked.txt");
+        assert_ne!(fs::symlink_metadata(&file).unwrap().st_flags() & libc::UF_IMMUTABLE, 0, "the file keeps its lock");
+        lock(&file, 0);
+        let kept = kept.unwrap();
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "locked");
+        assert_eq!(fs::symlink_metadata(&kept).unwrap().st_flags() & libc::UF_IMMUTABLE, 0);
+        fs::remove_file(&kept).unwrap();
     }
 
     #[test]

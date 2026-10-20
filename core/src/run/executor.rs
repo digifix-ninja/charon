@@ -1081,7 +1081,7 @@ impl<'a> Executor<'a> {
             Some(old) if keep_old && old.is_file() => {
                 // Keep a copy of the old version, then replace it in place (see `Trash`).
                 // The old version may be only in the cloud since the scan: then it's left alone.
-                let kept = match self.room_for_kept_copy(to, old.size, "the replaced version").and_then(|()| self.trash.preserve(root, &relative).map_err(|e| Copier::unreadable(&target, e, 0))) {
+                let kept = match self.room_for_kept_copy(to, old.size, "the replaced version").and_then(|()| self.trash.preserve(root, &relative)) {
                     Ok(kept) => kept,
                     Err(e) => {
                         Copier::discard(&partial);
@@ -1515,7 +1515,7 @@ impl<'a> Executor<'a> {
     /// it takes no room); elsewhere it needs room on the drive.
     fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
         self.room_for_kept_copy(side, planned.size, "the removed file")?;
-        let kept = self.trash.preserve(self.shores.root(side), relative).map_err(|e| Copier::unreadable(target, e, 0))?;
+        let kept = self.trash.preserve(self.shores.root(side), relative)?;
         self.touch(&kept);
         let removed = self.remove_checked(side, relative, target, planned);
         if !matches!(removed, Ok(true)) {

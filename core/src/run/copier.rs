@@ -609,7 +609,7 @@ mod tests {
         assert!(matches!(&result, Err(Error::Changed(why)) if why.contains("only in the cloud")), "{result:?}");
         // Nor is it downloaded to keep a copy of it in the trash.
         let trash = crate::run::Trash::for_run(chrono::Local::now());
-        assert!(trash.preserve(tmp.path(), "a.txt").is_err_and(|e| Contents::only_in_the_cloud(&e)));
+        assert!(matches!(trash.preserve(tmp.path(), "a.txt"), Err(Error::Changed(why)) if why.contains("only in the cloud")));
     }
 
     #[test]
