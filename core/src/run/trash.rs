@@ -321,7 +321,7 @@ impl Trash {
         let mut look = TrashLook::default();
         let Ok(trash) = Self::real_trash(root, false) else { return look };
         let Ok(items) = fs::read_dir(&trash) else { return look };
-        let cutoff = (days > 0).then(|| Local::now() - chrono::Duration::days(days as i64));
+        let cutoff = Self::cutoff(days);
         for item in items.flatten().filter(|item| item.file_type().is_ok_and(|t| t.is_dir())) {
             let Some(name) = item.file_name().to_str().map(str::to_owned) else { continue };
             let Some(stamp) = Self::parse_stamp(&name) else { continue };
@@ -419,16 +419,25 @@ impl Trash {
         contents
     }
 
+    /// Dated folders made before this are old enough to be cleared out when they're kept
+    /// for `days` (none when `days` is 0, which keeps everything).
+    fn cutoff(days: u32) -> Option<DateTime<Local>> {
+        (days > 0).then(|| Local::now() - chrono::Duration::days(days as i64))
+    }
+
     /// Permanently removes the dated folders `names` from `root`'s trash (those a review
-    /// listed). Anything else in the trash stays, and so does a folder in which something
-    /// changed since the review.
-    pub fn sweep(root: &Path, names: &[String]) {
+    /// listed) that are still older than `days`, the setting as it is now: a list can wait a
+    /// long time for another sync, and a setting changed meanwhile to keep more (or to keep
+    /// everything, 0) keeps them. Anything else in the trash stays, and so does a folder in
+    /// which something changed since the review.
+    pub fn sweep(root: &Path, names: &[String], days: u32) {
+        let Some(cutoff) = Self::cutoff(days) else { return };
         if names.is_empty() {
             return;
         }
         let Ok(trash) = Self::real_trash(root, false) else { return };
         for name in names {
-            let Some(stamp) = Self::parse_stamp(name) else { continue };
+            let Some(stamp) = Self::parse_stamp(name).filter(|stamp| *stamp < cutoff) else { continue };
             let folder = trash.join(name);
             // Only a real folder: remove_dir_all never follows links inside it either.
             if !fs::symlink_metadata(&folder).is_ok_and(|m| m.is_dir()) {
@@ -568,7 +577,7 @@ mod tests {
         fs::write(root.join("a.txt"), "x").unwrap();
         assert!(Trash::for_run(Local::now()).put(&root, "a.txt").is_err());
         assert!(Trash::look(&root, 1, true).expired.is_empty());
-        Trash::sweep(&root, &["2000-01-01_00-00-00".to_string()]);
+        Trash::sweep(&root, &["2000-01-01_00-00-00".to_string()], 1);
         assert!(elsewhere.join("2000-01-01_00-00-00/keep.txt").exists(), "sweeping never follows the link");
     }
 
@@ -586,7 +595,13 @@ mod tests {
         assert_eq!(look.expired, vec![Expired { name: "2000-01-01_00-00-00".into(), items: 1, bytes: 5 }]);
         assert!(look.revived.is_empty());
         assert!(Trash::look(tmp.path(), 0, false).expired.is_empty(), "0 keeps everything");
-        Trash::sweep(tmp.path(), &[look.expired[0].name.clone(), "not-a-stamp".into()]);
+        // The setting may have changed since the list was made: only what it allows now goes.
+        let named = [look.expired[0].name.clone(), "not-a-stamp".into()];
+        Trash::sweep(tmp.path(), &named, 0);
+        assert!(trash.join("2000-01-01_00-00-00").exists(), "0 keeps everything, even a folder a list named");
+        Trash::sweep(tmp.path(), &named, 365 * 100);
+        assert!(trash.join("2000-01-01_00-00-00").exists(), "kept for longer now");
+        Trash::sweep(tmp.path(), &named, 30);
         assert!(!trash.join("2000-01-01_00-00-00").exists());
         assert!(trash.join("not-a-stamp").exists());
         assert!(trash.join(fresh).exists());
@@ -615,7 +630,7 @@ mod tests {
         let look = Trash::look(tmp.path(), 30, false);
         assert!(look.expired.is_empty());
         assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{folder}/report.pages")]);
-        Trash::sweep(tmp.path(), std::slice::from_ref(&folder));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30);
         assert_eq!(fs::read_to_string(&kept).unwrap(), "the report, with this week's work");
     }
 

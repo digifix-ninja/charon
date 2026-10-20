@@ -17,19 +17,22 @@ use std::time::{Duration, Instant};
 pub(crate) struct JobRuntime {
     /// Set while a sync runs; setting it to true stops the run.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// The running sync is one nobody confirmed a list for (full automation): *Pause
+    /// everything* stops it.
+    pub unattended: bool,
     /// The person pressed Stop on the running sync (not Charon quitting).
     pub stopped_by_person: bool,
     /// Runs nobody looks at are refused until the person confirms a list (they stopped a
     /// sync, or a run was held back). Kept here too, in case the job's record couldn't be saved.
     pub must_ask: bool,
-    /// A run nobody looks at is due (full automation), and why. It starts as soon as nothing
-    /// stands in its way, so a trigger is never lost while another job uses the folders.
-    pub wanted: Option<String>,
+    /// A run nobody looks at is due (full automation). It starts as soon as nothing stands
+    /// in its way, so a trigger is never lost while another job uses the folders.
+    pub wanted: Option<Wanted>,
     /// The person confirmed the job's list while another sync used its folders: it starts
     /// as soon as that sync is done (see `Engine::start_confirmed`).
     pub confirmed: Option<Confirmed>,
-    /// The sync whose folders the wanted or confirmed run waits for: another job's name, or
-    /// another Charon.
+    /// The sync whose folders the confirmed run, or else the wanted run, waits for: another
+    /// job's name, or another Charon.
     pub waiting_for: Option<String>,
     /// Set while a review is being prepared; setting it to true stops that.
     pub preparing: Option<Arc<AtomicBool>>,
@@ -122,6 +125,16 @@ impl JobRuntime {
         waited
     }
 
+    /// Forgets the wanted run, if `which` says so. Returns the sync it waited for, if the
+    /// row said it waited. (What a confirmed list waits for stays: it's the list's.)
+    pub fn forget_wanted(&mut self, which: impl FnOnce(&Wanted) -> bool) -> Option<String> {
+        self.wanted.take_if(|wanted| which(wanted))?;
+        if self.confirmed.is_some() {
+            return None;
+        }
+        self.waiting_for.take()
+    }
+
     /// Forgets everything learned about the folders (the job's folders or mode changed).
     pub fn forget_folders(&mut self) {
         self.stop_looking();
@@ -139,6 +152,16 @@ impl JobRuntime {
         self.waiting_for = None;
         self.folders_inside.clear();
     }
+}
+
+/// A run nobody looks at that is due, until it starts.
+#[derive(Debug, Clone)]
+pub(crate) struct Wanted {
+    /// Why, for the log: "automatically after changes", "started with Sync all".
+    pub reason: String,
+    /// The person asked for it (Sync all, or Sync now that found another sync at work): it
+    /// still starts while the job or everything is paused, as a trigger's run doesn't.
+    pub by_hand: bool,
 }
 
 /// A list the person confirmed whose sync waits for another sync to finish.

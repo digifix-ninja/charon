@@ -10,7 +10,8 @@
 use charon_core::run::{BusyNote, BUSY_EXTENSION};
 use charon_core::store::DataFolder;
 use charon_core::{
-    Approval, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, JobView, Level, Phase, Review, SyncMode, SyncStart, Trigger,
+    Approval, Autopilot, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, JobView, Level, Phase, Review, SyncMode, SyncStart,
+    Trigger,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -522,6 +523,261 @@ fn a_confirmed_sync_waits_for_another_charon_and_starts_once_it_is_done() {
     assert!(!dst.join("b.txt").exists(), "only what the person confirmed");
     assert!(!row.confirmed && row.waiting_for.is_none());
     assert!(engine.log(&id, 20).iter().any(|line| line.text.contains("after waiting for another sync")));
+    // What changed while it waited isn't in it: the row doesn't say "In sync", and the
+    // folders are looked at again at once.
+    assert_ne!(row.status, JobStatus::InSync);
+    assert!(engine.check_due(&id, 15));
+}
+
+#[test]
+fn a_confirmed_sync_that_waited_leaves_newer_changes_on_its_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    let review = engine.prepare_review(&id).unwrap();
+    let note = another_charons_note(&dst, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+
+    // While it waits, a file turns up, and a look finds it along with the list's own.
+    write(&src.join("b.txt"), "b");
+    assert!(engine.note_change(&id, &src.join("b.txt")));
+    engine.check(&id);
+    eventually("the look during the wait", || view(&engine, &id).pending.is_some_and(|pending| pending.items == 2));
+
+    // The other sync ends, and the list the person confirmed is carried out.
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(dst.join("a.txt").exists() && !dst.join("b.txt").exists(), "only what the person confirmed");
+    let row = view(&engine, &id);
+    assert_ne!(row.status, JobStatus::InSync, "b.txt still waits");
+    assert!(engine.check_due(&id, 15), "looked at again at once");
+    engine.check(&id);
+    eventually("the new look: b.txt waits for an OK", || view(&engine, &id).waiting.is_some_and(|waiting| waiting.items == 1));
+}
+
+#[test]
+fn a_confirmed_sync_keeps_saying_what_it_waits_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    let mut setup = job_setup("Photos", &src, &dst, SyncMode::Backup);
+    setup.full_automation = true;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+    write(&src.join("b.txt"), "b");
+    let review = engine.prepare_review(&id).unwrap();
+    let note = another_charons_note(&dst, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+    let waits = |engine: &Engine| {
+        let row = view(engine, &id);
+        row.confirmed && row.waiting_for.as_deref() == Some("Charon on studio-mac")
+    };
+
+    // A trigger fires meanwhile: its run is refused for the confirmed list, which still says
+    // what it waits for.
+    engine.want(&id, "after changes");
+    engine.start_wanted(&id);
+    assert!(!engine.is_running(&id) && waits(&engine));
+
+    // The autopilot goes round a few times (it tries the list again every 5 seconds): the
+    // row says what the list waits for all along.
+    Autopilot::start(engine.clone());
+    let until = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < until {
+        assert!(waits(&engine), "the row lost what the confirmed list waits for");
+        thread::sleep(Duration::from_millis(50));
+    }
+    fs::remove_file(note).unwrap();
+    eventually("the confirmed sync ran", || dst.join("b.txt").exists() && !engine.is_running(&id));
+    engine.shut_down(Duration::from_secs(10));
+}
+
+#[test]
+fn sync_all_leaves_out_a_job_whose_confirmed_list_waits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    let review = engine.prepare_review(&id).unwrap();
+    let note = another_charons_note(&dst, None);
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+
+    // It needs no OK: it's on its way.
+    assert!(engine.sync_all().is_empty());
+    assert!(view(&engine, &id).confirmed);
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(dst.join("a.txt").exists());
+}
+
+#[test]
+fn every_way_a_waiting_confirmed_sync_is_called_off_says_so_in_the_log() {
+    use charon_core::plan::Side;
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    write(&src.join("Drafts/b.txt"), "b");
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    // The person confirms the list while another Charon syncs the destination.
+    let confirm_while_busy = || {
+        let review = engine.prepare_review(&id).unwrap();
+        let note = another_charons_note(&dst, None);
+        assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+        note
+    };
+    let called_off = |why: &str| {
+        let row = view(&engine, &id);
+        assert!(!row.confirmed && row.waiting_for.is_none(), "{why}: the row no longer says it waits");
+        assert!(engine.log(&id, 1).first().is_some_and(|line| line.text == format!("the confirmed sync that waited for another sync was called off ({why})")), "{:?}", engine.log(&id, 3));
+    };
+
+    // Editing the job, even only its name.
+    let note = confirm_while_busy();
+    let mut setup = view(&engine, &id).job.setup;
+    setup.name = "Pictures".into();
+    engine.update_job(&id, setup).unwrap();
+    called_off("the job was edited");
+    fs::remove_file(note).unwrap();
+
+    // Leaving a place out.
+    let note = confirm_while_busy();
+    engine.leave_out(&id, Side::Source, "Drafts").unwrap();
+    called_off("a place was left out");
+    fs::remove_file(note).unwrap();
+
+    // A newer list.
+    let note = confirm_while_busy();
+    fs::remove_file(note).unwrap();
+    engine.prepare_review(&id).unwrap();
+    called_off("a newer list took its place");
+
+    // Quitting.
+    let note = another_charons_note(&dst, None);
+    let review = engine.prepare_review(&id);
+    assert!(review.is_err(), "no list while another Charon syncs");
+    fs::remove_file(note).unwrap();
+    let _note = confirm_while_busy();
+    engine.shut_down(Duration::from_secs(10));
+    called_off("Charon quit");
+    assert!(!engine.start_confirmed(&id) && !dst.join("a.txt").exists(), "nothing ran");
+}
+
+#[test]
+fn a_confirmed_sync_that_waited_empties_no_more_old_trash_than_the_setting_allows_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("a.txt"), "a");
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    // Dated folders in the destination's trash, from syncs 40 and 100 days ago.
+    let trash_of = |days: i64| {
+        let made = chrono::Local::now() - chrono::Duration::days(days);
+        let folder = dst.join(".charon-trash").join(made.format("%Y-%m-%d_%H-%M-%S").to_string());
+        write(&folder.join("old.txt"), "an old version");
+        filetime::set_file_mtime(folder.join("old.txt"), filetime::FileTime::from_system_time(made.into())).unwrap();
+        folder
+    };
+    let (forty, hundred) = (trash_of(40), trash_of(100));
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.housekeeping.iter().any(|line| line.starts_with("Also empties 2 items older than 30 days")), "{:?}", review.housekeeping);
+
+    // Confirmed while another Charon syncs; meanwhile the person keeps deleted files longer.
+    let note = another_charons_note(&dst, None);
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+    let mut settings = engine.settings();
+    settings.trash_days = 60;
+    engine.set_settings(settings).unwrap();
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(dst.join("a.txt").exists());
+    assert!(!hundred.exists(), "named in the list, and older than the setting allows now");
+    assert!(forty.join("old.txt").exists(), "the setting keeps it now");
+}
+
+#[test]
+fn sync_all_under_pause_everything_starts_a_job_that_waited_for_its_neighbour() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let (photos, nas, usb) = (tmp.path().join("Photos"), tmp.path().join("NAS/Photos"), tmp.path().join("USB/Photos"));
+    write(&photos.join("a.jpg"), "a");
+    let mut jobs = Vec::new();
+    for (name, to, mode) in [("One", &nas, SyncMode::TwoWay), ("Two", &usb, SyncMode::Backup)] {
+        let mut setup = job_setup(name, &photos, to, mode);
+        setup.full_automation = true;
+        let id = add(engine, setup);
+        confirm(engine, &id);
+        jobs.push(id);
+    }
+    let (one, two) = (jobs[0].clone(), jobs[1].clone());
+    write(&photos.join("b.jpg"), "b");
+    engine.set_all_paused(true).unwrap();
+
+    // Sync all: "One" starts and is held at its first step, "Two" waits for it.
+    let (release, released) = mpsc::channel::<()>();
+    let (arrived, at_first_step) = mpsc::channel::<()>();
+    rig.at_first_step(move || {
+        arrived.send(()).unwrap();
+        let _ = released.recv_timeout(DEADLINE);
+    });
+    let_progress_throttle_pass();
+    assert!(engine.sync_all().is_empty(), "both run by themselves");
+    at_first_step.recv_timeout(DEADLINE).expect("the first job's sync reached its first step");
+    assert_eq!(view(engine, &two).waiting_for.as_deref(), Some("One"));
+
+    // The autopilot goes round while everything is paused: the person asked for this sync,
+    // so it still waits, and starts once "One" is done.
+    Autopilot::start(engine.clone());
+    thread::sleep(Duration::from_secs(5));
+    assert_eq!(view(engine, &two).waiting_for.as_deref(), Some("One"), "still waiting");
+    release.send(()).unwrap();
+    eventually("“Two” synced", || usb.join("b.jpg").exists() && !engine.is_running(&two));
+    assert!(view(engine, &two).job.last_run.is_some_and(|run| !run.approved && run.error.is_none()));
+    assert!(engine.log(&two, 20).iter().any(|line| line.text.starts_with("sync started with Sync all")));
+    assert!(!engine.is_running(&one));
+    engine.shut_down(Duration::from_secs(10));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_confirmed_list_for_a_folder_on_another_drive_starts_once_another_charon_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst, first_drive) = (tmp.path().join("src"), tmp.path().join("Backup"), tmp.path().join("first-drive"));
+    write(&src.join("a.txt"), "a");
+    fs::create_dir_all(&first_drive).unwrap();
+    std::os::unix::fs::symlink(&first_drive, &dst).unwrap();
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    confirm(&engine, &id);
+
+    // The backup now goes to a new disk under the same name (tmpfs plays it).
+    let new_drive = tempfile::tempdir_in("/dev/shm").unwrap();
+    fs::remove_file(&dst).unwrap();
+    std::os::unix::fs::symlink(new_drive.path(), &dst).unwrap();
+    write(&src.join("b.txt"), "b");
+    let row = view(&engine, &id);
+    assert_eq!(row.status, JobStatus::Offline, "on another drive than at the last sync");
+
+    // The person looks at the list, sees the warning, and confirms it while another Charon
+    // syncs the source.
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.blocked.is_none() && review.needs_tick, "{:?}", review.warnings);
+    let note = another_charons_note(&src, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+
+    Autopilot::start(engine.clone());
+    fs::remove_file(note).unwrap();
+    eventually("the confirmed sync ran", || new_drive.path().join("b.txt").exists() && !engine.is_running(&id));
+    assert!(view(&engine, &id).job.last_run.is_some_and(|run| run.approved && run.error.is_none()));
+    engine.shut_down(Duration::from_secs(10));
 }
 
 #[test]

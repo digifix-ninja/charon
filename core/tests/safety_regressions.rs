@@ -858,6 +858,93 @@ fn pause_everything_stops_every_automatic_sync() {
     engine.shut_down(Duration::from_secs(10));
 }
 
+#[test]
+fn pause_everything_stops_an_automatic_sync_that_is_still_looking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("first.txt"), "first");
+    // Everything is paused the moment the run's look has counted its first items (it says
+    // so every few hundred).
+    let pause: Arc<Mutex<Option<Hook>>> = Arc::default();
+    let paused = Arc::new(AtomicBool::new(false));
+    let (slot, flag) = (pause.clone(), paused.clone());
+    let emitter = Arc::new(move |event: EngineEvent| {
+        if matches!(event, EngineEvent::ScanProgress { .. }) {
+            // Taken out first: pausing sends events of its own.
+            let armed = slot.lock().unwrap().take();
+            if let Some(pause) = armed {
+                pause();
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
+    });
+    let engine = Engine::open(&data, emitter).expect("the engine opens");
+    let mut setup = job_setup(&src, &dst, SyncMode::Mirror);
+    setup.full_automation = true;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+    for n in 0..600 {
+        write(&src.join(format!("new-{n}.txt")), "new");
+    }
+    write(&dst.join("precious.txt"), "only here");
+    let (before, last_run) = (tree(&dst), view(&engine, &id).job.last_run);
+    let pauser = engine.clone();
+    *pause.lock().unwrap() = Some(Box::new(move || pauser.set_all_paused(true).unwrap()));
+
+    engine.want(&id, "after changes");
+    engine.start_wanted(&id);
+    wait_idle(&engine, &id);
+    assert!(paused.load(Ordering::SeqCst), "everything was paused while the run looked");
+    let job = view(&engine, &id);
+    let run = job.job.last_run.clone().expect("the run ended");
+    assert_ne!(Some(&run), last_run.as_ref(), "the run began before the pause");
+    assert!(run.cancelled && !run.approved, "the run stopped: {run:?}");
+    assert_eq!(tree(&dst), before, "nothing changed in the destination");
+    assert!(job.job.needs_review && !job.runs_by_itself, "the next sync waits for an OK");
+    let log = engine.log(&id, 20);
+    assert!(log.iter().any(|line| line.text == "everything paused: this sync stops, since you didn't confirm its list"), "{log:?}");
+    engine.shut_down(Duration::from_secs(10));
+}
+
+#[test]
+fn a_trigger_never_starts_a_sync_once_the_job_or_everything_is_paused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("first.txt"), "first");
+    let engine = plain_engine(&data);
+    let mut setup = job_setup(&src, &dst, SyncMode::Backup);
+    setup.full_automation = true;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+    write(&src.join("new.txt"), "new");
+    let last_run = view(&engine, &id).job.last_run;
+
+    // The autopilot reads the jobs once a tick: a trigger it saw before the pause still
+    // asks for a run after it, which doesn't begin.
+    for everything in [false, true] {
+        if everything {
+            engine.set_all_paused(true).unwrap();
+        } else {
+            engine.set_paused(&id, true).unwrap();
+        }
+        engine.want(&id, "after changes");
+        engine.start_wanted(&id);
+        assert!(!engine.is_running(&id), "no sync began (everything paused: {everything})");
+        assert_eq!(view(&engine, &id).job.last_run, last_run);
+        assert!(!dst.join("new.txt").exists());
+        engine.set_paused(&id, false).unwrap();
+        engine.set_all_paused(false).unwrap();
+    }
+
+    // Sync now still starts it, paused or not: the person asked for it.
+    engine.set_paused(&id, true).unwrap();
+    engine.set_all_paused(true).unwrap();
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait_idle(&engine, &id);
+    assert_eq!(read(&dst.join("new.txt")), "new");
+    engine.shut_down(Duration::from_secs(10));
+}
+
 // ------------------------------------------------------------------ probe 5: editing a running job
 
 #[test]
