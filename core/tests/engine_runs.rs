@@ -1025,3 +1025,62 @@ fn the_first_list_after_charon_0_2_says_which_items_come_back() {
     assert!(warning.text.contains("“Photos”") && warning.text.contains("“b.txt”") && !warning.text.contains("x.jpg"), "{}", warning.text);
     assert_eq!(warning.text.matches("afresh").count(), 1, "said once: {}", warning.text);
 }
+
+/// Settling one conflict of that first list leaves Charon 0.2's record as it is: the lists
+/// after it still say why they remove nothing, and which items most likely were removed.
+#[test]
+fn settling_a_conflict_after_charon_0_2_keeps_saying_which_items_come_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    for side in [&src, &dst] {
+        write(&side.join("gone.txt"), "g");
+        write(&side.join("plan.txt"), "first");
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    let item = r#"{"kind":"file","size":1,"modified":10000}"#;
+    fs::write(data.join("baselines").join(format!("{id}.json")), format!(r#"{{"gone.txt":{item},"plan.txt":{item}}}"#)).unwrap();
+    // Since then the person removed gone.txt on the destination, and edited plan.txt on both sides.
+    fs::remove_file(dst.join("gone.txt")).unwrap();
+    write(&src.join("plan.txt"), "edited on the source");
+    write(&dst.join("plan.txt"), "edited on the destination");
+    let review = engine.prepare_review(&id).unwrap();
+    engine.discard_review(&id, &review.review_id);
+
+    let conflict = engine.job(&id).unwrap().conflicts[0].clone();
+    let settle = engine.prepare_resolution(&id, &conflict, ConflictChoice::KeepSource).unwrap();
+    assert!(settle.warnings.iter().any(|w| w.text.contains("no memory of the last sync that it can trust")), "{:?}", settle.warnings);
+    engine.approve(&id, &settle.review_id, false).unwrap();
+    wait(&engine, &id);
+    assert_eq!(fs::read_to_string(dst.join("plan.txt")).unwrap(), "edited on the source");
+
+    let next = engine.prepare_review(&id).unwrap();
+    assert!(next.steps.iter().all(|step| step.kind != StepKind::Remove), "nothing is removed: {:?}", next.steps);
+    let warning = next.warnings.iter().find(|w| w.text.contains("older version of Charon")).expect("the list still says why");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("so it was most likely removed since: “gone.txt”."), "{}", warning.text);
+    assert!(!next.warnings.iter().any(|w| w.text.contains("first two-way sync")), "{:?}", next.warnings);
+}
+
+/// A job whose memory of the last sync is gone isn't syncing its folders for the first
+/// time: its list says that it compares them afresh, and that what was removed comes back.
+#[test]
+fn a_job_that_lost_its_memory_never_calls_its_list_the_first_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("gone.txt"), "g");
+    fs::create_dir_all(&dst).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    fs::remove_file(data.join("baselines").join(format!("{id}.json"))).unwrap();
+    fs::remove_file(dst.join("gone.txt")).unwrap();
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.new_files, 1, "gone.txt comes back: {:?}", review.steps);
+    let warning = review.warnings.iter().find(|w| w.text.contains("no memory of this job's last sync")).expect("the list says why");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("removed since the last sync may come back"), "{}", warning.text);
+    assert!(!review.warnings.iter().any(|w| w.text.contains("first two-way sync")), "{:?}", review.warnings);
+}

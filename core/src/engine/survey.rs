@@ -214,7 +214,8 @@ pub(crate) struct Survey {
     /// The job's markers in both folders, read before the scans. A sync records nothing
     /// unless they are still the same when it's done.
     pub markers: Markers,
-    /// Two-way: the memory as loaded (trusted or not).
+    /// Two-way: the memory as loaded, with the reason this look couldn't trust it, if it
+    /// couldn't (see `Engine::distrust`).
     pub memory: Option<Memory>,
     /// Two-way: the plan was made with the stored memory.
     pub trusted: bool,
@@ -346,9 +347,9 @@ impl Engine {
             let memory = self.inner.baselines.load(&job.id, &setup);
             match self.distrust(job, &memory, folded, &markers) {
                 Some(reason) => {
-                    afresh = Some(reason);
+                    afresh = Some(reason.clone());
                     guide = Guide::of(&memory, folded, true);
-                    (Some(memory), false, Baseline::new())
+                    (Some(Memory { distrust: Some(reason), ..memory }), false, Baseline::new())
                 }
                 None if memory.tokens.is_none() => {
                     warnings.push(Warning::info(format!(
@@ -764,8 +765,11 @@ impl Engine {
         if job.run_in_progress {
             return Some("The last sync of this job didn't finish properly (Charon was closed, the computer stopped, or a drive went away).".into());
         }
-        // No memory yet (nothing to trust or distrust): nothing is removed.
-        memory.tokens.as_ref()?;
+        // No memory: nothing to trust or distrust before the first sync of these folders
+        // (nothing is removed). After one (it has a record of their drives), it was lost.
+        if memory.tokens.is_none() {
+            return (job.last_synced.is_some() && job.drives.is_some()).then(|| "Charon has no memory of this job's last sync.".into());
+        }
         if memory.folded != folded {
             let guessed = job.drives.as_ref().is_some_and(|drives| drives.source.case_guessed || drives.destination.case_guessed);
             return Some(if guessed {

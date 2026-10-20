@@ -367,10 +367,10 @@ impl Engine {
         survey.housekeeping = Default::default();
         // What's said about the drives themselves still holds (another drive, a missing marker).
         survey.warnings.retain(|warning| warning.level == Level::Danger);
-        if !survey.trusted && survey.memory.as_ref().is_some_and(|memory| memory.tokens.is_some()) {
-            survey.warnings.push(Warning::caution(
-                "Charon doesn't trust its memory of the last sync right now, so settling this item lets go of that memory. \
-                 Until you confirm a whole list of this job's changes, Charon compares both folders afresh and removes nothing.",
+        if survey.memory.as_ref().is_some_and(|memory| memory.distrust.is_some()) {
+            survey.warnings.push(Warning::info(
+                "Charon has no memory of the last sync that it can trust right now, and settling this item doesn't change that: \
+                 until you confirm a whole list of this job's changes, it compares both folders afresh and removes nothing.",
             ));
         }
         survey.warnings.push(Warning::info(
