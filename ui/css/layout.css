@@ -51,6 +51,10 @@
 
 .actions { display: flex; align-items: center; gap: 6px; }
 
+/* What keeps Charon itself from syncing, above the tiles */
+.app-problem { margin: 0 22px; }
+.app-problem .notice { margin-top: 18px; user-select: text; -webkit-user-select: text; }
+
 /* ---------------------------------------------------------------- stats */
 
 .stats {

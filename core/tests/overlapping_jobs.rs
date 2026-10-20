@@ -10,7 +10,7 @@
 use charon_core::run::{BusyNote, BUSY_EXTENSION};
 use charon_core::store::DataFolder;
 use charon_core::{
-    Approval, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobView, Level, Phase, Review, SyncMode, SyncStart, Trigger,
+    Approval, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, JobView, Level, Phase, Review, SyncMode, SyncStart, Trigger,
 };
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -429,6 +429,9 @@ fn a_confirmed_sync_waits_for_another_charon_and_starts_once_it_is_done() {
     let row = view(&engine, &id);
     assert!(row.confirmed && !engine.is_running(&id));
     assert_eq!(row.waiting_for.as_deref(), Some("Charon on studio-mac"));
+    assert!(row.waiting.is_none() && row.pending.is_some(), "it no longer waits for an OK, only for the other sync");
+    assert_eq!(row.status, JobStatus::Pending, "never “New” or “Review” once confirmed");
+    assert_eq!(engine.overview().waiting, 0);
     assert!(!engine.start_confirmed(&id), "still busy");
     assert!(!dst.join("a.txt").exists());
 

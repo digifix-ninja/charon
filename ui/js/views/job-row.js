@@ -41,13 +41,22 @@ export class JobRow {
             </div>
             ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job))}
             ${raw(JobRow.flags(job))}
-            ${raw(job.waitingFor ? html`<div class="waits-for"><span class="ico">${raw(Icons.pause)}</span>Waits for “${job.waitingFor}” to finish syncing, then starts by itself</div>` : "")}
+            ${raw(JobRow.waitsFor(job))}
             ${raw(job.stale ? html`<div class="stale"><span class="ico">${raw(Icons.warn)}</span>${job.stale}</div>` : "")}
           </div>
           ${raw(JobRow.actions(job))}
         </div>
         <div class="detail"><div class="inner">${raw(open ? JobRow.detail(job, tab, log, trashDays) : "")}</div></div>
       </article>`;
+  }
+
+  /** A sync that's due, or that the person confirmed, waiting for another sync of its folders. */
+  static waitsFor(job) {
+    if (!job.waitingFor) return "";
+    const text = job.confirmed
+      ? `Confirmed: starts as soon as “${job.waitingFor}” finishes syncing (Stop calls it off)`
+      : `Waits for “${job.waitingFor}” to finish syncing, then starts by itself`;
+    return html`<div class="waits-for"><span class="ico">${raw(Icons.pause)}</span>${text}</div>`;
   }
 
   /** One folder, and the drive it's on when known: "on Backup SSD (exFAT)". */
@@ -85,7 +94,7 @@ export class JobRow {
         parts.push("Not synced yet", "Nothing crosses until you confirm the list");
         break;
       case "review":
-        if (!job.waiting) parts.push(html`<span class="warn">The next sync waits for your OK</span>`);
+        if (!job.waiting && !job.confirmed) parts.push(html`<span class="warn">The next sync waits for your OK</span>`);
         parts.push(job.looking ? "Looking for changes…" : synced);
         break;
       case "looking":
@@ -153,6 +162,8 @@ export class JobRow {
     let main;
     if (running) {
       main = html`<button class="btn row-main" data-action="main"><span class="ico">${raw(Icons.stop)}</span>Stop</button>`;
+    } else if (job.confirmed) {
+      main = html`<button class="btn row-main" data-action="main" title="Call off the sync you confirmed"><span class="ico">${raw(Icons.stop)}</span>Stop</button>`;
     } else if (job.runsByItself && !job.waiting) {
       main = html`<button class="btn row-main" data-action="main" ${offline ? "disabled" : ""}><span class="ico">${raw(Icons.play)}</span>Sync now</button>`;
     } else {

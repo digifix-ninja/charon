@@ -111,7 +111,7 @@ html, body {
 
 body {
   display: grid;
-  grid-template-rows: auto auto auto 1fr;
+  grid-template-rows: auto auto auto auto 1fr;
   grid-template-columns: minmax(0, 1fr); /* never wider than the window, whatever the title bar holds */
 }
 

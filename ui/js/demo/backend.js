@@ -103,6 +103,7 @@ function job(id, fields) {
     nextRun: null,
     stale: null,
     waitingFor: null,
+    confirmed: false,
     ...fields,
   };
 }
@@ -384,6 +385,7 @@ export class DemoBackend {
       looking: count("looking"),
       incomplete: this.jobs.filter(j => j.unreadable.length || j.notSyncedCount > 0).length,
       pausedAll: this.settings.pausedAll,
+      problem: null,
     };
   }
 
@@ -658,7 +660,7 @@ export class DemoBackend {
       this.log(j, `you confirmed ${entry.steps.length} changes`);
       this.sync(j, entry.steps.filter(s => s.kind !== "conflict"), { approved: true });
     }
-    return null;
+    return { kind: "started" };
   }
 
   // ---------------------------------------------------------------- syncing

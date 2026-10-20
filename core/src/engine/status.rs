@@ -72,7 +72,11 @@ impl Engine {
         let runs_by_itself = job.runs_by_itself() && !must_ask;
 
         let work = look.as_ref().filter(|look| look.items > 0);
+        // A list the person confirmed no longer waits for an OK, only for another sync to end:
+        // its changes are queued (and the row says what it waits for).
+        let confirmed = confirmed && !running;
         let waiting = match (work, &job.held) {
+            _ if confirmed => None,
             (Some(look), held) if !runs_by_itself || held.is_some() => Some(Waiting {
                 items: look.items,
                 bytes: look.bytes,
@@ -130,7 +134,7 @@ impl Engine {
             JobStatus::Error
         } else if waiting.is_some() {
             JobStatus::Review
-        } else if job.last_synced.is_none() {
+        } else if job.last_synced.is_none() && !confirmed {
             JobStatus::New
         } else if pending.is_some() {
             JobStatus::Pending
@@ -184,7 +188,7 @@ impl Engine {
             next_run,
             stale,
             waiting_for: if running { None } else { waiting_for },
-            confirmed: confirmed && !running,
+            confirmed,
             job,
         }
     }

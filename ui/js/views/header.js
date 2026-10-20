@@ -3,6 +3,7 @@
 import { Dom } from "../dom.js";
 import { GROUPS, needsYou } from "../store.js";
 import { Counter } from "../effects/counter.js";
+import { Icons } from "../icons.js";
 
 const TONES = {
   syncing: "var(--syncing)",
@@ -19,6 +20,7 @@ export class Header {
   constructor(store, { pickGroup }) {
     this.store = store;
     this.headline = Dom.$("#headline");
+    this.problem = Dom.$("#app-problem");
     this.pauseButton = Dom.$("#btn-pause-all");
     this.stats = Dom.$("#stats");
     this.buildTiles();
@@ -42,6 +44,10 @@ export class Header {
     const o = this.facts(overview);
     this.headline.querySelector(".text").textContent = this.describe(o);
     this.headline.style.setProperty("--tone", TONES[this.mood(o)]);
+    // What keeps Charon itself from syncing, in full, under the title bar.
+    this.problem.innerHTML = o.problem
+      ? Dom.html`<div class="notice danger"><span class="ico">${Dom.raw(Icons.warn)}</span><span>${o.problem}</span></div>`
+      : "";
 
     const paused = o.pausedAll;
     this.pauseButton.classList.toggle("on", paused);
@@ -75,6 +81,7 @@ export class Header {
   }
 
   mood(o) {
+    if (o.problem) return "attention";
     if (o.jobs === 0) return "empty";
     if (o.syncing) return "syncing";
     if (o.attention) return "attention";
@@ -89,6 +96,7 @@ export class Header {
   describe(o) {
     const waits = o.waiting === 1 ? "1 job waits for your OK" : `${o.waiting} jobs wait for your OK`;
     const need = `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
+    if (o.problem) return "Charon needs your attention";
     if (o.jobs === 0) return "No crossings yet. Create your first sync job.";
     if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing${o.waiting ? ` · ${waits}` : ""}`;
     if (o.attention) return o.waiting ? `${need} · ${waits}` : need;

@@ -115,9 +115,9 @@ class App {
     if (result === "review") this.review.show(id);
   }
 
-  /** The row's main button: Stop, Sync now, or Review and sync. */
+  /** The row's main button: Stop (a sync, or a confirmed one that waits), Sync now, or Review and sync. */
   mainAction(job) {
-    if (job.status === "syncing") return this.run(() => Api.cancel(job.id));
+    if (job.status === "syncing" || job.confirmed) return this.run(() => Api.cancel(job.id));
     if (job.runsByItself && !job.waiting) return this.syncNow(job.id);
     return this.review.show(job.id);
   }

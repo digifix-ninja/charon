@@ -608,17 +608,23 @@ export class ReviewDialog extends Overlay {
 
   // ---------------------------------------------------------------- acting
 
-  /** Starts the sync of exactly this list. A refusal is shown here, never after closing. */
+  /**
+   * Starts the sync of exactly this list, or, while another sync works in the job's folders,
+   * leaves it to start by itself once that sync is done. A refusal is shown here, never after
+   * closing.
+   */
   async approve() {
     const s = this.state;
     const review = s.review;
     s.phase = "approving";
     this.renderFooter();
     try {
-      await Api.approve(review.jobId, review.reviewId, Boolean(s.ticked));
+      const approval = await Api.approve(review.jobId, review.reviewId, Boolean(s.ticked));
       if (this.state !== s) return;
       this.finish("confirmed");
-      this.toast.show(`Syncing “${review.jobName}”…`);
+      this.toast.show(approval?.kind === "waiting"
+        ? `Confirmed. “${review.jobName}” syncs as soon as “${approval.waitingFor}” is done.`
+        : `Syncing “${review.jobName}”…`);
     } catch (error) {
       if (this.state !== s || s.review !== review) return;
       s.phase = "ready";
