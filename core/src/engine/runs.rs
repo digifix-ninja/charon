@@ -606,7 +606,7 @@ impl Engine {
                 return Err(fail(format!("couldn't leave its marker in the {} ({e})", side.word())));
             }
         }
-        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None };
+        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default() };
         self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
     }
 

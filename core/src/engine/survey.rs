@@ -285,17 +285,15 @@ impl Engine {
             _ => {}
         }
 
-        // Two-way: what Charon remembers of the last sync, if it can be trusted.
+        // Two-way: what Charon remembers of the last sync, if it can be trusted. Where it
+        // can't, both folders are compared afresh this time, and the list says why once the
+        // plan shows what that brings back.
+        let mut afresh = None;
         let (memory, trusted, mut baseline) = if setup.mode.is_two_way() {
             let memory = self.inner.baselines.load(&job.id, &setup);
             match self.distrust(job, &memory, folded, &markers) {
                 Some(reason) => {
-                    let text = format!(
-                        "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and {}.",
-                        Self::differing_files(setup.conflict)
-                    );
-                    holds.push(text.clone());
-                    warnings.push(Warning::caution(text));
+                    afresh = Some(reason);
                     (Some(memory), false, Baseline::new())
                 }
                 None if memory.tokens.is_none() => {
@@ -333,6 +331,17 @@ impl Engine {
         let record = if setup.mode.is_two_way() { &baseline } else { &landed };
         let plan = plan::plan_for(&setup, &source, &destination, record, &compared.different);
         self.change_missing(job, |missing| missing.note(&plan, &source, &destination, Utc::now()));
+        if let (Some(reason), Some(memory)) = (&afresh, &memory) {
+            let mut text = format!(
+                "{reason} So this time Charon compares both folders afresh: it removes nothing, so items removed since the last sync may come back, and {}.",
+                Self::differing_files(setup.conflict)
+            );
+            if let Some(found) = Self::one_side_only(&plan, memory) {
+                text = format!("{text} {found}");
+            }
+            holds.push(text.clone());
+            warnings.push(Warning::caution(text));
+        }
         let refusal = Guard::refusal(&plan, &source, &destination);
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
@@ -510,6 +519,48 @@ impl Engine {
             housekeeping,
             made_at: Utc::now(),
         })
+    }
+
+    /// What a fresh comparison copies to the side that lacks it (items on one side only),
+    /// as a sentence for the list, with how many of them the last sync left on both sides by
+    /// a record Charon can't decide with (the memory it distrusts, or 0.2's): those were most
+    /// likely removed on one side since, and come back. `None` when nothing is on one side
+    /// only.
+    fn one_side_only(plan: &Plan, memory: &Memory) -> Option<String> {
+        let only_on = |side: Side| -> Vec<&str> {
+            plan.actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::Copy { to, path, replaces: false, .. } | Action::CreateDir { side: to, path } if *to == side.opposite() => Some(path.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let (on_source, on_destination) = (only_on(Side::Source), only_on(Side::Destination));
+        let count = on_source.len() + on_destination.len();
+        if count == 0 {
+            return None;
+        }
+        let copied = match (on_source.len(), on_destination.len()) {
+            (n, 0) => format!("{} only on the source {} copied to the destination.", plural(n as u64, "item"), if n == 1 { "is" } else { "are" }),
+            (0, n) => format!("{} only on the destination {} copied to the source.", plural(n as u64, "item"), if n == 1 { "is" } else { "are" }),
+            (s, d) => format!("{} are only on one side ({} on the source, {} on the destination) and are copied to the other.", plural(count as u64, "item"), human_count(s as u64), human_count(d as u64)),
+        };
+        // The record's keys and the plan's may be folded differently: both are compared folded.
+        let earlier: BTreeSet<String> = memory.baseline.paths().chain(memory.earlier.iter()).map(|key| Keys::fold(key)).collect();
+        let back: Vec<&str> = on_source.iter().chain(on_destination.iter()).copied().filter(|path| earlier.contains(&Keys::fold(path))).collect();
+        if back.is_empty() {
+            return Some(copied);
+        }
+        // Named by the topmost of them: a folder that comes back stands for what's inside.
+        let topmost: Vec<&str> = back.iter().copied().filter(|path| !Keys::ancestors(path).any(|folder| back.contains(&folder))).collect();
+        Some(format!(
+            "{copied} By Charon's record of the last sync, {} of them {} on both sides then, so {} most likely removed since: {}.",
+            human_count(back.len() as u64),
+            if back.len() == 1 { "was" } else { "were" },
+            if back.len() == 1 { "it was" } else { "they were" },
+            Housekeeping::names(&topmost)
+        ))
     }
 
     /// What a two-way sync without a memory does with files that differ, by the job's rule
@@ -1075,6 +1126,40 @@ mod tests {
         fs::write(dst.join("REPORT~1.PDF"), "ours").unwrap();
         engine.survey(&job, &cancel, Purpose::Check).unwrap();
         assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()));
+    }
+
+    #[test]
+    fn a_fresh_comparison_says_what_it_brings_back() {
+        let file = Entry::file(1, 10_000);
+        let mut plan = Plan::default();
+        plan.push(Action::copy(Side::Destination, "a.txt", file, None));
+        plan.push(Action::CreateDir { side: Side::Destination, path: "Photos".into() });
+        plan.push(Action::copy(Side::Destination, "Photos/x.jpg", file, None));
+        plan.push(Action::copy(Side::Source, "b.txt", file, None));
+        plan.push(Action::copy(Side::Destination, "c.txt", file, Some(Entry::file(2, 20_000))));
+        let mut memory = Memory::default();
+        assert_eq!(
+            Engine::one_side_only(&plan, &memory).as_deref(),
+            Some("4 items are only on one side (3 on the source, 1 on the destination) and are copied to the other.")
+        );
+        memory.baseline.insert("Photos", Pair::new(Entry::dir(), Entry::dir()));
+        memory.baseline.insert("Photos/x.jpg", Pair::new(file, file));
+        memory.earlier.insert("B.txt".into());
+        assert_eq!(
+            Engine::one_side_only(&plan, &memory).as_deref(),
+            Some(
+                "4 items are only on one side (3 on the source, 1 on the destination) and are copied to the other. \
+                 By Charon's record of the last sync, 3 of them were on both sides then, so they were most likely removed since: “Photos” and “b.txt”."
+            ),
+            "a folder stands for what's inside, and case doesn't hide an item"
+        );
+        let mut one = Plan::default();
+        one.push(Action::copy(Side::Source, "b.txt", file, None));
+        assert_eq!(
+            Engine::one_side_only(&one, &memory).as_deref(),
+            Some("1 item only on the destination is copied to the source. By Charon's record of the last sync, 1 of them was on both sides then, so it was most likely removed since: “b.txt”.")
+        );
+        assert_eq!(Engine::one_side_only(&Plan::default(), &memory), None);
     }
 
     #[test]

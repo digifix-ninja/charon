@@ -10,6 +10,8 @@ use crate::model::{JobId, JobSetup};
 use crate::plan::{Baseline, Side};
 use crate::store::atomic;
 use serde::{Deserialize, Serialize};
+use crate::scan::Keys;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -28,6 +30,10 @@ pub struct Memory {
     pub folded: bool,
     /// Why the stored memory can't be used, if it can't. The baseline is then empty.
     pub distrust: Option<String>,
+    /// The items an older record Charon can't use (0.2's) had on both sides at the last
+    /// sync. They decide nothing: they only tell which of the items a fresh comparison
+    /// brings back were most likely removed since.
+    pub earlier: BTreeSet<String>,
 }
 
 impl Memory {
@@ -63,7 +69,7 @@ struct StoredMemory {
 #[serde(untagged)]
 enum AnyMemory {
     Current(StoredMemory),
-    Legacy(#[allow(dead_code)] serde_json::Map<String, serde_json::Value>),
+    Legacy(serde_json::Map<String, serde_json::Value>),
 }
 
 pub struct Baselines {
@@ -86,9 +92,7 @@ impl Baselines {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Memory::fresh(None),
             Err(e) => {
                 log::error!("couldn't read {}: {e}", path.display());
-                return Memory::fresh(Some(format!(
-                    "Charon couldn't read what it remembered about the last sync ({e}), so it compares both folders afresh."
-                )));
+                return Memory::fresh(Some(format!("Charon couldn't read what it remembered about the last sync ({e}).")));
             }
         };
         match serde_json::from_slice::<AnyMemory>(&bytes) {
@@ -100,6 +104,7 @@ impl Baselines {
                         generation: stored.generation,
                         folded: stored.folded,
                         distrust: None,
+                        earlier: BTreeSet::new(),
                     }
                 } else {
                     log::warn!("the two-way memory of job {job} belongs to other folders; starting fresh");
@@ -108,15 +113,15 @@ impl Baselines {
             }
             // An older Charon could save its memory for the wrong folders (when a job was
             // edited or two copies of the app ran at once), and nothing in the file says
-            // which folders it was made with. It's never used.
-            Ok(AnyMemory::Legacy(_)) => Memory::fresh(Some(
-                "This job was last synced by an older version of Charon, whose memory of that sync can't be fully trusted. \
-                 This time Charon compares both folders afresh: it removes nothing, so items deleted since the last sync may come back."
-                    .into(),
-            )),
+            // which folders it was made with. It's never used to decide anything; its items
+            // only tell what a fresh comparison brings back (see `Memory::earlier`).
+            Ok(AnyMemory::Legacy(items)) => Memory {
+                earlier: items.iter().filter(|(_, item)| item.get("kind").is_some()).map(|(path, _)| Keys::normalize(path)).collect(),
+                ..Memory::fresh(Some("This job was last synced by an older version of Charon, whose memory of that sync can't be fully trusted.".into()))
+            },
             Err(e) => {
                 log::error!("{} is damaged: {e}", path.display());
-                Memory::fresh(Some("Charon's memory of the last sync is damaged, so it compares both folders afresh.".into()))
+                Memory::fresh(Some("Charon's memory of the last sync is damaged.".into()))
             }
         }
     }
@@ -183,7 +188,7 @@ mod tests {
     fn memory() -> Memory {
         let mut baseline = Baseline::new();
         baseline.insert("a.txt", Pair::new(Entry::file(1, 10_000), Entry::file(1, 11_000)));
-        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None }
+        Memory { baseline, tokens: Some(("s".into(), "d".into())), generation: 4, folded: true, distrust: None, earlier: BTreeSet::new() }
     }
 
     #[test]
@@ -206,6 +211,7 @@ mod tests {
         let loaded = baselines.load(&"job".to_string(), &setup("/a", "/b"));
         assert!(loaded.baseline.is_empty());
         assert!(loaded.distrust.is_some());
+        assert_eq!(loaded.earlier, BTreeSet::from(["caf\u{e9}.txt".to_string()]), "only to tell what comes back");
     }
 
     #[test]

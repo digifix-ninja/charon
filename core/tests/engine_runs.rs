@@ -1,6 +1,6 @@
 //! End-to-end: real folders on disk, real looks, reviews and runs through the engine.
 
-use charon_core::model::{ConflictChoice, Level, ReviewKind, StepFilter, SyncMode};
+use charon_core::model::{ConflictChoice, Level, ReviewKind, StepFilter, StepKind, SyncMode};
 use charon_core::{ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, SyncStart, Trigger};
 use std::fs;
 use std::path::Path;
@@ -931,4 +931,37 @@ fn a_drive_without_room_is_never_filled() {
     let run = engine.job(&id).unwrap().job.last_run.unwrap();
     assert_eq!(run.failed, 1);
     assert!(engine.log(&id, 20).iter().any(|l| l.text.contains("huge.bin") && l.text.contains("isn't enough room")));
+}
+
+#[test]
+fn the_first_list_after_charon_0_2_says_which_items_come_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    for side in [&src, &dst] {
+        write(&side.join("a.txt"), "a");
+        write(&side.join("b.txt"), "b");
+        write(&side.join("Photos/x.jpg"), "x");
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+
+    // What Charon 0.2 left of the last sync: a bare list of the items both sides had.
+    let item = r#"{"kind":"file","size":1,"modified":10000}"#;
+    let folder = r#"{"kind":"dir","size":0,"modified":0}"#;
+    let legacy = format!(r#"{{"a.txt":{item},"b.txt":{item},"Photos":{folder},"Photos/x.jpg":{item}}}"#);
+    fs::write(data.join("baselines").join(format!("{id}.json")), legacy).unwrap();
+    // Since then the person removed b.txt and Photos on the destination, and made new.txt.
+    fs::remove_file(dst.join("b.txt")).unwrap();
+    fs::remove_dir_all(dst.join("Photos")).unwrap();
+    write(&src.join("new.txt"), "new");
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.steps.iter().all(|step| step.kind != StepKind::Remove), "nothing is removed: {:?}", review.steps);
+    let warning = review.warnings.iter().find(|w| w.text.contains("older version of Charon")).expect("the list says why");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("4 items only on the source are copied to the destination."), "{}", warning.text);
+    assert!(warning.text.contains("3 of them were on both sides then, so they were most likely removed since:"), "{}", warning.text);
+    assert!(warning.text.contains("“Photos”") && warning.text.contains("“b.txt”") && !warning.text.contains("x.jpg"), "{}", warning.text);
+    assert_eq!(warning.text.matches("afresh").count(), 1, "said once: {}", warning.text);
 }
