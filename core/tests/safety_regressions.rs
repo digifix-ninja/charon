@@ -15,21 +15,31 @@
 //! relies on (a hook that fired, a control job that ran).
 //!
 //! Tests that need unreadable folders must run without CAP_DAC_OVERRIDE when the process is
-//! root, otherwise they skip with a message:
+//! root. Otherwise they skip, and say so on stderr in the normal test output ("SKIPPED ...");
+//! with CHARON_REQUIRE_PERMISSION_TESTS=1 they fail instead of skipping (for CI):
 //!
 //! ```text
 //! capsh --drop=cap_dac_override,cap_dac_read_search -- -c \
 //!     "cargo test -p charon-core --test safety_regressions"
 //! ```
+//!
+//! One test waits for a list to expire (15 minutes) and is ignored by default:
+//! `cargo test -p charon-core --test safety_regressions -- --ignored`.
 
 use charon_core::plan::{NoteKind, Side};
+#[cfg(unix)]
 use charon_core::scan::EntryKind;
 use charon_core::{
-    Autopilot, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, JobView, Level, Phase, Review, StepFilter, SyncMode,
-    SyncStart, Trigger,
+    Autopilot, ConflictChoice, ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, JobView, Level, Phase, Review,
+    SyncMode, SyncStart, Trigger,
 };
+#[cfg(unix)]
+use charon_core::StepFilter;
 use std::collections::BTreeMap;
 use std::fs;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -216,27 +226,70 @@ fn set_mtime(path: &Path, time: SystemTime) {
 }
 
 /// Everything under `root`, relative path → what it is ("file: contents", "folder",
-/// "link -> target"). Links are listed, never followed.
+/// "link -> target"). Links are listed, never followed. A folder that is missing or can't be
+/// listed, or a file that can't be read, fails the test: it is never taken for an empty one.
 fn tree(root: &Path) -> BTreeMap<String, String> {
     fn visit(root: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
-        let Ok(items) = fs::read_dir(dir) else { return };
-        for item in items.flatten() {
-            let path = item.path();
+        let items = fs::read_dir(dir).unwrap_or_else(|e| panic!("{} can't be listed: {e}", dir.display()));
+        for item in items {
+            let path = item.unwrap_or_else(|e| panic!("an item in {} can't be listed: {e}", dir.display())).path();
             let relative = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-            let meta = fs::symlink_metadata(&path).unwrap();
+            let meta = fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("{} can't be looked at: {e}", path.display()));
             if meta.file_type().is_symlink() {
                 out.insert(relative, format!("link -> {}", fs::read_link(&path).unwrap().display()));
             } else if meta.is_dir() {
                 out.insert(relative, "folder".into());
                 visit(root, &path, out);
             } else {
-                out.insert(relative, format!("file: {}", String::from_utf8_lossy(&fs::read(&path).unwrap_or_default())));
+                let bytes = fs::read(&path).unwrap_or_else(|e| panic!("{} can't be read: {e}", path.display()));
+                out.insert(relative, format!("file: {}", String::from_utf8_lossy(&bytes)));
             }
         }
     }
     let mut out = BTreeMap::new();
     visit(root, root, &mut out);
     out
+}
+
+/// Copies the folder `from` to `to` (which must not exist yet) with each file's time, as a
+/// copy on another drive would look, leaving out the items whose name is in `skip`.
+fn copy_tree(from: &Path, to: &Path, skip: &[&str]) {
+    fs::create_dir(to).unwrap();
+    for item in fs::read_dir(from).unwrap() {
+        let item = item.unwrap();
+        let name = item.file_name().to_string_lossy().into_owned();
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let (path, target) = (item.path(), to.join(&name));
+        let meta = fs::symlink_metadata(&path).unwrap();
+        assert!(!meta.file_type().is_symlink(), "copy_tree doesn't copy links: {}", path.display());
+        if meta.is_dir() {
+            copy_tree(&path, &target, skip);
+        } else {
+            fs::copy(&path, &target).unwrap();
+            filetime::set_file_mtime(&target, filetime::FileTime::from_last_modification_time(&meta)).unwrap();
+        }
+    }
+}
+
+/// The names in `dir`, for failure messages.
+fn names_in(dir: &Path) -> Vec<String> {
+    fs::read_dir(dir).unwrap().map(|item| format!("{:?}", item.unwrap().file_name())).collect()
+}
+
+/// Renames `nfc` (a name in its composed Unicode form) in `dir` to its other spelling, the
+/// way a drive that hands names back in another form would show it. Exactly one of the two
+/// spellings must be there. Returns the new name.
+fn respell(dir: &Path, nfc: &str) -> String {
+    assert_eq!(nfc.nfc().collect::<String>(), nfc, "{nfc:?} is given composed");
+    let nfd: String = nfc.nfd().collect();
+    assert_ne!(nfd, nfc, "{nfc:?} has a second spelling");
+    let present: Vec<&str> = [nfc, nfd.as_str()].into_iter().filter(|name| fs::symlink_metadata(dir.join(name)).is_ok()).collect();
+    assert_eq!(present.len(), 1, "exactly one spelling of {nfc:?} in {}: {:?}", dir.display(), names_in(dir));
+    let to = if present[0] == nfc { nfd.clone() } else { nfc.to_string() };
+    fs::rename(dir.join(present[0]), dir.join(&to)).unwrap();
+    to
 }
 
 /// `tree`, without Charon's own folders (`.charon`, `.charon-trash`).
@@ -249,9 +302,16 @@ fn without_pokes(tree: BTreeMap<String, String>) -> BTreeMap<String, String> {
     tree.into_iter().filter(|(path, _)| !path.rsplit('/').next().unwrap_or(path).starts_with("poke-")).collect()
 }
 
-/// The contents of every file called `name` in `root`'s .charon-trash.
+/// The contents of every file called `name` in `root`'s .charon-trash (none when Charon
+/// never made a trash there).
 fn trashed(root: &Path, name: &str) -> Vec<String> {
-    tree(&root.join(".charon-trash"))
+    let trash = root.join(".charon-trash");
+    match fs::symlink_metadata(&trash) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => panic!("{} can't be looked at: {e}", trash.display()),
+        Ok(_) => {}
+    }
+    tree(&trash)
         .into_iter()
         .filter(|(path, what)| path.rsplit('/').next() == Some(name) && what.starts_with("file: "))
         .map(|(_, what)| what.trim_start_matches("file: ").to_string())
@@ -270,13 +330,16 @@ fn versions(folder: &Path, stem: &str) -> Vec<String> {
     found
 }
 
+#[cfg(unix)]
 fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+#[cfg(unix)]
 /// A folder made unreadable (or read-only) for as long as this lives.
 struct Locked(PathBuf);
 
+#[cfg(unix)]
 impl Locked {
     fn new(path: &Path, mode: u32) -> Locked {
         chmod(path, mode);
@@ -289,12 +352,14 @@ impl Locked {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Locked {
     fn drop(&mut self) {
         let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
     }
 }
 
+#[cfg(unix)]
 fn i_am_unprivileged() -> bool {
     // Root with DAC override reads a 000 folder: then the permission tests prove nothing.
     let tmp = tempfile::tempdir().unwrap();
@@ -306,15 +371,25 @@ fn i_am_unprivileged() -> bool {
     blocked
 }
 
-/// Whether file permissions bite in this process; prints why the test is skipped if not.
+#[cfg(unix)]
+/// Whether file permissions bite in this process. If not, the test can't make a folder
+/// unreadable: it says so where everyone sees it and skips, or fails when
+/// CHARON_REQUIRE_PERMISSION_TESTS=1.
 fn permissions_bite(test: &str) -> bool {
     if i_am_unprivileged() {
         return true;
     }
-    println!(
-        "SKIPPED {test}: this process can read folders whose permissions are 000 (root with CAP_DAC_OVERRIDE), \
-         so it can't make a folder unreadable and the test would prove nothing. Run it with: \
-         capsh --drop=cap_dac_override,cap_dac_read_search -- -c \"cargo test -p charon-core --test safety_regressions\""
+    let how = "capsh --drop=cap_dac_override,cap_dac_read_search -- -c \"cargo test -p charon-core --test safety_regressions\"";
+    let why = "this process can read folders whose permissions are 000 (root with CAP_DAC_OVERRIDE), so it can't make a \
+               folder unreadable and the test would prove nothing";
+    if std::env::var("CHARON_REQUIRE_PERMISSION_TESTS").is_ok_and(|v| v == "1") {
+        panic!("{test} can't run: {why}. CHARON_REQUIRE_PERMISSION_TESTS=1 forbids skipping it. Run it with: {how}");
+    }
+    // Straight to stderr: the test harness swallows println!/eprintln! of a test that
+    // passes, and a skipped safety test must never look like one that ran.
+    let _ = writeln!(
+        std::io::stderr(),
+        "SKIPPED {test}: {why}. It did NOT run. Run it with: {how} (or set CHARON_REQUIRE_PERMISSION_TESTS=1 to fail instead of skipping)"
     );
     false
 }
@@ -364,11 +439,41 @@ fn backdate_jobs(data: &Path) {
     fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
 }
 
+/// Writes into the state file that a run of job `id` was carrying files when Charon stopped
+/// (the computer lost power mid-run). The engine must be closed.
+fn mark_run_in_progress(data: &Path, id: &String) {
+    let path = data.join("charon-state.json");
+    let mut state: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let jobs = state["jobs"].as_array_mut().expect("jobs in the state file");
+    let job = jobs.iter_mut().find(|job| job["id"] == serde_json::json!(id)).expect("the job in the state file");
+    assert_eq!(job.get("runInProgress"), Some(&serde_json::json!(false)), "the state file has the field, and the last run finished");
+    job["runInProgress"] = serde_json::json!(true);
+    fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+}
+
+/// How many changes the job's row says wait for an OK (0 when none).
+fn items_waiting(engine: &Engine, id: &String) -> u64 {
+    view(engine, id).waiting.map_or(0, |waiting| waiting.items)
+}
+
+/// Asks for a look at the job now (as the autopilot does) and waits until its row shows what
+/// waits; returns how many items that is. The job's row must show nothing waiting before.
+/// From the moment the look starts, the autopilot's regular look isn't due for this job for
+/// many minutes (`check_due`), so any later look can only come from a trigger.
+fn look_now(engine: &Engine, id: &String) -> u64 {
+    assert!(view(engine, id).waiting.is_none(), "no look of this setup yet: {}", describe(engine, id));
+    engine.check(id);
+    assert!(!engine.check_due(id, 1), "the look started");
+    eventually("the look finished", || view(engine, id).waiting.is_some());
+    items_waiting(engine, id)
+}
+
 // ==================================================================== 1. the 0.2 probes, turned around
 
 // ------------------------------------------------------------------ probe 1: scan errors (mirror)
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn an_unreadable_source_folder_never_empties_its_mirror() {
     if !permissions_bite("an_unreadable_source_folder_never_empties_its_mirror") {
         return;
@@ -404,6 +509,7 @@ fn an_unreadable_source_folder_never_empties_its_mirror() {
 // ------------------------------------------------------------------ probe 2: scan errors (two-way)
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_two_way_folder_unreadable_for_a_moment_never_causes_removals() {
     if !permissions_bite("a_two_way_folder_unreadable_for_a_moment_never_causes_removals") {
         return;
@@ -449,6 +555,7 @@ fn a_two_way_folder_unreadable_for_a_moment_never_causes_removals() {
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_two_way_destination_folder_unreadable_for_a_while_never_causes_removals_in_the_source() {
     if !permissions_bite("a_two_way_destination_folder_unreadable_for_a_while_never_causes_removals_in_the_source") {
         return;
@@ -485,6 +592,7 @@ fn a_two_way_destination_folder_unreadable_for_a_while_never_causes_removals_in_
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn an_unreadable_job_folder_stops_the_look_and_removes_nothing() {
     if !permissions_bite("an_unreadable_job_folder_stops_the_look_and_removes_nothing") {
         return;
@@ -502,7 +610,10 @@ fn an_unreadable_job_folder_stops_the_look_and_removes_nothing() {
     let before = user_tree(&a);
 
     let locked = Locked::new(&b, 0o000);
-    assert!(engine.prepare_review(&id).is_err(), "a list of an unreadable folder can't be made");
+    match engine.prepare_review(&id) {
+        Err(Error::Unreadable { path, .. }) => assert_eq!(path, b, "the error names the folder that can't be read"),
+        other => panic!("a list of an unreadable folder can't be made, and says why: {:?}", other.map(|r| r.total_steps)),
+    }
     // A run nobody looks at fails before it touches anything.
     assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
     wait_idle(&engine, &id);
@@ -514,6 +625,7 @@ fn an_unreadable_job_folder_stops_the_look_and_removes_nothing() {
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_folder_that_turns_unreadable_during_a_run_stops_removals_on_the_other_side() {
     if !permissions_bite("a_folder_that_turns_unreadable_during_a_run_stops_removals_on_the_other_side") {
         return;
@@ -543,8 +655,10 @@ fn a_folder_that_turns_unreadable_during_a_run_stops_removals_on_the_other_side(
     assert!(rig.hook_fired());
     assert_eq!(read(&b.join("docs/x.txt")), "x", "not removed while the other side can't be checked");
     assert!(trashed(&b, "x.txt").is_empty());
+    // The copy went through, so the removal was kept back only because a/docs can't be read.
+    assert_eq!(read(&b.join("aaa.txt")), "carried first");
     let run = view(engine, &id).job.last_run.unwrap();
-    assert!(run.failed + run.skipped > 0, "the step that didn't happen is reported: {run:?}");
+    assert_eq!(run.failed + run.skipped, 1, "the one step that didn't happen (the removal) is reported: {run:?}");
     // The removal is still known and comes back in the next list, for the person to confirm.
     let review = engine.prepare_review(&id).unwrap();
     assert_eq!(review.tally.destination.removed, 1, "{:?}", review.steps);
@@ -553,10 +667,13 @@ fn a_folder_that_turns_unreadable_during_a_run_stops_removals_on_the_other_side(
 
 // ------------------------------------------------------------------ probes 3 and 4: a list isn't a gate
 
-/// A job (full automation, never confirmed) with `trigger` and its list open, a control job
-/// with the same trigger that runs by itself, and a witness that proves the autopilot looked
-/// several times. The job must not sync; returns its id, the engine and its list.
-fn new_job_with_its_list_open_under_the_autopilot(trigger: Trigger) -> (tempfile::TempDir, Engine, String, Review, PathBuf) {
+/// A new job (full automation, never confirmed) with `trigger` and its first list open, a
+/// control job with the same trigger that runs by itself, and a witness that proves the
+/// autopilot looked several times. The new job must not sync: before its first OK it never
+/// runs by itself (whether or not its list is open; see
+/// `the_autopilot_never_syncs_a_job_whose_list_is_open` for a job that does run by itself).
+/// Returns its id, the engine and its list.
+fn new_job_under_the_autopilot(trigger: Trigger) -> (tempfile::TempDir, Engine, String, Review, PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let (src, dst, data) = (root.join("src"), root.join("dst"), root.join("data"));
@@ -609,19 +726,133 @@ fn new_job_with_its_list_open_under_the_autopilot(trigger: Trigger) -> (tempfile
 }
 
 #[test]
-fn a_new_drive_connected_job_never_syncs_while_its_list_is_open() {
-    let (_tmp, engine, _id, _review, _dst) = new_job_with_its_list_open_under_the_autopilot(Trigger::DriveConnected);
+fn a_new_drive_connected_job_never_syncs_by_itself_before_its_first_ok() {
+    let (_tmp, engine, _id, _review, _dst) = new_job_under_the_autopilot(Trigger::DriveConnected);
     engine.shut_down(Duration::from_secs(10));
 }
 
 #[test]
-fn a_new_on_change_job_never_syncs_while_its_list_is_open() {
-    let (_tmp, engine, id, review, _dst) = new_job_with_its_list_open_under_the_autopilot(Trigger::OnChange { settle_seconds: 1 });
+fn a_new_on_change_job_never_syncs_by_itself_before_its_first_ok() {
+    let (_tmp, engine, id, review, _dst) = new_job_under_the_autopilot(Trigger::OnChange { settle_seconds: 1 });
     // The folder watcher saw the changes made after the list was made: it can't be confirmed.
     assert!(
         matches!(engine.approve(&id, &review.review_id, true), Err(Error::ReviewOutdated(_))),
         "a list made before the folders changed can't be confirmed"
     );
+    engine.shut_down(Duration::from_secs(10));
+}
+
+/// Two mirror jobs with full automation that already run by themselves (each had its
+/// confirmed sync), both started when their drive is connected (so the autopilot's first
+/// look syncs them), each with changes waiting: a new file to copy and a file only the
+/// destination has. The job under test is first in the list, so in every round the
+/// autopilot decides about it before it starts the control job: once the control job ran
+/// by itself, the job's fate in that round is sealed.
+struct DriveJobs {
+    _tmp: tempfile::TempDir,
+    engine: Engine,
+    id: String,
+    control: String,
+    dst: PathBuf,
+    c_dst: PathBuf,
+}
+
+impl DriveJobs {
+    fn new() -> DriveJobs {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let (src, dst, c_src, c_dst, data) =
+            (root.join("src"), root.join("dst"), root.join("control-src"), root.join("control-dst"), root.join("data"));
+        write(&src.join("first.txt"), "first");
+        write(&c_src.join("first.txt"), "first");
+        let engine = plain_engine(&data);
+        let drive_job = |src: &Path, dst: &Path| {
+            let mut setup = job_setup(src, dst, SyncMode::Mirror);
+            setup.trigger = Trigger::DriveConnected;
+            setup.full_automation = true;
+            setup
+        };
+        let id = add(&engine, drive_job(&src, &dst));
+        let control = add(&engine, drive_job(&c_src, &c_dst));
+        confirm(&engine, &id);
+        confirm(&engine, &control);
+        assert_eq!(engine.job_list().iter().map(|job| job.id.clone()).collect::<Vec<_>>(), vec![id.clone(), control.clone()]);
+        write(&src.join("new.txt"), "new");
+        write(&dst.join("precious.txt"), "only here");
+        write(&c_src.join("new.txt"), "carried by itself");
+        DriveJobs { _tmp: tmp, engine, id, control, dst, c_dst }
+    }
+
+    /// Starts the autopilot and waits until the control job ran by itself.
+    fn let_the_autopilot_go_round(&self) {
+        Autopilot::start(self.engine.clone());
+        eventually("the control job ran by itself because its drive was there", || ran_by_itself(&self.engine, &self.control));
+        assert_eq!(read(&self.c_dst.join("new.txt")), "carried by itself", "the trigger fired");
+        wait_idle(&self.engine, &self.id);
+    }
+}
+
+#[test]
+fn the_autopilot_never_syncs_a_job_whose_list_is_open() {
+    let jobs = DriveJobs::new();
+    let engine = &jobs.engine;
+    let review = engine.prepare_review(&jobs.id).unwrap(); // the window shows this list
+    assert_eq!(review.tally.destination.removed, 1);
+    let job = view(engine, &jobs.id);
+    assert!(job.runs_by_itself, "the job runs by itself: only its open list holds it back");
+    let (last_run, before) = (job.job.last_run, tree(&jobs.dst));
+
+    jobs.let_the_autopilot_go_round();
+    assert_eq!(view(engine, &jobs.id).job.last_run, last_run, "the job didn't sync while its list was open");
+    assert_eq!(tree(&jobs.dst), before, "nothing changed in its destination");
+    assert_eq!(read(&jobs.dst.join("precious.txt")), "only here");
+    engine.shut_down(Duration::from_secs(10));
+}
+
+#[test]
+fn the_autopilot_never_syncs_a_paused_job() {
+    let jobs = DriveJobs::new();
+    let engine = &jobs.engine;
+    engine.set_paused(&jobs.id, true).unwrap();
+    let job = view(engine, &jobs.id);
+    assert!(job.runs_by_itself, "the job runs by itself: only the pause holds it back");
+    assert!(job.pending.is_none(), "not looked at yet: {}", describe(engine, &jobs.id));
+    let (last_run, before) = (job.job.last_run, tree(&jobs.dst));
+
+    jobs.let_the_autopilot_go_round();
+    // Paused jobs are still looked at: the row shows what would be carried.
+    eventually("the autopilot looked at the paused job", || {
+        view(engine, &jobs.id).pending.is_some_and(|pending| pending.items > 0) && !engine.is_running(&jobs.id)
+    });
+    assert_eq!(view(engine, &jobs.id).job.last_run, last_run, "the paused job didn't sync");
+    assert_eq!(tree(&jobs.dst), before, "nothing changed in its destination");
+    engine.shut_down(Duration::from_secs(10));
+}
+
+#[test]
+fn pause_everything_stops_every_automatic_sync() {
+    let jobs = DriveJobs::new();
+    let engine = &jobs.engine;
+    engine.set_all_paused(true).unwrap();
+    let ids = [&jobs.id, &jobs.control];
+    let last_runs: Vec<_> = ids.iter().map(|id| view(engine, id).job.last_run).collect();
+    let before = (tree(&jobs.dst), tree(&jobs.c_dst));
+    for id in ids {
+        assert!(view(engine, id).runs_by_itself && view(engine, id).pending.is_none(), "{}", describe(engine, id));
+    }
+
+    Autopilot::start(engine.clone());
+    // Everything is still looked at, so the rows show what would be carried: that is the
+    // proof the autopilot went round (the drive-connected trigger fired for both jobs).
+    for id in ids {
+        eventually("the autopilot looked at the job", || {
+            view(engine, id).pending.is_some_and(|pending| pending.items > 0) && !engine.is_running(id)
+        });
+    }
+    let now: Vec<_> = ids.iter().map(|id| view(engine, id).job.last_run).collect();
+    assert_eq!(now, last_runs, "no job synced");
+    assert_eq!((tree(&jobs.dst), tree(&jobs.c_dst)), before, "nothing changed");
+    assert!(!jobs.c_dst.join("new.txt").exists());
     engine.shut_down(Duration::from_secs(10));
 }
 
@@ -762,6 +993,7 @@ fn a_mirror_keeps_a_removed_folder_that_holds_excluded_files() {
 // ------------------------------------------------------------------ probe 8: what isn't carried
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn symbolic_links_are_carried_as_links_and_never_followed() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data, outside) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"), tmp.path().join("outside"));
@@ -797,6 +1029,7 @@ fn symbolic_links_are_carried_as_links_and_never_followed() {
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_link_in_the_destination_where_the_source_has_a_folder_is_replaced_without_touching_its_target() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data, outside) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"), tmp.path().join("outside"));
@@ -815,6 +1048,7 @@ fn a_link_in_the_destination_where_the_source_has_a_folder_is_replaced_without_t
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_folder_replaced_by_a_link_during_a_run_is_never_removed_through() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data, outside) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"), tmp.path().join("outside"));
@@ -844,14 +1078,18 @@ fn a_folder_replaced_by_a_link_during_a_run_is_never_removed_through() {
 }
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_linked_trash_folder_is_never_used_and_nothing_is_lost_for_it() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data, outside) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"), tmp.path().join("outside"));
     write(&src.join("keep.txt"), "keep");
     write(&dst.join("keep.txt"), "keep");
     write(&dst.join("old.txt"), "only copy");
-    fs::create_dir_all(&outside).unwrap();
+    // The link points at a folder that holds something of its own, which must stay as it is.
+    write(&outside.join("sentinel.txt"), "outside the job");
     std::os::unix::fs::symlink(&outside, dst.join(".charon-trash")).unwrap();
+    let outside_before = tree(&outside);
+    assert_eq!(outside_before.len(), 1);
     let engine = plain_engine(&data);
     let id = add(&engine, job_setup(&src, &dst, SyncMode::Mirror));
     let review = engine.prepare_review(&id).unwrap();
@@ -859,7 +1097,7 @@ fn a_linked_trash_folder_is_never_used_and_nothing_is_lost_for_it() {
     engine.approve(&id, &review.review_id, true).unwrap();
     wait_idle(&engine, &id);
     assert_eq!(read(&dst.join("old.txt")), "only copy", "a removal that can't go to the trash doesn't happen");
-    assert!(tree(&outside).is_empty(), "nothing went through the link");
+    assert_eq!(tree(&outside), outside_before, "nothing went through the link, and nothing there was touched");
     assert!(view(&engine, &id).job.last_run.unwrap().failed > 0, "the failure is reported");
 
     // A replaced file isn't lost either.
@@ -870,7 +1108,7 @@ fn a_linked_trash_folder_is_never_used_and_nothing_is_lost_for_it() {
     engine.approve(&id, &review.review_id, true).unwrap();
     wait_idle(&engine, &id);
     assert_eq!(read(&dst.join("keep.txt")), "keep", "the old version stays when it can't be kept in the trash");
-    assert!(tree(&outside).is_empty());
+    assert_eq!(tree(&outside), outside_before);
 }
 
 // ------------------------------------------------------------------ probe 9: the wipe guard is narrow
@@ -887,11 +1125,25 @@ fn a_mirror_from_an_almost_empty_source_needs_the_tick() {
     let id = add(&engine, job_setup(&src, &dst, SyncMode::Mirror));
     let before = tree(&dst);
     let review = engine.prepare_review(&id).unwrap();
+    assert!(review.blocked.is_none(), "not refused outright: {:?}", review.blocked);
     assert!(review.needs_tick, "removing 200 of 200 photos needs the tick");
     assert!(review.warnings.iter().any(|w| w.level == Level::Danger), "{:?}", review.warnings);
-    assert!(engine.approve(&id, &review.review_id, false).is_err());
+    match engine.approve(&id, &review.review_id, false) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("Tick"), "refused for the missing tick: {msg}"),
+        other => panic!("confirmed without the tick: {other:?}"),
+    }
     assert!(!engine.is_running(&id));
     assert_eq!(tree(&dst), before, "nothing changed");
+    // With the tick it goes ahead, and every photo is kept in the trash.
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    let trash = tree(&dst.join(".charon-trash"));
+    for n in 0..200 {
+        let name = format!("photo-{n}.jpg");
+        assert!(!dst.join(&name).exists());
+        let kept = trash.iter().filter(|(path, what)| path.rsplit('/').next() == Some(name.as_str()) && what.as_str() == "file: p");
+        assert_eq!(kept.count(), 1, "{name} is in the trash");
+    }
 }
 
 #[test]
@@ -919,6 +1171,8 @@ fn full_automation_holds_back_a_mirror_whose_source_is_nearly_empty() {
     let job = view(engine, &id);
     assert!(job.job.held.is_some() && job.job.needs_review, "the run was held for an OK");
     assert_eq!(job.status, JobStatus::Review);
+    // The Held event is sent just after the job stops counting as running.
+    eventually("the Held event arrived", || rig.held_events(&id) >= 1);
     assert_eq!(rig.held_events(&id), 1);
     assert_eq!(tree(&dst), before, "nothing was touched");
     assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review, "the next sync waits for an OK");
@@ -927,6 +1181,7 @@ fn full_automation_holds_back_a_mirror_whose_source_is_nearly_empty() {
 // ------------------------------------------------------------------ probe 10: a failed save
 
 #[test]
+#[cfg(unix)] // folder permissions and symbolic links work differently on Windows
 fn a_job_edit_that_cannot_be_saved_changes_nothing() {
     if !permissions_bite("a_job_edit_that_cannot_be_saved_changes_nothing") {
         return;
@@ -1015,11 +1270,11 @@ fn a_name_seen_in_the_other_unicode_form_is_neither_copied_again_nor_removed() {
     // The copy landed under one spelling; the next look must not find anything to remove.
     let next = engine.prepare_review(&mirror).unwrap();
     assert_eq!(next.total_steps, 0, "{:?}", next.steps);
-    // A drive that hands the name back in the other form (as HFS+ does) changes nothing either.
-    for (root, from, to) in [(&dst, "caf\u{e9}", "cafe\u{301}"), (&b, "caf\u{e9}", "cafe\u{301}")] {
-        if root.join(from).exists() {
-            fs::rename(root.join(from), root.join(to)).unwrap();
-        }
+    // A drive that hands the names back in the other form (as HFS+ does) changes nothing
+    // either: the folder and the file in each copy now carry the other spelling.
+    for root in [&dst, &b] {
+        let folder = respell(root, "caf\u{e9}");
+        respell(&root.join(folder), "men\u{fc}.txt");
     }
     for id in [&mirror, &two_way] {
         let review = engine.prepare_review(id).unwrap();
@@ -1063,11 +1318,19 @@ fn an_edited_job_with_full_automation_waits_for_an_ok_before_it_syncs_again() {
     swapped.source = dst.clone();
     swapped.destination = src.clone();
     engine.update_job(&id, swapped).unwrap();
-    let last_run = view(&engine, &id).job.last_run;
+    let edited = view(&engine, &id);
+    assert!(edited.job.needs_review && !edited.runs_by_itself, "the edit makes the job wait for an OK");
+    let last_run = edited.job.last_run;
     let (src_before, dst_before) = (tree(&src), tree(&dst));
+    // What the edited job's row shows before the autopilot starts; the autopilot's regular
+    // look isn't due again for many minutes.
+    let seen = look_now(&engine, &id);
     Autopilot::start(engine.clone());
-    poke_until(&[w_src.clone(), dst.clone()], "the witness ran by itself", &engine, &[&id, &witness], || {
-        ran_by_itself(&engine, &witness)
+    // New files in its new source make the edited job's on-change trigger fire. Once its row
+    // counts more waiting items than before, the autopilot handled that change, and only
+    // looked (a sync would have left nothing waiting).
+    poke_until(&[dst.clone(), w_src.clone()], "the witness ran by itself and the edited job's change was looked at", &engine, &[&id, &witness], || {
+        ran_by_itself(&engine, &witness) && items_waiting(&engine, &id) > seen
     });
     wait_idle(&engine, &id);
 
@@ -1173,15 +1436,25 @@ fn the_autopilot_only_looks_at_jobs_that_wait_for_an_ok(trigger: Trigger) {
     let watched = [&p_src, &p_dst, &t_src, &t_dst, &u_src, &u_dst];
     let before: Vec<BTreeMap<String, String>> = watched.iter().map(|folder| without_pokes(tree(folder))).collect();
     let last_runs: Vec<_> = [&p, &t, &u].iter().map(|id| view(&engine, id).job.last_run).collect();
+    // What each row shows before the autopilot starts; its regular look isn't due again for
+    // many minutes.
+    let seen: Vec<u64> = [&p, &t, &u].iter().map(|id| look_now(&engine, id)).collect();
     Autopilot::start(engine.clone());
 
     let automatic = trigger != Trigger::Manual;
+    let on_change = trigger.syncs_on_change();
     let mut pokes = vec![w_src.clone()];
-    if trigger.syncs_on_change() {
+    if on_change {
         pokes.extend([p_src.clone(), t_src.clone(), u_src.clone(), c_src.clone()]);
     }
+    // For on-change jobs: once a row counts more waiting items than before the autopilot
+    // started, the autopilot handled the change in its folders, and only looked (a sync
+    // would have left nothing waiting). For the other triggers the control job proves it:
+    // the jobs come before it in the list, so the autopilot decided about them first.
     poke_until(&pokes, "the control job and the witness ran by themselves", &engine, &[&p, &t, &u, &c, &w], || {
-        ran_by_itself(&engine, &w) && (!automatic || ran_by_itself(&engine, &c))
+        ran_by_itself(&engine, &w)
+            && (!automatic || ran_by_itself(&engine, &c))
+            && (!on_change || [&p, &t, &u].iter().zip(&seen).all(|(id, seen)| items_waiting(&engine, id) > *seen))
     });
     if automatic {
         assert_eq!(read(&c_dst.join("new.txt")), "carried by itself", "the trigger fired");
@@ -1323,7 +1596,10 @@ fn a_job_with_full_automation_never_syncs_by_itself_while_its_list_is_open() {
     let before = tree(&dst);
 
     let review = engine.prepare_review(&id).unwrap();
-    assert!(engine.sync_now(&id).is_err(), "the open list comes first");
+    match engine.sync_now(&id) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("list") && msg.contains("open"), "refused for the open list: {msg}"),
+        other => panic!("the open list comes first: {other:?}"),
+    }
     engine.want(&id, "for a test");
     engine.start_wanted(&id);
     assert!(!engine.is_running(&id));
@@ -1367,7 +1643,8 @@ fn a_list_cannot_be_confirmed_after_the_jobs_setup_changed() {
     fs::remove_file(a.join("gone.txt")).unwrap();
     write(&a.join("doc.txt"), "edited, longer");
 
-    let changes: Vec<(&str, Box<dyn Fn(&mut JobSetup)>)> = vec![
+    type Change = Box<dyn Fn(&mut JobSetup)>;
+    let changes: Vec<(&str, Change)> = vec![
         ("safe deletes turned off", Box::new(|s: &mut JobSetup| s.safe_delete = false)),
         ("full automation turned on", Box::new(|s: &mut JobSetup| s.full_automation = true)),
         ("another conflict rule", Box::new(|s: &mut JobSetup| s.conflict = ConflictRule::NewestWins)),
@@ -1382,7 +1659,8 @@ fn a_list_cannot_be_confirmed_after_the_jobs_setup_changed() {
         let mut changed = original.clone();
         change(&mut changed);
         engine.update_job(&id, changed).unwrap();
-        assert!(engine.approve(&id, &review.review_id, true).is_err(), "confirmed after {what}");
+        let answer = engine.approve(&id, &review.review_id, true);
+        assert!(matches!(answer, Err(Error::ReviewOutdated(_))), "confirmed after {what}: {answer:?}");
         assert!(!engine.is_running(&id));
         assert_eq!((tree(&a), tree(&b)), before, "nothing changed after {what}");
         engine.update_job(&id, original).unwrap();
@@ -1396,7 +1674,8 @@ fn a_list_cannot_be_confirmed_after_the_jobs_setup_changed() {
     fs::create_dir_all(&elsewhere.destination).unwrap();
     engine.update_job(&id, elsewhere).unwrap();
     engine.update_job(&id, original).unwrap();
-    assert!(engine.approve(&id, &review.review_id, true).is_err(), "confirmed after the folders changed and changed back");
+    let answer = engine.approve(&id, &review.review_id, true);
+    assert!(matches!(answer, Err(Error::ReviewOutdated(_))), "confirmed after the folders changed and changed back: {answer:?}");
     assert!(!engine.is_running(&id));
     assert_eq!((tree(&a), tree(&b)), before);
 }
@@ -1459,8 +1738,92 @@ fn a_list_cannot_be_confirmed_when_a_folder_was_replaced_by_another_at_the_same_
     fs::rename(&a, &old_a).unwrap();
     fs::create_dir_all(&a).unwrap();
     assert!(matches!(engine.approve(&id, &review.review_id, true), Err(Error::ReviewOutdated(_))));
+    assert!(a.is_dir());
     assert!(tree(&a).is_empty());
     assert_eq!(user_tree(&old_a).len(), 4);
+}
+
+/// A mirror job after its confirmed sync, with one file removed from the source: the list
+/// (open) removes dst/b.txt.
+fn mirror_with_a_removal_listed() -> (tempfile::TempDir, Engine, String, Review, PathBuf, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("a.txt"), "a");
+    write(&src.join("b.txt"), "b");
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&src, &dst, SyncMode::Mirror));
+    confirm(&engine, &id);
+    fs::remove_file(src.join("b.txt")).unwrap();
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 1);
+    assert!(review.blocked.is_none());
+    (tmp, engine, id, review, src, dst)
+}
+
+#[test]
+fn a_list_cannot_be_confirmed_when_the_folder_lost_charons_marker() {
+    // The very same folder (same drive, same folder numbers), but without the marker the
+    // last sync left: maybe the drive was restored or reformatted and refilled meanwhile.
+    let (_tmp, engine, id, review, _src, dst) = mirror_with_a_removal_listed();
+    let marker = dst.join(".charon").join(format!("{id}.json"));
+    assert!(marker.is_file(), "the last sync left its marker at {}", marker.display());
+    fs::remove_file(&marker).unwrap();
+    let before = user_tree(&dst);
+    match engine.approve(&id, &review.review_id, true) {
+        Err(Error::ReviewOutdated(msg)) => assert!(msg.contains("marker"), "refused for the marker: {msg}"),
+        other => panic!("confirmed although the marker is gone: {other:?}"),
+    }
+    assert!(!engine.is_running(&id));
+    assert_eq!(read(&dst.join("b.txt")), "b");
+    assert_eq!(user_tree(&dst), before, "nothing changed");
+    assert!(trashed(&dst, "b.txt").is_empty());
+}
+
+#[test]
+fn a_list_cannot_be_confirmed_when_another_folder_with_the_same_contents_and_marker_took_its_place() {
+    // Another folder at the same path holding a full copy of the destination, Charon's
+    // marker included (a cloned drive, a folder restored from a copy).
+    let (tmp, engine, id, review, _src, dst) = mirror_with_a_removal_listed();
+    let first = tmp.path().join("first-dst");
+    fs::rename(&dst, &first).unwrap();
+    copy_tree(&first, &dst, &[]);
+    assert!(dst.join(".charon").join(format!("{id}.json")).is_file(), "the copy carries the marker");
+    let before = (tree(&dst), tree(&first));
+    match engine.approve(&id, &review.review_id, true) {
+        Err(Error::ReviewOutdated(msg)) => assert!(msg.contains("isn't the one"), "refused because it is another folder: {msg}"),
+        other => panic!("confirmed in another folder: {other:?}"),
+    }
+    assert!(!engine.is_running(&id));
+    assert_eq!((tree(&dst), tree(&first)), before, "neither folder changed");
+    assert_eq!(read(&dst.join("b.txt")), "b");
+    assert_eq!(read(&first.join("b.txt")), "b");
+}
+
+#[test]
+#[ignore = "takes 15 minutes; run with --ignored"]
+fn a_list_older_than_15_minutes_cannot_be_confirmed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("new.txt"), "new");
+    write(&dst.join("precious.txt"), "only here");
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&src, &dst, SyncMode::Mirror));
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 1);
+    assert!(review.expires_at <= review.prepared_at + chrono::Duration::minutes(15));
+    let before = tree(&dst);
+    // The clock decides, not a sleep: wait until the list is past its time.
+    let deadline = Instant::now() + Duration::from_secs(20 * 60);
+    while chrono::Utc::now() <= review.expires_at + chrono::Duration::seconds(1) {
+        assert!(Instant::now() < deadline, "the clock never passed {}", review.expires_at);
+        thread::sleep(Duration::from_secs(1));
+    }
+    match engine.approve(&id, &review.review_id, true) {
+        Err(Error::ReviewOutdated(msg)) => assert!(msg.contains("minutes"), "refused for its age: {msg}"),
+        other => panic!("a list older than 15 minutes was confirmed: {other:?}"),
+    }
+    assert!(!engine.is_running(&id));
+    assert_eq!(tree(&dst), before, "nothing changed");
 }
 
 #[test]
@@ -1478,8 +1841,12 @@ fn a_list_that_needs_the_tick_is_refused_without_it() {
     }
     let review = engine.prepare_review(&id).unwrap();
     assert!(review.needs_tick, "removing 9 of 10 files needs the tick");
+    assert!(review.blocked.is_none(), "not refused outright: {:?}", review.blocked);
     let before = tree(&dst);
-    assert!(engine.approve(&id, &review.review_id, false).is_err());
+    match engine.approve(&id, &review.review_id, false) {
+        Err(Error::Invalid(msg)) => assert!(msg.contains("Tick"), "refused for the missing tick: {msg}"),
+        other => panic!("confirmed without the tick: {other:?}"),
+    }
     assert!(!engine.is_running(&id));
     assert_eq!(tree(&dst), before);
     // With the tick, it goes ahead, into the trash.
@@ -1505,7 +1872,10 @@ fn a_blocked_list_is_refused_even_with_the_tick() {
     let review = engine.prepare_review(&id).unwrap();
     assert!(review.blocked.is_some(), "a sync that would empty the source is refused");
     let before = tree(&a);
-    assert!(engine.approve(&id, &review.review_id, true).is_err());
+    match engine.approve(&id, &review.review_id, true) {
+        Err(Error::Invalid(msg)) => assert_eq!(Some(msg), review.blocked, "refused for the reason the list gave"),
+        other => panic!("a blocked list was confirmed: {other:?}"),
+    }
     assert!(!engine.is_running(&id));
     assert_eq!(tree(&a), before);
 }
@@ -1655,6 +2025,68 @@ fn swapping_a_two_way_jobs_folders_makes_charon_forget_and_the_next_look_removes
     }
 }
 
+#[test]
+fn a_two_way_run_that_never_finished_makes_the_next_look_remove_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for n in 0..5 {
+        write(&a.join(format!("f{n}.txt")), "mine");
+    }
+    let id = {
+        let engine = plain_engine(&data);
+        let id = add(&engine, job_setup(&a, &b, SyncMode::TwoWay));
+        confirm(&engine, &id);
+        id
+    };
+    // The computer lost power while a run carried files: the state file still says so, and
+    // what Charon remembers may not match the folders. Meanwhile a file is gone from b.
+    wait_until_released(&data);
+    mark_run_in_progress(&data, &id);
+    fs::remove_file(b.join("f3.txt")).unwrap();
+
+    let engine = reopen(&data);
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.source.removed, review.tally.destination.removed), (0, 0), "{:?}", review.steps);
+    assert!(
+        review.warnings.iter().any(|w| w.level == Level::Caution && w.text.contains("didn't finish")),
+        "the list says why it compares afresh: {:?}",
+        review.warnings
+    );
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(read(&a.join("f3.txt")), "mine", "not removed from a");
+    assert_eq!(read(&b.join("f3.txt")), "mine", "compared afresh, the file is copied back");
+    assert!(trashed(&a, "f3.txt").is_empty());
+}
+
+#[test]
+fn a_two_way_list_made_after_a_folder_lost_charons_marker_removes_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for n in 0..5 {
+        write(&a.join(format!("f{n}.txt")), "mine");
+    }
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&a, &b, SyncMode::TwoWay));
+    confirm(&engine, &id);
+    // b no longer carries Charon's marker (another folder, or an older copy of b), and one
+    // file is missing from it.
+    assert!(b.join(".charon").join(format!("{id}.json")).is_file(), "the last sync left its marker");
+    fs::remove_dir_all(b.join(".charon")).unwrap();
+    fs::remove_file(b.join("f3.txt")).unwrap();
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.source.removed, review.tally.destination.removed), (0, 0), "{:?}", review.steps);
+    assert!(
+        review.warnings.iter().any(|w| w.level == Level::Caution && w.text.contains("marker")),
+        "the list says why it compares afresh: {:?}",
+        review.warnings
+    );
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(read(&a.join("f3.txt")), "mine", "not removed from a");
+    assert_eq!(read(&b.join("f3.txt")), "mine");
+}
+
 // ------------------------------------------------------------------ full automation is held back
 
 #[test]
@@ -1680,6 +2112,7 @@ fn full_automation_holds_back_a_two_way_run_when_one_side_was_emptied() {
     wait_idle(engine, &id);
     let job = view(engine, &id);
     assert!(job.job.held.is_some() && job.job.needs_review, "held for an OK");
+    eventually("the Held event arrived", || rig.held_events(&id) >= 1);
     assert_eq!(rig.held_events(&id), 1);
     assert_eq!((tree(&a), tree(&b)), (a_before, b_before), "nothing was touched");
 
@@ -1695,9 +2128,9 @@ fn full_automation_holds_back_when_a_folder_is_not_the_one_it_synced_with() {
     let tmp = tempfile::tempdir().unwrap();
     let (a, b, src, dst, data) =
         (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
-    for n in 0..5 {
-        write(&a.join(format!("f{n}.txt")), "mine");
-        write(&src.join(format!("f{n}.txt")), "mine");
+    for n in 0..20 {
+        write(&a.join(format!("f{n:02}.txt")), "mine");
+        write(&src.join(format!("f{n:02}.txt")), "mine");
     }
     let rig = Rig::open(&data);
     let engine = &rig.engine;
@@ -1710,21 +2143,32 @@ fn full_automation_holds_back_when_a_folder_is_not_the_one_it_synced_with() {
     confirm(engine, &two_way);
     confirm(engine, &mirror);
 
-    // Another drive (or the empty folder an unplugged drive leaves) under the same names.
-    fs::rename(&b, tmp.path().join("old-b")).unwrap();
-    write(&b.join("f0.txt"), "mine");
-    fs::rename(&dst, tmp.path().join("old-dst")).unwrap();
+    // Another folder under the same names that looks almost exactly like the old one, so
+    // only Charon's marker can tell: for b, an older copy of it (one file short, which a
+    // trusted memory would turn into a removal in a); for dst, a copy of it holding one more
+    // file of someone else's (which a mirror would remove). Neither copy carries the marker.
+    let (old_b, old_dst) = (tmp.path().join("old-b"), tmp.path().join("old-dst"));
+    fs::rename(&b, &old_b).unwrap();
+    copy_tree(&old_b, &b, &[".charon", "f19.txt"]);
+    fs::rename(&dst, &old_dst).unwrap();
+    copy_tree(&old_dst, &dst, &[".charon"]);
     write(&dst.join("someone-elses.txt"), "not part of the backup");
-    let before: Vec<_> = [&a, &b, &src, &dst].iter().map(|f| tree(f)).collect();
+    let folders = [&a, &b, &old_b, &src, &dst, &old_dst];
+    let before: Vec<_> = folders.iter().map(|f| tree(f)).collect();
     for id in [&two_way, &mirror] {
         assert_eq!(engine.sync_now(id).unwrap(), SyncStart::Started);
         wait_idle(engine, id);
         let job = view(engine, id);
-        assert!(job.job.held.is_some() && job.job.needs_review, "held for an OK: {:?}", job.job.last_run);
+        let held = job.job.held.clone().unwrap_or_else(|| panic!("held for an OK: {:?}", job.job.last_run));
+        assert!(job.job.needs_review);
+        assert!(held.contains("marker"), "held because of the missing marker: {held}");
+        eventually("the Held event arrived", || rig.held_events(id) >= 1);
         assert_eq!(rig.held_events(id), 1);
     }
-    let after: Vec<_> = [&a, &b, &src, &dst].iter().map(|f| tree(f)).collect();
+    let after: Vec<_> = folders.iter().map(|f| tree(f)).collect();
     assert_eq!(after, before, "nothing was touched");
+    assert_eq!(read(&a.join("f19.txt")), "mine");
+    assert_eq!(read(&dst.join("someone-elses.txt")), "not part of the backup");
 }
 
 // ------------------------------------------------------------------ the trash
@@ -1807,6 +2251,55 @@ fn newest_wins_keeps_the_losing_version_in_the_trash_even_with_safe_deletes_off(
     wait_idle(&engine, &id);
     assert_eq!(read(&a.join("plan.txt")), "edited on b, later");
     assert_eq!(trashed(&a, "plan.txt"), vec!["edited on a".to_string()], "the losing version is kept");
+}
+
+// ------------------------------------------------------------------ conflicts left for the person
+
+#[test]
+fn a_conflict_is_left_alone_and_settled_only_as_the_person_saw_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write(&a.join("plan.txt"), "v1");
+    let engine = plain_engine(&data);
+    let mut setup = job_setup(&a, &b, SyncMode::TwoWay);
+    setup.conflict = ConflictRule::Ask;
+    setup.safe_delete = false;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+
+    // Edited on both sides: with "Ask", the sync leaves both versions as they are.
+    write(&a.join("plan.txt"), "edited on a");
+    write(&b.join("plan.txt"), "edited on b, longer");
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.conflicts, 1, "{:?}", review.steps);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(read(&a.join("plan.txt")), "edited on a", "Ask leaves both versions alone");
+    assert_eq!(read(&b.join("plan.txt")), "edited on b, longer");
+    let card = view(&engine, &id).conflicts.first().cloned().expect("the row shows the conflict");
+
+    // b changes again after the person saw the card: the card can't be settled anymore.
+    write(&b.join("plan.txt"), "edited on b again, after the card was shown");
+    match engine.prepare_resolution(&id, &card, ConflictChoice::KeepSource) {
+        Err(Error::ReviewOutdated(_)) => {}
+        other => panic!("a conflict that changed was settled: {:?}", other.map(|r| r.total_steps)),
+    }
+    assert!(!engine.is_running(&id));
+    assert_eq!(read(&b.join("plan.txt")), "edited on b again, after the card was shown");
+    assert_eq!(read(&a.join("plan.txt")), "edited on a");
+
+    // Settled from a fresh card: the version that loses is kept in the trash, even with
+    // safe deletes off.
+    let card = view(&engine, &id).conflicts.first().cloned().expect("the row shows the conflict as it is now");
+    let review = engine.prepare_resolution(&id, &card, ConflictChoice::KeepSource).unwrap();
+    assert!(review.blocked.is_none(), "{:?}", review.blocked);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(read(&a.join("plan.txt")), "edited on a");
+    assert_eq!(read(&b.join("plan.txt")), "edited on a", "the person chose the source's version");
+    assert_eq!(trashed(&b, "plan.txt"), vec!["edited on b again, after the card was shown".to_string()], "b's version is kept");
+    let next = engine.prepare_review(&id).unwrap();
+    assert_eq!(next.total_steps, 0, "settled: {:?}", next.steps);
 }
 
 // ------------------------------------------------------------------ quitting and stopping
