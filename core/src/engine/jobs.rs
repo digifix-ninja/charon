@@ -48,8 +48,9 @@ impl Engine {
         };
 
         // The setup it replaces is read where it's replaced, so two quick edits in a row
-        // each compare with the one saved before.
-        let old = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing, then edit it."), |state, rt| {
+        // each compare with the one saved before. A confirmed list that waits for another
+        // sync was made for the old setup: the edit calls it off, and says so.
+        let (old, called_off) = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing, then edit it."), |state, rt| {
             let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
             let old = job.setup.clone();
             let folders_changed = !old.same_folders(&setup);
@@ -70,6 +71,7 @@ impl Engine {
             if review_next {
                 job.needs_review = true;
             }
+            let called_off = rt.confirmed.is_some();
             if folders_changed {
                 job.drives = None;
                 job.destination_token = None;
@@ -85,7 +87,7 @@ impl Engine {
             // at as soon as nothing else is looking.
             rt.outdate_looks();
             rt.last_checked = None;
-            Ok(old)
+            Ok((old, called_off))
         })?;
         let folders_changed = !old.same_folders(&setup);
         let automation_on = setup.full_automation && !old.full_automation;
@@ -115,6 +117,9 @@ impl Engine {
         }
         if automation_off {
             self.inner.journal.info(id, "full automation turned off");
+        }
+        if called_off {
+            self.note_called_off(id, " (the job was edited)");
         }
         self.publish(id);
         self.check(id);
@@ -150,12 +155,17 @@ impl Engine {
         self.job(&new_id)
     }
 
-    /// Pausing stops a running sync too. Paused jobs only sync when asked.
+    /// Pausing stops a running sync too, and calls off one that waits for another sync.
+    /// Paused jobs only sync when asked.
     pub fn set_paused(&self, id: &JobId, paused: bool) -> Result<()> {
+        // Saved first: a run a trigger starts from now on sees it and doesn't begin (see
+        // `begin_run`), and one that began before is stopped below.
+        let saved = self.change_job(id, |job| job.paused = paused);
         if paused {
-            self.cancel(id);
+            // Even when the pause couldn't be saved: the person wants it to stop.
+            self.stop_paused(id);
         }
-        self.change_job(id, |job| job.paused = paused)?;
+        saved?;
         self.inner.journal.info(id, if paused { "paused" } else { "resumed" });
         self.publish(id);
         Ok(())
@@ -220,18 +230,24 @@ impl Engine {
         let pattern = ExcludeFilter::pattern_for(path);
         ExcludeFilter::check(std::slice::from_ref(&pattern))?;
         let name = self.stored_job(id)?.setup.name;
-        self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing."), |state, rt| {
+        // A confirmed list that waits for another sync didn't leave the place out: it's called
+        // off, and the log says so.
+        let called_off = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing."), |state, rt| {
             let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
             if !job.setup.excludes.contains(&pattern) {
                 job.setup.excludes.push(pattern.clone());
             }
             job.needs_review = true;
+            let called_off = rt.confirmed.is_some();
             rt.outdate_looks();
             rt.forget_review();
             rt.last_checked = None;
-            Ok(())
+            Ok(called_off)
         })?;
         self.inner.journal.info(id, &format!("left out {path} (on the {})", side.word()));
+        if called_off {
+            self.note_called_off(id, " (a place was left out)");
+        }
         self.publish(id);
         self.check(id);
         self.job(id)

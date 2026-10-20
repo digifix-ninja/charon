@@ -9,7 +9,7 @@
 //! job changed, synced, or a drive was swapped meanwhile: then the row says why it wasn't).
 
 use crate::engine::runs::Crossing;
-use crate::engine::runtime::Confirmed;
+use crate::engine::runtime::{Confirmed, JobRuntime};
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, Look};
 use crate::error::{Error, Result};
@@ -123,7 +123,7 @@ impl Engine {
             waited
         });
         if waited == Some(true) {
-            self.inner.journal.info(id, "the confirmed sync that waited for another sync was called off");
+            self.note_called_off(id, "");
             self.publish(id);
         }
     }
@@ -196,7 +196,10 @@ impl Engine {
         match self.carry_out(id, &confirmed.review_id, confirmed.acknowledged, true) {
             Ok(()) => true,
             Err(Error::FoldersBusy(who)) => {
-                let changed = self.change_known_runtime(id, |rt| rt.waiting_for.replace(who.clone()) != Some(who));
+                // Only while it's still the job's confirmed list: it may have been called off
+                // meanwhile.
+                let current = |rt: &JobRuntime| rt.confirmed.as_ref().is_some_and(|waiting| waiting.review_id == confirmed.review_id);
+                let changed = self.change_known_runtime(id, |rt| current(rt) && rt.waiting_for.replace(who.clone()) != Some(who));
                 if changed == Some(true) {
                     self.publish(id);
                 }
@@ -277,7 +280,16 @@ impl Engine {
                 side.word()
             )));
         }
-        let (job, cancel) = self.begin_run(id, |job, rt| {
+        let mut reason = match review.kind {
+            ReviewKind::Sync => "confirmed by you".to_string(),
+            ReviewKind::Resolve => format!("to settle a conflict ({})", review.title.as_deref().unwrap_or("confirmed by you")),
+        };
+        if waited {
+            reason.push_str(", after waiting for another sync");
+        }
+        let mut crossing =
+            Crossing { kind: review.kind, approved: true, by_hand: true, reason, resolving: review.resolving.clone(), outdated: false };
+        let (job, cancel) = self.begin_run(id, &crossing, |job, rt| {
             // Stopped, paused or edited while it waited: the person called it off, even if
             // that came after `start_confirmed` picked it up.
             if waited && !rt.confirmed.as_ref().is_some_and(|confirmed| confirmed.review_id == review_id) {
@@ -304,14 +316,11 @@ impl Engine {
             }
             Ok(())
         })?;
-        let mut reason = match review.kind {
-            ReviewKind::Sync => "confirmed by you".to_string(),
-            ReviewKind::Resolve => format!("to settle a conflict ({})", review.title.as_deref().unwrap_or("confirmed by you")),
-        };
-        if waited {
-            reason.push_str(", after waiting for another sync");
-        }
-        let crossing = Crossing { kind: review.kind, approved: true, reason, resolving: review.resolving.clone() };
+        // A list that waited is older than the folders: the sync it waited for changed them,
+        // and Charon may not have heard of it (nobody hears what another computer writes to a
+        // network share). Those changes didn't count against the list, and aren't in it: once
+        // it's done, the folders are looked at again.
+        crossing.outdated = waited;
         // The run's busy notes go into the folders before anything changes there, and before
         // the person is told it started.
         let claim = match self.claim_folders(&job, &review.survey) {
@@ -443,9 +452,10 @@ impl Engine {
         self.runtime().get(id).and_then(|rt| rt.review.clone()).filter(|review| review.id == review_id).ok_or_else(Self::gone)
     }
 
-    /// Keeps a review of `survey` for the job (replacing any other, and a confirmed one that
-    /// waited) and returns it. `epoch` is the job's epoch when the look began: a list the job
-    /// outgrew meanwhile (it synced, changed or was removed) isn't kept.
+    /// Keeps a review of `survey` for the job (replacing any other, and calling off a confirmed
+    /// one that waited, which the job's log says) and returns it. `epoch` is the job's epoch
+    /// when the look began: a list the job outgrew meanwhile (it synced, changed or was
+    /// removed) isn't kept.
     pub(crate) fn keep_review(
         &self,
         job: &crate::model::Job,
@@ -487,20 +497,27 @@ impl Engine {
             survey,
         });
         let review = self.review_of(job, &stored);
+        // Returns whether it was kept, and whether that called off a confirmed list.
         let kept = self.change_known_runtime(&job.id, |rt| {
             if rt.epoch != epoch || rt.is_running() {
-                return false;
+                return (false, false);
             }
+            let called_off = rt.confirmed.is_some();
             rt.forget_review();
             rt.review = Some(stored);
             // The person is looking at the list: the next reminder can wait.
             rt.reminder.last = Some(Utc::now());
             rt.reminder.count = rt.reminder.count.max(1);
-            true
+            (true, called_off)
         });
         match kept {
-            Some(true) => Ok(review),
-            Some(false) => Err(Self::overtaken()),
+            Some((true, called_off)) => {
+                if called_off {
+                    self.note_called_off(&job.id, " (a newer list took its place)");
+                }
+                Ok(review)
+            }
+            Some((false, _)) => Err(Self::overtaken()),
             None => Err(Error::UnknownJob(job.id.clone())),
         }
     }

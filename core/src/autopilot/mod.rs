@@ -28,7 +28,8 @@
 //! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
 //!
 //! Paused jobs (and everything under "Pause everything") are still looked at, so the
-//! window shows what's waiting, but never sync by themselves.
+//! window shows what's waiting, but never sync by themselves. A sync the person asked for
+//! with Sync all that waits for another sync still starts once that sync is done.
 
 mod schedule;
 mod watcher;
@@ -127,9 +128,11 @@ impl Autopilot {
 
         for job in &jobs {
             let id = &job.id;
+            let present = job.setup.source.is_dir() && job.setup.destination.is_dir();
             // A folder on another drive than at the last sync (a leftover mount folder) isn't
             // the job's folder: nothing is looked at or synced there by itself.
-            let reachable = job.setup.source.is_dir() && job.setup.destination.is_dir() && Engine::drive_moved(job).is_none();
+            let moved = present && Engine::drive_moved(job).is_some();
+            let reachable = present && !moved;
             let was_reachable = self.reachable.insert(id.clone(), reachable);
             if was_reachable.is_some() && was_reachable != Some(reachable) {
                 // A drive went away or came (maybe another one under the same name): a list
@@ -142,25 +145,39 @@ impl Autopilot {
                 self.engine.publish(id); // the row turns offline / back online
             }
             let automatic = !settings.paused_all && !job.paused;
-            if !reachable || !automatic || !job.runs_by_itself() {
-                // A due sync waits only while the job could still run by itself.
-                self.engine.unwant(id);
+            // A due sync waits only while the job could still run by itself; while it's
+            // paused, only one the person asked for (Sync all) still waits.
+            if !present {
+                self.engine.unwant(id, "a folder isn't reachable");
+            } else if moved {
+                self.engine.unwant(id, "a folder is on another drive than at the last sync");
+            } else if !job.runs_by_itself() {
+                self.engine.unwant(id, "the job waits for your OK");
+            } else if !automatic {
+                self.engine.unwant_automatic(id, if job.paused { "the job is paused" } else { "everything is paused" });
             }
-            if !reachable || self.engine.is_running(id) {
+            if !present || self.engine.is_running(id) {
                 continue;
             }
             // A list the person confirmed while another sync used the folders (that sync
-            // may have been another Charon's, which says nothing when it's done).
+            // may have been another Charon's, which says nothing when it's done). Even with a
+            // folder on another drive than at the last sync: the person saw that in the list,
+            // and `carry_out` makes sure the folders are still the ones it was made for.
             if self.confirmed_tried.get(id).is_none_or(|tried| tried.elapsed() >= CONFIRMED_RETRY) {
                 self.confirmed_tried.insert(id.clone(), Instant::now());
                 if self.engine.start_confirmed(id) {
                     continue;
                 }
             }
-            // Runs by itself now: full automation, nothing waiting for a look, and no list
-            // of its changes open for the person.
-            let by_itself = automatic && job.runs_by_itself() && !self.engine.review_open(id);
-            if by_itself {
+            if !reachable {
+                continue;
+            }
+            // A wanted run may start: full automation, nothing waiting for a look, and no
+            // list of its changes open for the person. A trigger's own run also needs the
+            // job and everything not paused (runs by itself now).
+            let may_start = job.runs_by_itself() && !self.engine.review_open(id);
+            let by_itself = automatic && may_start;
+            if may_start {
                 self.engine.start_wanted(id);
                 if self.engine.is_running(id) {
                     continue;

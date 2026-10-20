@@ -298,14 +298,20 @@ impl Engine {
         Ok(())
     }
 
-    /// Pauses or resumes every job at once.
+    /// Pauses or resumes every job at once. Pausing stops the syncs nobody confirmed a list
+    /// for, and calls off the syncs that wait for another sync; a sync the person confirmed
+    /// that's at work goes on.
     pub fn set_all_paused(&self, paused: bool) -> Result<()> {
-        // A list confirmed before doesn't start by itself later on, even when the setting
-        // can't be saved.
+        // Saved first: a run a trigger starts from now on sees it and doesn't begin (see
+        // `begin_run`), and one that began before is stopped below.
+        let saved = self.change_state(|state| state.settings.paused_all = paused);
+        // Even when the setting couldn't be saved: nothing goes on, or starts later, without
+        // the person.
         if paused {
+            self.stop_unattended();
             self.call_off_all_confirmed(" (Pause everything)");
         }
-        self.change_state(|state| state.settings.paused_all = paused)?;
+        saved?;
         self.emit(EngineEvent::Settings(self.settings()));
         self.publish_all();
         Ok(())
@@ -324,6 +330,9 @@ impl Engine {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
+        // A confirmed sync that waits for another sync lives only while Charon runs: the job's
+        // log says it was called off, and after a restart the job waits for an OK again.
+        self.call_off_all_confirmed(" (Charon quit)");
         let deadline = Instant::now() + wait;
         while self.runtime().values().any(|rt| rt.is_running()) {
             if Instant::now() >= deadline {

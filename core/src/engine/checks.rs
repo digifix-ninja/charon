@@ -288,6 +288,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::runs::Crossing;
     use crate::model::{ConflictRule, JobSetup, ReviewKind, SyncMode};
     use std::fs;
     use std::sync::atomic::Ordering;
@@ -334,7 +335,7 @@ mod tests {
         let before = epoch(&engine, &job.id);
         let survey = look_at(&engine, &job);
         // A sync begins (and ends) while the look is still on its way.
-        engine.begin_run(&job.id, |_, _| Ok(())).unwrap();
+        engine.begin_run(&job.id, &Crossing::unattended("a test", false), |_, _| Ok(())).unwrap();
         engine.change_runtime(&job.id, |rt| {
             rt.cancel = None;
             rt.look = None;

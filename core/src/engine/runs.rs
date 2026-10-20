@@ -11,7 +11,7 @@
 //! stopped) is recognised at the next look, which then doesn't trust the memory.
 
 use crate::engine::checks::ChangeAt;
-use crate::engine::runtime::{OwnWrites, MISSING_FOR};
+use crate::engine::runtime::{OwnWrites, Wanted, MISSING_FOR};
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
@@ -45,6 +45,8 @@ pub(crate) const OLDER_CHARON: &str = "An older version of Charon is running at 
      Quit it (from its icon in the menu bar or the system tray), then quit and reopen Charon. Until then, nothing syncs.";
 /// Why runs nobody looks at wait while Charon's state can't be saved.
 pub(crate) const CANNOT_SAVE: &str = "Charon can't save its jobs and settings right now (is the disk full?), so nothing syncs by itself until it can again.";
+/// Why a run a trigger started doesn't begin.
+const PAUSED: &str = "The job is paused, or everything is: nothing syncs by itself until you resume it.";
 /// What a sync wrote is forgotten once it ended this long ago. Only the changes the folder
 /// watcher reports right after a sync are told apart by it (see `note_change_while_syncing`).
 const OWN_WRITES_KEPT: Duration = Duration::from_secs(60);
@@ -69,10 +71,55 @@ pub(crate) struct Crossing {
     pub kind: ReviewKind,
     /// The person confirmed the list.
     pub approved: bool,
+    /// The person started it: they confirmed its list, or asked for it (Sync now, Sync
+    /// all). Only a run a trigger started is held back while the job or everything is
+    /// paused.
+    pub by_hand: bool,
     /// For the log: "confirmed by you", "automatically on schedule".
     pub reason: String,
     /// The conflict this run settles (a resolution), by its key.
     pub resolving: Option<String>,
+    /// The list is older than the folders: it waited for another sync, which changed them
+    /// (heard of or not), and a list that waited is carried out all the same. What's left
+    /// once it's done is for a new look to say.
+    pub outdated: bool,
+}
+
+impl Crossing {
+    /// A run nobody looks at (full automation), started by a trigger or `by_hand`.
+    pub(crate) fn unattended(reason: &str, by_hand: bool) -> Crossing {
+        Crossing { kind: ReviewKind::Sync, approved: false, by_hand, reason: reason.to_string(), resolving: None, outdated: false }
+    }
+}
+
+/// What a run nobody looks at is started for (see `Engine::start_unreviewed`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Unreviewed<'a> {
+    /// The person pressed Sync now.
+    SyncNow,
+    /// The job's wanted run, as it was read before the run began (see `Engine::start_wanted`).
+    Wanted(&'a Wanted),
+}
+
+impl Unreviewed<'_> {
+    /// How the run comes about.
+    fn crossing(self) -> Crossing {
+        match self {
+            Unreviewed::SyncNow => Crossing::unattended("started by hand", true),
+            Unreviewed::Wanted(wanted) => Crossing::unattended(&wanted.reason, wanted.by_hand),
+        }
+    }
+
+    /// Whether the run is still asked for, as the job is now (`rt`, under the lock that marks
+    /// it as running). The job's wanted run is only while the job still wants it as it was
+    /// read: pausing may have called it off since, and one the person asked for would begin
+    /// all the same, since pausing holds back only a trigger's run.
+    fn still_asked_for(self, rt: &JobRuntime) -> bool {
+        match self {
+            Unreviewed::SyncNow => true,
+            Unreviewed::Wanted(read) => rt.wanted.as_ref().is_some_and(|now| read.asks_as(now)),
+        }
+    }
 }
 
 /// For each other job: its setup as it was looked at, and whether it shares a folder with
@@ -93,7 +140,7 @@ impl Engine {
         if !job.runs_by_itself() || self.must_ask(id) {
             return Ok(SyncStart::Review);
         }
-        self.start_unreviewed(id, "started by hand")?;
+        self.start_unreviewed(id, Unreviewed::SyncNow)?;
         Ok(SyncStart::Started)
     }
 
@@ -102,12 +149,15 @@ impl Engine {
     pub fn sync_all(&self) -> Vec<JobId> {
         let mut asking = Vec::new();
         for job in self.job_list() {
-            if job.paused || !job.setup.source.is_dir() || !job.setup.destination.is_dir() || self.is_running(&job.id) {
+            let reachable = job.setup.source.is_dir() && job.setup.destination.is_dir();
+            // A job whose confirmed list waits for another sync is on its way already.
+            if job.paused || !reachable || self.is_running(&job.id) || self.confirmed_waits(&job.id) {
                 continue;
             }
             if job.runs_by_itself() && !self.must_ask(&job.id) {
-                // Another job using the folders makes it wait, not give up (see `start_wanted`).
-                self.want(&job.id, "started with Sync all");
+                // Another job using the folders makes it wait, not give up (see `start_wanted`),
+                // even under *Pause everything*: the person asked for it.
+                self.want_by_hand(&job.id, "started with Sync all");
                 self.start_wanted(&job.id);
             } else {
                 asking.push(job.id);
@@ -121,21 +171,67 @@ impl Engine {
     pub fn cancel(&self, id: &JobId) {
         // Under one lock: a confirmed sync that starts now either sees it called off, or
         // runs with its stop flag set.
-        let called_off = self.runtime().get_mut(id).is_some_and(|rt| {
-            if let Some(cancel) = &rt.cancel {
-                cancel.store(true, Ordering::Relaxed);
-                rt.stopped_by_person = true;
-            }
+        let called_off = self.change_known_runtime(id, |rt| {
+            rt.stop_for_person();
             rt.call_off_confirmed()
         });
-        if called_off {
-            self.called_off(id, "");
+        if called_off == Some(true) {
+            self.note_called_off(id, "");
+            self.publish(id);
+        }
+    }
+
+    /// Pausing the job: stops it as Stop does, and drops the run it wants, even one the
+    /// person asked for (Sync all, or Sync now that met another sync): they paused it since.
+    /// Under one lock, as Stop: a run that begins now either runs with its stop flag set, or
+    /// finds its wanted run called off (see `start_unreviewed`).
+    pub(crate) fn stop_paused(&self, id: &JobId) {
+        let called_off = self.change_known_runtime(id, |rt| {
+            rt.stop_for_person();
+            (rt.call_off_confirmed(), rt.forget_wanted(|_| true))
+        });
+        let Some((confirmed, waited_for)) = called_off else { return };
+        if confirmed {
+            self.note_called_off(id, "");
+        }
+        if let Some(who) = &waited_for {
+            self.note_wanted_called_off(id, who, "the job is paused");
+        }
+        if confirmed || waited_for.is_some() {
+            self.publish(id);
+        }
+    }
+
+    /// Stops every sync nobody confirmed a list for, and drops every wanted run (*Pause
+    /// everything*: nothing syncs by itself now). A sync stops as Stop would stop it: what it
+    /// already carried stays, and the next sync of its job waits for the person's OK. A sync
+    /// the person confirmed goes on. Under one lock: a wanted run that begins now either is
+    /// stopped here, or finds itself called off (see `start_unreviewed`).
+    pub(crate) fn stop_unattended(&self) {
+        let mut stopped = Vec::new();
+        let mut dropped = Vec::new();
+        for (id, rt) in self.runtime().iter_mut() {
+            // One already stopping (Stop, Charon quitting) ends as it was going to.
+            if rt.cancel.as_ref().is_some_and(|cancel| rt.unattended && !cancel.swap(true, Ordering::Relaxed)) {
+                rt.stopped_by_person = true;
+                stopped.push(id.clone());
+            }
+            if let Some(who) = rt.forget_wanted(|_| true) {
+                dropped.push((id.clone(), who));
+            }
+        }
+        for id in stopped {
+            self.inner.journal.info(&id, "everything paused: this sync stops, since you didn't confirm its list");
+        }
+        for (id, who) in dropped {
+            self.note_wanted_called_off(&id, &who, "everything is paused");
+            self.publish(&id);
         }
     }
 
     /// Calls off every confirmed sync that waits for another sync (*Pause everything*: the
-    /// person wants nothing to start without them now). A sync that already started isn't
-    /// stopped, as *Pause everything* doesn't stop syncs at work.
+    /// person wants nothing to start without them now; Charon quitting). A sync the person
+    /// confirmed that already started isn't stopped.
     pub(crate) fn call_off_all_confirmed(&self, why: &str) {
         let called_off: Vec<JobId> = self
             .runtime()
@@ -143,14 +239,20 @@ impl Engine {
             .filter_map(|(id, rt)| (!rt.is_running() && rt.call_off_confirmed()).then(|| id.clone()))
             .collect();
         for id in called_off {
-            self.called_off(&id, why);
+            self.note_called_off(&id, why);
+            self.publish(&id);
         }
     }
 
-    /// Says in the job's log, and on its row, that its confirmed sync was called off.
-    fn called_off(&self, id: &JobId, why: &str) {
+    /// Says in the job's log that its confirmed sync was called off, and why (`why` is
+    /// empty when the person called it off themselves: Stop, closing the list, pausing).
+    pub(crate) fn note_called_off(&self, id: &JobId, why: &str) {
         self.inner.journal.info(id, &format!("the confirmed sync that waited for another sync was called off{why}"));
-        self.publish(id);
+    }
+
+    /// Whether the job has a confirmed list that waits for another sync.
+    fn confirmed_waits(&self, id: &JobId) -> bool {
+        self.runtime().get(id).is_some_and(|rt| rt.confirmed.is_some())
     }
 
     /// Whether runs nobody looks at are refused for this job until the person confirms a
@@ -172,72 +274,104 @@ impl Engine {
             .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < quiet))
     }
 
-    /// Notes that a job with full automation should sync (`reason` is for the log). The run
-    /// starts with `start_wanted`, now or as soon as nothing stands in its way.
+    /// Notes that a job with full automation should sync, for a trigger (`reason` is for
+    /// the log). The run starts with `start_wanted`, now or as soon as nothing stands in its
+    /// way.
     pub fn want(&self, id: &JobId, reason: &str) {
-        self.change_runtime(id, |rt| {
-            if rt.wanted.is_none() {
-                rt.wanted = Some(format!("automatically {reason}"));
-            }
+        self.want_run(id, Wanted { reason: format!("automatically {reason}"), by_hand: false });
+    }
+
+    /// Notes that the person asked a job with full automation to sync (Sync all): unlike a
+    /// trigger's run, it still starts while the job or everything is paused.
+    fn want_by_hand(&self, id: &JobId, reason: &str) {
+        self.want_run(id, Wanted { reason: reason.to_string(), by_hand: true });
+    }
+
+    /// Keeps `wanted` as the job's wanted run, unless it has one.
+    fn want_run(&self, id: &JobId, wanted: Wanted) {
+        self.change_runtime(id, |rt| match &mut rt.wanted {
+            // Once the person asked for it, pausing doesn't drop it.
+            Some(due) => due.by_hand |= wanted.by_hand,
+            None => rt.wanted = Some(wanted),
         });
     }
 
-    /// Forgets a wanted run (the job can't run by itself now: paused, offline, or it waits
+    /// Forgets a wanted run: it can't start now (`why`: a folder is away, or the job waits
     /// for the person's OK).
-    pub fn unwant(&self, id: &JobId) {
-        let changed = self.change_runtime(id, |rt| {
-            let had = rt.wanted.take().is_some() || rt.waiting_for.is_some();
-            rt.waiting_for = None;
-            had
-        });
-        if changed {
+    pub fn unwant(&self, id: &JobId, why: &str) {
+        self.drop_wanted(id, |_| true, why);
+    }
+
+    /// Forgets a wanted run a trigger started: the job or everything is paused (`why`). One
+    /// the person asked for (Sync all) still starts once nothing stands in its way.
+    pub fn unwant_automatic(&self, id: &JobId, why: &str) {
+        self.drop_wanted(id, |wanted| !wanted.by_hand, why);
+    }
+
+    /// Forgets the job's wanted run, if `which` says so. When its row said it waited for
+    /// another sync, the job's log says it was called off, and why.
+    pub(crate) fn drop_wanted(&self, id: &JobId, which: impl FnOnce(&Wanted) -> bool, why: &str) {
+        let waited_for = self.change_known_runtime(id, |rt| rt.forget_wanted(which)).flatten();
+        if let Some(who) = waited_for {
+            self.note_wanted_called_off(id, &who, why);
             self.publish(id);
         }
+    }
+
+    /// Says in the job's log that its wanted run, which waited for `who` to finish syncing,
+    /// was called off, and why.
+    fn note_wanted_called_off(&self, id: &JobId, who: &str, why: &str) {
+        self.inner.journal.info(id, &format!("the sync that waited for “{who}” to finish syncing was called off: {why}"));
     }
 
     /// Starts the job's wanted run, if it has one. While another sync uses the folders it
     /// keeps waiting (the row says for which); any other refusal drops it.
     pub fn start_wanted(&self, id: &JobId) {
-        let Some(reason) = self.runtime().get(id).and_then(|rt| rt.wanted.clone()) else { return };
-        let result = self.start_unreviewed(id, &reason);
-        let (now_waiting, changed) = self.change_runtime(id, |rt| {
-            let before = rt.waiting_for.clone();
-            match &result {
-                // A run that started took the wanted run along (see `begin_run`).
-                Ok(()) | Err(Error::Busy) => {}
-                Err(Error::FoldersBusy(name)) => rt.waiting_for = Some(name.clone()),
-                Err(_) => {
-                    rt.wanted = None;
-                    rt.waiting_for = None;
-                }
-            }
-            (rt.waiting_for.clone(), before != rt.waiting_for)
-        });
-        match result {
-            Ok(()) => {}
-            Err(Error::FoldersBusy(_)) | Err(Error::Busy) if changed => {
-                log::info!("job {id}: automatic sync waits for {}", now_waiting.unwrap_or_default());
-                self.publish(id);
-            }
-            Err(Error::FoldersBusy(_)) | Err(Error::Busy) => {}
-            Err(e) => {
-                log::info!("job {id}: automatic sync not started: {e}");
+        let Some(wanted) = self.runtime().get(id).and_then(|rt| rt.wanted.clone()) else { return };
+        self.start_as_wanted(id, &wanted);
+    }
+
+    /// Starts `wanted`, the job's wanted run as `start_wanted` read it. It may have changed
+    /// since (pausing called it off, Sync all asked for it): the run begins only while the job
+    /// still wants it so, and a refusal drops it only while it's still so.
+    fn start_as_wanted(&self, id: &JobId, wanted: &Wanted) {
+        match self.start_unreviewed(id, Unreviewed::Wanted(wanted)) {
+            // A run that started took the wanted run along (see `begin_run`); the job's own
+            // sync keeps it waiting. One no longer wanted so has nothing to start: the next
+            // tick starts what's wanted now.
+            Ok(()) | Err(Error::Busy) | Err(Error::Cancelled) => {}
+            Err(Error::FoldersBusy(name)) => {
+                // Only while it's still wanted: pausing may have dropped it meanwhile.
+                let changed = self.change_runtime(id, |rt| rt.wanted.is_some() && rt.waiting_for.replace(name.clone()) != Some(name.clone()));
                 if changed {
+                    log::info!("job {id}: automatic sync waits for {name}");
                     self.publish(id);
                 }
+            }
+            Err(e) => {
+                log::info!("job {id}: automatic sync not started: {e}");
+                self.drop_wanted(id, |now| wanted.asks_as(now), &e.to_string());
             }
         }
     }
 
     /// Starts a run nobody looks at (full automation): it surveys first, and holds back for
-    /// the person's OK when anything about the plan needs a look.
-    pub(crate) fn start_unreviewed(&self, id: &JobId, reason: &str) -> Result<()> {
+    /// the person's OK when anything about the plan needs a look. A run a trigger started
+    /// doesn't start while the job or everything is paused, and the job's wanted run only
+    /// while the job still wants it (`Cancelled` otherwise).
+    pub(crate) fn start_unreviewed(&self, id: &JobId, start: Unreviewed) -> Result<()> {
         // A run whose end can't be recorded mustn't start by itself (a failed save tries
         // again at most once a minute).
         if !self.can_save() {
             return Err(Error::Invalid(CANNOT_SAVE.into()));
         }
-        let (job, cancel) = self.begin_run(id, |job, rt| {
+        let crossing = start.crossing();
+        let (job, cancel) = self.begin_run(id, &crossing, |job, rt| {
+            // Checked where `begin_run` takes the wanted run along, so a pause that called it
+            // off either finds the run going (and stops it), or this finds it called off.
+            if !start.still_asked_for(rt) {
+                return Err(Error::Cancelled);
+            }
             if !job.runs_by_itself() || rt.must_ask {
                 return Err(Error::Invalid("This job waits for your OK before it syncs.".into()));
             }
@@ -250,7 +384,6 @@ impl Engine {
             Ok(())
         })?;
         self.publish(id);
-        let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: reason.to_string(), resolving: None };
         self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
             Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
             Ok(mut survey) => {
@@ -287,12 +420,18 @@ impl Engine {
         }
     }
 
-    /// Marks the job as running, if it may run now: Charon isn't quitting, the job isn't
-    /// running already, `check` (the caller's own conditions) passes, and no other sync is
+    /// Marks the job as running for `crossing`, if it may run now: Charon isn't quitting, the
+    /// job isn't running already, a run a trigger started finds neither the job nor
+    /// everything paused, `check` (the caller's own conditions) passes, and no other sync is
     /// at work in its folders: no running job of this Charon by their paths, and no sync of
     /// this or another Charon by its busy notes (see `run::Claim`; the run leaves its own
     /// notes before it changes anything).
-    pub(crate) fn begin_run(&self, id: &JobId, check: impl FnOnce(&Job, &mut JobRuntime) -> Result<()>) -> Result<(Job, Arc<AtomicBool>)> {
+    pub(crate) fn begin_run(
+        &self,
+        id: &JobId,
+        crossing: &Crossing,
+        check: impl FnOnce(&Job, &mut JobRuntime) -> Result<()>,
+    ) -> Result<(Job, Arc<AtomicBool>)> {
         if self.older_charon_running() {
             return Err(Error::Invalid(OLDER_CHARON.into()));
         }
@@ -308,6 +447,11 @@ impl Engine {
         if runtime.get(id).is_some_and(|rt| rt.is_running()) {
             return Err(Error::Busy);
         }
+        // Read where pausing saves it: a pause saved after this finds the run going, and
+        // stops it (see `set_paused`, `set_all_paused`).
+        if !crossing.by_hand && (job.paused || state.settings.paused_all) {
+            return Err(Error::Invalid(PAUSED.into()));
+        }
         check(&job, runtime.entry(id.clone()).or_default())?;
         if let Some(name) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
             return Err(Error::FoldersBusy(name));
@@ -315,6 +459,7 @@ impl Engine {
         let rt = runtime.entry(id.clone()).or_default();
         let cancel = Arc::new(AtomicBool::new(false));
         rt.cancel = Some(cancel.clone());
+        rt.unattended = !crossing.approved;
         rt.stopped_by_person = false;
         rt.progress = Some(Progress::scanning());
         rt.problem = None;
@@ -386,7 +531,7 @@ impl Engine {
             rt.progress = None;
             Self::look_again_if_changed(rt);
             if !crossing.approved {
-                rt.wanted = Some(crossing.reason.clone());
+                rt.wanted = Some(Wanted { reason: crossing.reason.clone(), by_hand: crossing.by_hand });
                 rt.waiting_for = Some(who.to_string());
             }
             false
@@ -548,11 +693,13 @@ impl Engine {
         let flushed = executor.flush(&mut outcome);
         // Old trash goes only after a list that said so was confirmed. A run nobody looked at
         // never empties it: the originals in there may be the only good copies of files a
-        // broken app is slowly damaging (see `Guard::since_confirmed`).
+        // broken app is slowly damaging (see `Guard::since_confirmed`). And never more than
+        // *Keep deleted files* allows now, which may have changed while the list waited.
         if complete && flushed.is_ok() && crossing.approved {
+            let days = self.settings().trash_days;
             for (side, look) in &survey.housekeeping.trash {
                 let names: Vec<String> = look.expired.iter().map(|e| e.name.clone()).collect();
-                Trash::sweep(survey.setup.root(*side), &names);
+                Trash::sweep(survey.setup.root(*side), &names, days);
             }
         }
 
@@ -913,9 +1060,13 @@ impl Engine {
         let mut look = Look::of(survey);
         let resolved: Vec<String> = survey.plan.actions.iter().map(|a| a.path().to_string()).collect();
         self.change_runtime(id, |rt| {
-            // Something besides the run's own items changed while it ran: it's looked at
-            // again at once (see below).
-            let changed_meanwhile = rt.own_writes.as_ref().is_some_and(OwnWrites::others_changed);
+            // The folders changed in ways the run's plan didn't know of: something besides
+            // its own items changed while it ran, or since its list was made (a list that
+            // waited for another sync), maybe as a newer look found. Its own look then says
+            // nothing about what's left: the folders are looked at again at once (see below).
+            let outdated = rt.own_writes.as_ref().is_some_and(OwnWrites::others_changed)
+                || crossing.outdated
+                || rt.look.as_ref().is_some_and(|look| look.at > survey.made_at);
             rt.cancel = None;
             rt.stopped_by_person = false;
             if stopped_by_person || unrecorded {
@@ -947,7 +1098,8 @@ impl Engine {
                     }
                     look.replacements = Default::default();
                     rt.reminder.count = 0;
-                    rt.look = Some(look);
+                    // Until the new look, "In sync" would be a guess.
+                    rt.look = (!outdated).then_some(look);
                 }
                 ReviewKind::Resolve => {
                     if let Some(look) = rt.look.as_mut() {
@@ -964,11 +1116,11 @@ impl Engine {
                 }
                 look.unreadable.truncate(PLACES_SHOWN);
             }
-            // After a stopped run, a confirmed run that left something, or a run during which
-            // something else changed, look again at once, so the row shows what's still
-            // waiting. Runs by themselves wait for the regular look otherwise: a file that
-            // fails every time mustn't start a run every few seconds.
-            if summary.cancelled || changed_meanwhile || (crossing.approved && (left || summary.error.is_some())) {
+            // After a stopped run, a confirmed run that left something, or a run whose plan the
+            // folders outgrew, look again at once, so the row shows what's still waiting. Runs
+            // by themselves wait for the regular look otherwise: a file that fails every time
+            // mustn't start a run every few seconds.
+            if summary.cancelled || outdated || (crossing.approved && (left || summary.error.is_some())) {
                 rt.last_checked = None;
             } else {
                 rt.last_checked = Some(Instant::now());
@@ -1179,8 +1331,9 @@ mod tests {
     /// network share. The folders are on this computer's own drive, so the run's look notes
     /// nothing by itself: what a look at the share notes is added, as of `missing_since`.
     fn run_from_a_share(engine: &Engine, id: &JobId, missing_since: DateTime<Utc>) {
+        let crossing = Crossing::unattended("drive connected", false);
         let (job, cancel) = engine
-            .begin_run(id, |job, _| {
+            .begin_run(id, &crossing, |job, _| {
                 assert!(job.runs_by_itself());
                 Ok(())
             })
@@ -1190,9 +1343,86 @@ mod tests {
         on_a_share(&mut survey.source, &job.setup.source);
         engine.change_missing(&job, |missing| missing.note(&survey.plan, &survey.source, &survey.destination, missing_since));
         engine.hold_back_recent_removals(&job, &mut survey);
-        let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: "drive connected".into(), resolving: None };
         let claim = engine.claim_folders(&job, &survey).unwrap();
         engine.cross(&job, &survey, &cancel, &crossing, claim);
+    }
+
+    /// The job's wanted run, as `start_wanted` reads it before it starts it.
+    fn read_wanted(engine: &Engine, id: &JobId) -> Wanted {
+        engine.runtime().get(id).and_then(|rt| rt.wanted.clone()).expect("the job wants a run")
+    }
+
+    fn wait_idle(engine: &Engine, id: &JobId) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while engine.is_running(id) {
+            assert!(Instant::now() < deadline, "the sync took too long");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts that nothing began: no run, nothing copied, and no run wanted anymore.
+    fn nothing_began(engine: &Engine, id: &JobId, dst: &Path) {
+        assert!(!engine.is_running(id), "a sync began");
+        assert!(!dst.join("new.txt").exists(), "a sync copied the new file");
+        assert!(engine.runtime().get(id).is_some_and(|rt| rt.wanted.is_none() && rt.waiting_for.is_none()));
+        assert!(!engine.log(id, 20).iter().any(|line| line.text.contains("sync started with Sync all")), "{:?}", engine.log(id, 5));
+    }
+
+    #[test]
+    fn a_run_the_person_asked_for_never_begins_once_pausing_the_job_called_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        std::fs::write(src.join("new.txt"), "new").unwrap();
+
+        // Sync all under Pause everything wants a run; it's read to be started, and while
+        // the folders are looked at before it begins, the person pauses the job.
+        engine.set_all_paused(true).unwrap();
+        engine.want_by_hand(&id, "started with Sync all");
+        let wanted = read_wanted(&engine, &id);
+        engine.set_paused(&id, true).unwrap();
+        engine.start_as_wanted(&id, &wanted);
+        nothing_began(&engine, &id, &dst);
+    }
+
+    #[test]
+    fn a_run_the_person_asked_for_never_begins_once_pause_everything_called_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        std::fs::write(src.join("new.txt"), "new").unwrap();
+
+        // Sync all wants a run; it's read to be started, and while the folders are looked at
+        // before it begins, the person pauses everything.
+        engine.want_by_hand(&id, "started with Sync all");
+        let wanted = read_wanted(&engine, &id);
+        engine.set_all_paused(true).unwrap();
+        engine.start_as_wanted(&id, &wanted);
+        nothing_began(&engine, &id, &dst);
+    }
+
+    #[test]
+    fn a_triggers_run_held_back_by_a_pause_leaves_the_run_the_person_asked_for_since() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        let (engine, id) = synced_mirror(&data, &src, &dst);
+        std::fs::write(src.join("new.txt"), "new").unwrap();
+
+        // A trigger's run is due, and it's read to be started. While the folders are looked
+        // at before it begins, the person pauses everything, then presses Sync all.
+        engine.want(&id, "after changes");
+        let read = read_wanted(&engine, &id);
+        engine.set_all_paused(true).unwrap();
+        engine.want_by_hand(&id, "started with Sync all");
+
+        // The pause holds back the trigger's run, and only that one.
+        engine.start_as_wanted(&id, &read);
+        assert!(!engine.is_running(&id));
+        assert!(read_wanted(&engine, &id).by_hand, "the run the person asked for is still wanted");
+        engine.start_wanted(&id);
+        wait_idle(&engine, &id);
+        assert!(dst.join("new.txt").exists());
+        assert!(engine.log(&id, 20).iter().any(|line| line.text.starts_with("sync started with Sync all")));
     }
 
     #[test]
@@ -1265,8 +1495,8 @@ mod tests {
         assert!(engine.stored_job(&id).unwrap().runs_by_itself());
 
         // A run starts carrying files, then hits a mistake in Charon itself.
-        let (job, cancel) = engine.begin_run(&id, |_, _| Ok(())).unwrap();
-        let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: "a test".into(), resolving: None };
+        let crossing = Crossing::unattended("a test", false);
+        let (job, cancel) = engine.begin_run(&id, &crossing, |_, _| Ok(())).unwrap();
         engine
             .spawn_crossing(job, cancel, crossing, |engine, job, _, _| {
                 engine.change_job(&job.id, |job| job.run_in_progress = true).unwrap();
