@@ -64,14 +64,13 @@ impl TwoWayPlanner {
         let mut plan = Plan::default();
         let mut ground = Ground::new(source, destination, &[Side::Source, Side::Destination], &mut plan);
         let all_paths: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(baseline.paths()).collect();
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
         let split = self.split_units(&all_paths, source, destination, baseline, &ground);
 
         for path in all_paths {
             if ground.is_off_limits(path) {
                 continue;
             }
-            if let Some(unit) = Unit::of(path, exists).filter(|unit| split.contains(unit)) {
+            if let Some(unit) = Unit::of(path, source, destination).filter(|unit| split.contains(unit)) {
                 Self::ask_unit(&mut plan, &mut ground, &unit, path, source, destination);
                 continue;
             }
@@ -119,13 +118,12 @@ impl TwoWayPlanner {
     /// The app libraries and databases with files changed on both sides: syncing them file
     /// by file would mix two versions.
     fn split_units(&self, paths: &BTreeSet<&String>, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, ground: &Ground) -> BTreeSet<Unit> {
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
         let mut changed: std::collections::BTreeMap<Unit, (bool, bool)> = std::collections::BTreeMap::new();
         for path in paths {
             if ground.is_off_limits(path) {
                 continue;
             }
-            let Some(unit) = Unit::of(path, exists) else { continue };
+            let Some(unit) = Unit::of(path, source, destination) else { continue };
             let (on_source, on_destination) = self.changes(path, source, destination, baseline);
             let sides = changed.entry(unit).or_default();
             sides.0 |= on_source;
@@ -585,5 +583,37 @@ mod tests {
         // Nothing inside the library moves; the rest of the job syncs.
         assert!(plan.work().all(|action| action.path() == "notes.txt"), "{:?}", plan.actions);
         assert_eq!(plan.summary().to_destination, 1);
+    }
+
+    /// A Numbers document saved as one file, and a private key: only named like an app's
+    /// package. They follow the job's rule like any file.
+    #[test]
+    fn a_single_file_named_like_a_package_follows_the_rules_for_files() {
+        for name in ["Budget.numbers", "server.key"] {
+            let baseline = base(&[(name, file(1, 10_000))]);
+            let (source, destination) = (snap(&[(name, file(2, 50_000))]), snap(&[(name, file(3, 90_000))]));
+            let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&source, &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::KeepBoth { .. }]), "{name}: {:?}", plan.actions);
+            let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&source, &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::Copy { to: Side::Source, settles_conflict: true, .. }]), "{name}: {:?}", plan.actions);
+            // Edited on one side, removed on the other: the edit wins.
+            let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[]), &destination, &baseline);
+            assert!(matches!(plan.actions.as_slice(), [Action::Copy { to: Side::Source, .. }]), "{name}: {:?}", plan.actions);
+        }
+    }
+
+    /// A folder "notes" next to a file "notes-journal" is no database: the file changed on
+    /// both sides follows the job's rule, and the folder syncs as usual.
+    #[test]
+    fn a_folder_next_to_a_file_named_like_its_journal_syncs_as_usual() {
+        let baseline = base(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes-journal", file(1, 10_000))]);
+        let source = snap(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes/new.txt", file(4, 20_000)), ("notes-journal", file(2, 50_000))]);
+        let destination = snap(&[("notes", Entry::dir()), ("notes/a.txt", file(1, 10_000)), ("notes-journal", file(3, 90_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&source, &destination, &baseline);
+        let mut paths: Vec<&str> = plan.actions.iter().map(|action| action.path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["notes-journal", "notes/new.txt"], "{:?}", plan.actions);
+        assert!(plan.actions.iter().any(|action| matches!(action, Action::KeepBoth { path, .. } if path == "notes-journal")));
+        assert!(plan.conflicts().is_empty());
     }
 }

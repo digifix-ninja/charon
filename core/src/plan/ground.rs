@@ -63,7 +63,7 @@ impl<'a> Ground<'a> {
         // Each file kept, with the file left alone that keeps it.
         let mut kept: Vec<(String, String)> = Vec::new();
         for frozen in &self.frozen {
-            let Some(database) = Unit::database_of(frozen, exists) else { continue };
+            let Some(database) = Unit::database_of(frozen, self.source, self.destination) else { continue };
             for file in Unit::database_files(&database) {
                 if file != *frozen && exists(&file) && !self.is_frozen(&file) && !kept.iter().any(|(other, _)| *other == file) {
                     kept.push((file, shown(frozen)));
@@ -207,10 +207,9 @@ impl<'a> Ground<'a> {
             return;
         }
         // The databases of the files kept, each with one of those files to name.
-        let exists = |key: &str| self.source.contains(key) || self.destination.contains(key);
         let mut databases: Vec<(Unit, String)> = Vec::new();
         for (side, key) in &held {
-            if let Some(database) = Unit::database_of(key, exists).map(Unit::Database) {
+            if let Some(database) = Unit::database_of(key, self.source, self.destination).map(Unit::Database) {
                 if !databases.iter().any(|(other, _)| *other == database) {
                     databases.push((database, self.side(*side).spelling(key).to_string()));
                 }
@@ -418,6 +417,20 @@ mod tests {
         let kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
         assert_eq!(kept, vec![("notes.db-wal", Some(Side::Source)), ("notes.db-shm", Some(Side::Destination))]);
         assert!(plan.notes.iter().all(|n| n.kind != NoteKind::Blocked || n.reason.contains("“notes.db”")), "{:?}", plan.notes);
+    }
+
+    /// A folder "notes" next to a file "notes-journal" that can't be read: only that file is
+    /// left alone, the folder syncs.
+    #[test]
+    fn a_folder_is_never_kept_for_a_file_named_like_its_journal() {
+        let mut source = snap(&[("notes", Entry::dir()), ("notes/new.txt", Entry::file(1, 2)), ("notes-journal", Entry::file(4, 2))], FsKind::Ext);
+        source.freeze_unread("notes-journal", "permission denied");
+        let destination = snap(&[("notes", Entry::dir())], FsKind::Ext);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("notes-journal"));
+        assert!(!ground.is_off_limits("notes") && !ground.is_off_limits("notes/new.txt"));
+        assert!(plan.notes.iter().all(|n| n.kind != NoteKind::Blocked), "{:?}", plan.notes);
     }
 
     #[test]

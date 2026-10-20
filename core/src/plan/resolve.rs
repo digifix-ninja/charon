@@ -37,7 +37,7 @@ impl Resolution {
         if ground.is_off_limits(key) {
             return Err("Charon can't settle this item: it's in a place it leaves alone (see the notes).".into());
         }
-        let unit = Unit::of(key, |k| source.contains(k) || destination.contains(k))
+        let unit = Unit::of(key, source, destination)
             .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
         if let Some(unit) = unit {
             return Self::settle_unit(plan, ground, &unit, choice);
@@ -305,5 +305,23 @@ mod tests {
         paths.sort();
         assert_eq!(paths, vec!["data.db", "data.db-shm", "data.db-wal"]);
         assert!(Resolution::plan(&source, &destination, "data.db", ConflictChoice::KeepBoth).is_err());
+    }
+
+    /// Only a folder is an app's package, and only files make a database: a single-file
+    /// Numbers document can be kept twice, and settling a folder next to a file named like
+    /// its journal settles that folder alone.
+    #[test]
+    fn items_only_named_like_a_library_or_database_are_settled_on_their_own() {
+        let (s, d) = (Entry::file(2, 50_000), Entry::file(3, 90_000));
+        let plan = Resolution::plan(&snap(&[("Budget.numbers", s)]), &snap(&[("Budget.numbers", d)]), "Budget.numbers", ConflictChoice::KeepBoth).unwrap();
+        assert!(matches!(plan.actions.as_slice(), [Action::KeepBoth { .. }]), "{:?}", plan.actions);
+
+        let source = snap(&[("Garden", Entry::dir()), ("Garden/plan.txt", Entry::file(1, 1))]);
+        let destination = snap(&[("Garden-journal", Entry::dir()), ("Garden-journal/day1.txt", Entry::file(1, 1))]);
+        let plan = Resolution::plan(&source, &destination, "Garden", ConflictChoice::KeepSource).unwrap();
+        let mut paths: Vec<&str> = plan.actions.iter().map(|a| a.path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["Garden", "Garden/plan.txt"], "the destination's “Garden-journal” stays: {:?}", plan.actions);
+        assert!(plan.actions.iter().all(|a| !matches!(a, Action::Delete { .. })));
     }
 }

@@ -594,8 +594,7 @@ impl Engine {
     /// App libraries and databases this sync changes: copied while their app writes to them,
     /// they may arrive half-written.
     fn units_warning(setup: &JobSetup, plan: &Plan, source: &Snapshot, destination: &Snapshot) -> Option<String> {
-        let exists = |key: &str| source.contains(key) || destination.contains(key);
-        let units: BTreeSet<Unit> = plan.work().filter_map(|action| Unit::of(action.path(), exists)).collect();
+        let units: BTreeSet<Unit> = plan.work().filter_map(|action| Unit::of(action.path(), source, destination)).collect();
         let names: Vec<String> = units
             .iter()
             .map(|unit| {
@@ -1184,6 +1183,35 @@ mod tests {
             Some("1 item only on the destination is copied to the source. By Charon's record of the last sync, 1 of them was on both sides then, so it was most likely removed since: “b.txt”.")
         );
         assert_eq!(Engine::one_side_only(&Plan::default(), &memory), None);
+    }
+
+    /// Only what really is an app's package or a database asks for its app to be closed:
+    /// not a single-file document or a private key that is only named like one.
+    #[test]
+    fn only_real_libraries_and_databases_ask_for_their_app_to_be_closed() {
+        let setup = JobSetup {
+            name: String::new(),
+            source: "/a".into(),
+            destination: "/b".into(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let file = Entry::file(1, 10_000);
+        let source: Snapshot = [("server.key", file), ("Budget.numbers", file), ("Talk.key", Entry::dir()), ("Talk.key/Index.zip", file)]
+            .iter()
+            .map(|(key, entry)| (key.to_string(), *entry))
+            .collect();
+        let mut plan = Plan::default();
+        plan.push(Action::copy(Side::Destination, "server.key", file, None));
+        plan.push(Action::copy(Side::Destination, "Budget.numbers", file, None));
+        assert_eq!(Engine::units_warning(&setup, &plan, &source, &Snapshot::new()), None);
+        plan.push(Action::copy(Side::Destination, "Talk.key/Index.zip", file, None));
+        let warning = Engine::units_warning(&setup, &plan, &source, &Snapshot::new()).unwrap();
+        assert!(warning.starts_with("“Talk.key” is an app library or document."), "{warning}");
     }
 
     #[test]

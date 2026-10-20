@@ -430,8 +430,7 @@ impl Engine {
     /// A conflict as the window shows it, saying when it's about a whole app library or
     /// database.
     fn conflict_item(survey: &Survey, key: &str, source: Option<Entry>, destination: Option<Entry>) -> ConflictItem {
-        let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
-            .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
+        let unit = Unit::of(key, &survey.source, &survey.destination).filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
         ConflictItem::new(key, &survey.spelling(key), source, destination).whole(unit.as_ref())
     }
 
@@ -708,7 +707,7 @@ impl Engine {
                 danger: false,
             },
             Action::Conflict { source, destination, path: key } => {
-                let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
+                let unit = Unit::of(key, &survey.source, &survey.destination)
                     .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
                 let reason = match (source, destination) {
                     _ if unit.is_some() => format!(

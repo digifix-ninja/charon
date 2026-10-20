@@ -644,8 +644,8 @@ impl<'a> Executor<'a> {
             Action::Delete { item: EntryKind::File, other: None, .. } => !step.makes_room(),
             _ => false,
         };
-        let exists = |key: &str| self.spellings.snapshot(Side::Source).contains(key) || self.spellings.snapshot(Side::Destination).contains(key);
-        groupable.then(|| Unit::database_of(step.action.path(), exists)).flatten()
+        let (source, destination) = (self.spellings.snapshot(Side::Source), self.spellings.snapshot(Side::Destination));
+        groupable.then(|| Unit::database_of(step.action.path(), source, destination)).flatten()
     }
 
     /// The databases with more than one file to carry in this plan, with their steps.
