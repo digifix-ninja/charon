@@ -1,7 +1,8 @@
 //! Safe deletes: removed and replaced items go into `.charon-trash/<run time>_<run id>/` at
 //! the root of their folder, and are cleared out after a number of days. Clearing out is
 //! part of what a review lists ("Also empties 120 items older than 30 days…"): only the
-//! dated folders the person saw listed are removed.
+//! dated folders the person saw listed are removed, so runs nobody looked at (full
+//! automation) never empty the trash.
 //!
 //! A removed item is moved there. A replaced file is *copied* there instead and then
 //! replaced in place: an app that has the file open (Pages, TextEdit, Preview…) follows the

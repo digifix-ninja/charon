@@ -29,7 +29,7 @@ pub use runs::SyncStart;
 use crate::error::{Error, Result};
 use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, UpgradeNotice, WaitingJob};
 use crate::plan::Side;
-use crate::store::{Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState};
+use crate::store::{Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
 use runtime::{JobRuntime, Look};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -75,6 +75,8 @@ struct Inner {
     baselines: Baselines,
     /// Mirror and Backup: copies whose dates didn't stick on the destination.
     landings: Landings,
+    /// Full automation: what automatic runs changed since the person last confirmed a list.
+    unattended: Unattended,
     journal: Journal,
     state: Mutex<StoredState>,
     runtime: Mutex<HashMap<JobId, JobRuntime>>,
@@ -107,6 +109,7 @@ impl Engine {
                 state_file,
                 baselines: Baselines::new(folder.baselines()),
                 landings: Landings::new(folder.landings()),
+                unattended: Unattended::new(folder.unattended()),
                 journal: Journal::new(folder.logs()),
                 state: Mutex::new(state),
                 runtime: Mutex::new(HashMap::new()),

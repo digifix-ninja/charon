@@ -3,6 +3,7 @@
 //! * `state_file.rs` – `StateFile`: settings and jobs (`charon-state.json`), saved atomically
 //! * `baselines.rs`  – `Baselines`: the two-way memory of each job
 //! * `landings.rs`   – `Landings`: Mirror and Backup copies whose dates didn't stick
+//! * `unattended.rs` – `Unattended`: what automatic runs changed since the last confirmed list
 //! * `journal.rs`    – `Journal`: one activity log per job
 //! * `lock.rs`       – `DataLock`: only one Charon works with the data folder at a time
 //! * `atomic.rs`     – writing a file so a crash never leaves it half-written
@@ -13,12 +14,14 @@ mod journal;
 mod landings;
 mod lock;
 mod state_file;
+mod unattended;
 
 pub use baselines::{Baselines, Memory};
 pub use journal::{Journal, LogLine};
 pub use landings::Landings;
 pub use lock::DataLock;
 pub use state_file::{StateFile, StoredState};
+pub use unattended::Unattended;
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +56,12 @@ impl DataFolder {
     /// Mirror and Backup: the copies whose dates didn't stick (see `Landings`).
     pub fn landings(&self) -> PathBuf {
         self.root.join("landings")
+    }
+
+    /// Full automation: what automatic runs changed since the last confirmed list (see
+    /// `Unattended`).
+    pub fn unattended(&self) -> PathBuf {
+        self.root.join("unattended")
     }
 
     pub fn logs(&self) -> PathBuf {

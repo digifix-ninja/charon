@@ -20,7 +20,7 @@ mod units;
 
 pub use action::{Action, Note, NoteKind, Plan, PlanSummary, Side};
 pub use baseline::{Baseline, Pair, Settled};
-pub use guard::{Guard, Recent};
+pub use guard::{Footprints, Guard, LongCount, Recent};
 pub use one_way::OneWayPlanner;
 pub use resolve::Resolution;
 pub use two_way::TwoWayPlanner;

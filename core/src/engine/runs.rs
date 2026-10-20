@@ -31,6 +31,10 @@ use std::time::{Duration, Instant};
 pub(crate) const STOPPED: &str = "You stopped the last sync. Nothing more happens until you confirm the list.";
 /// Why a job waits for an OK after a sync Charon couldn't record.
 pub(crate) const UNRECORDED: &str = "Charon couldn't record the last sync, so nothing more happens until you confirm the list.";
+/// Why a job with full automation waits for an OK after Charon couldn't count what an
+/// automatic sync removed or replaced.
+pub(crate) const UNCOUNTED: &str =
+    "Charon couldn't count what the last automatic sync removed or replaced, so nothing more happens until you confirm the list.";
 /// Live progress reaches the window at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 /// At most this many failed or skipped items are written to the log per run.
@@ -356,7 +360,10 @@ impl Engine {
             }
         }
         let flushed = executor.flush();
-        if complete && flushed.is_ok() {
+        // Old trash goes only after a list that said so was confirmed. A run nobody looked at
+        // never empties it: the originals in there may be the only good copies of files a
+        // broken app is slowly damaging (see `Guard::since_confirmed`).
+        if complete && flushed.is_ok() && crossing.approved {
             for (side, look) in &survey.housekeeping.trash {
                 let names: Vec<String> = look.expired.iter().map(|e| e.name.clone()).collect();
                 Trash::sweep(survey.setup.root(*side), &names);
@@ -600,6 +607,16 @@ impl Engine {
         let unrecorded = recorded.as_ref().is_some_and(|recorded| !recorded.recorded);
         summary.finished_at = Utc::now();
         let finished_at = summary.finished_at;
+        // Full automation: what a run nobody looked at removed or replaced joins the long
+        // count (see `Unattended`). If that can't be saved, the guard can't see damage that
+        // spreads slowly, so the next sync waits for the person's OK.
+        let uncounted = match recorded.as_ref().filter(|_| !crossing.approved) {
+            Some(recorded) => {
+                let (source, destination) = &recorded.destroyed;
+                self.inner.unattended.note(id, finished_at, source, destination, self.settings().trash_days).err()
+            }
+            None => None,
+        };
         let saved = self.change_job_anyway(id, |stored| {
             stored.last_run = Some(summary.clone());
             if summary.error.is_none() && !summary.cancelled {
@@ -628,6 +645,9 @@ impl Engine {
             } else if unrecorded {
                 stored.needs_review = true;
                 stored.held = Some(UNRECORDED.into());
+            } else if uncounted.is_some() {
+                stored.needs_review = true;
+                stored.held = Some(UNCOUNTED.into());
             } else if confirmed_clean {
                 stored.needs_review = false;
                 stored.held = None;
@@ -641,6 +661,16 @@ impl Engine {
         if let Err(e) = saved {
             log::error!("couldn't save the result of a sync of {}: {e}", job.setup.name);
             self.inner.journal.error(id, &format!("Charon couldn't save the result of this sync ({e}); it holds while Charon runs"));
+        }
+        if let Some(e) = uncounted {
+            log::error!("couldn't count what an automatic sync of {} changed: {e}", job.setup.name);
+            self.inner.journal.error(id, &format!("Charon couldn't count what this automatic sync removed or replaced ({e}); the next sync waits for your OK"));
+        }
+        if confirmed_clean {
+            // The person saw and confirmed a list: the long count starts again from here.
+            if let Err(e) = self.inner.unattended.forget(id) {
+                log::warn!("couldn't start the count of automatic changes of {} again: {e}", job.setup.name);
+            }
         }
         let line = summary.describe();
         match (&summary.error, summary.failed) {

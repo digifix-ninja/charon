@@ -250,7 +250,7 @@ impl Engine {
         // Why the job waits, where this look can't tell by itself.
         match job.held.as_deref() {
             Some(held) if purpose == Purpose::Review && held == runs::STOPPED => warnings.push(Warning::info(held)),
-            Some(held) if purpose == Purpose::Review && held == runs::UNRECORDED => warnings.push(Warning::caution(held)),
+            Some(held) if purpose == Purpose::Review && (held == runs::UNRECORDED || held == runs::UNCOUNTED) => warnings.push(Warning::caution(held)),
             _ => {}
         }
 
@@ -305,11 +305,14 @@ impl Engine {
             holds.push(refusal.clone());
         }
 
-        // What automatic syncs removed or replaced today counts too: for the runs nobody
-        // looks at, and in the list of a job that has them, so it shows why a run was held.
+        // What automatic syncs removed or replaced, today and since the last confirmed list,
+        // counts too: for the runs nobody looks at, and in the list of a job that has them,
+        // so it shows why a run was held.
         let recent = (purpose == Purpose::Automatic || (purpose == Purpose::Review && setup.full_automation)).then(|| {
-            let (source, destination) = job.recent_automatic(Utc::now());
-            Recent { source, destination }
+            let now = Utc::now();
+            let (source, destination) = job.recent_automatic(now);
+            let since_confirmed = self.inner.unattended.load(&job.id, self.settings().trash_days, now);
+            Recent { source, destination, since_confirmed }
         });
         for concern in Guard::concerns(&plan, &source, &destination, &baseline, recent.as_ref()) {
             holds.push(concern.clone());

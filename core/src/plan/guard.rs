@@ -30,12 +30,14 @@ const EMPTIED_FOLDER: usize = 5;
 /// At most this many names are listed in one concern.
 const LISTED: usize = 3;
 
-/// Files and links removed or replaced by automatic runs during the last day, per side (by
-/// key: a file replaced again and again counts once).
+/// Files and links removed or replaced by automatic runs, per side (by key: a file replaced
+/// again and again counts once): during the last day, and since the person last confirmed a
+/// list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Recent {
     pub source: BTreeSet<String>,
     pub destination: BTreeSet<String>,
+    pub since_confirmed: LongCount,
 }
 
 impl Recent {
@@ -45,6 +47,34 @@ impl Recent {
             Side::Destination => &self.destination,
         }
     }
+}
+
+/// What automatic runs removed or replaced since the person last confirmed a list, for as
+/// long as .charon-trash keeps the originals (see `store::Unattended`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LongCount {
+    pub source: Footprints,
+    pub destination: Footprints,
+    /// The count couldn't be read: nobody can say what automatic runs did.
+    pub lost: bool,
+}
+
+impl LongCount {
+    pub fn on(&self, side: Side) -> &Footprints {
+        match side {
+            Side::Source => &self.source,
+            Side::Destination => &self.destination,
+        }
+    }
+}
+
+/// What automatic runs removed or replaced on one side since the last confirmed list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Footprints {
+    /// The keys of the files and links, each once.
+    pub keys: BTreeSet<String>,
+    /// There were more than the count keeps, so not all of them are named.
+    pub overflowing: bool,
 }
 
 pub struct Guard;
@@ -72,8 +102,9 @@ impl Guard {
     }
 
     /// Everything about this plan that deserves a careful look, in words. `recent` is given
-    /// for jobs with full automation: what automatic runs already removed or replaced today
-    /// counts too, so damage that spreads slowly is caught as well.
+    /// for jobs with full automation: what automatic runs already removed or replaced, today
+    /// and since the person last confirmed a list, counts too, so damage that spreads slowly
+    /// is caught as well, while its originals are still in .charon-trash.
     pub fn concerns(plan: &Plan, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, recent: Option<&Recent>) -> Vec<String> {
         let mut concerns = Vec::new();
         for (side, snapshot, other) in [(Side::Source, source, destination), (Side::Destination, destination, source)] {
@@ -92,15 +123,24 @@ impl Guard {
             } else {
                 None
             };
-            let within_a_day = match (&this_run, recent) {
-                (None, Some(recent)) if destructive > 0 => Self::within_a_day(plan, snapshot, recent.on(side), side),
+            let earlier = match (&this_run, recent) {
+                (None, Some(recent)) if destructive > 0 => Self::within_a_day(plan, snapshot, recent.on(side), side)
+                    .or_else(|| Self::since_confirmed(plan, snapshot, recent.since_confirmed.on(side), side)),
                 _ => None,
             };
-            concerns.extend(this_run.into_iter().chain(within_a_day));
+            concerns.extend(this_run.into_iter().chain(earlier));
             if let Some(concern) = Self::emptied_files(plan, side) {
                 concerns.push(concern);
             }
             concerns.extend(Self::emptied_folders(plan, other, baseline, side));
+        }
+        let destroys = plan.destructive_on(Side::Source) + plan.destructive_on(Side::Destination) > 0;
+        if destroys && recent.is_some_and(|recent| recent.since_confirmed.lost) {
+            concerns.push(
+                "Charon couldn't read its count of what automatic syncs removed or replaced since you last confirmed a list, \
+                 so it can't tell whether damage has been spreading slowly. Please look at this list before anything more is removed or replaced."
+                    .into(),
+            );
         }
         concerns
     }
@@ -112,7 +152,12 @@ impl Guard {
 
     /// Many files and a good share of them, or very many.
     fn mass(hit: u64, total: u64) -> bool {
-        (hit > MANY && hit as f64 > total as f64 * MASS_SHARE) || hit > MASS_MAX
+        Self::large_share(hit, total) || hit > MASS_MAX
+    }
+
+    /// Many files that are a good share of them.
+    fn large_share(hit: u64, total: u64) -> bool {
+        hit > MANY && hit as f64 > total as f64 * MASS_SHARE
     }
 
     /// Several files that are at least half of them.
@@ -131,6 +176,25 @@ impl Guard {
             format!(
                 "Automatic syncs and this one would remove or replace {} of the {} files in the {} within a day.",
                 human_count(today),
+                human_count(total),
+                side.word()
+            )
+        })
+    }
+
+    /// The files this plan and the automatic runs since the last confirmed list (`earlier`)
+    /// removed or replaced on `side` together, each counted once, if that's a good share of
+    /// them. A day's count can't see damage that spreads more slowly than that (a broken
+    /// tool rewriting a few dozen files an hour); this one has no fixed ceiling, so even a
+    /// very large folder is held long before all of it is replaced.
+    fn since_confirmed(plan: &Plan, snapshot: &Snapshot, earlier: &Footprints, side: Side) -> Option<String> {
+        let hit: BTreeSet<&str> = earlier.keys.iter().map(String::as_str).chain(plan.destructive_paths_on(side)).collect();
+        let gone = earlier.keys.iter().filter(|key| !snapshot.contains(key)).count() as u64;
+        let (hit, total) = (hit.len() as u64, snapshot.file_count() as u64 + gone);
+        (earlier.overflowing || Self::large_share(hit, total)).then(|| {
+            format!(
+                "Automatic syncs since you last confirmed a list, and this one, would remove or replace {} of the {} files in the {}.",
+                human_count(hit),
                 human_count(total),
                 side.word()
             )
@@ -295,7 +359,7 @@ mod tests {
     }
 
     fn earlier(names: impl IntoIterator<Item = String>) -> Recent {
-        Recent { source: BTreeSet::new(), destination: names.into_iter().collect() }
+        Recent { destination: names.into_iter().collect(), ..Recent::default() }
     }
 
     fn with_recent(plan: &Plan, source: &Snapshot, destination: &Snapshot, recent: &Recent) -> Vec<String> {
@@ -341,6 +405,49 @@ mod tests {
         // 21 different files of 80 aren't ordinary.
         let recent = earlier((1..21).map(|i| format!("f{i}.txt")));
         assert!(!with_recent(&plan, &files(80), &files(80), &recent).is_empty());
+    }
+
+    #[test]
+    fn damage_slower_than_a_day_is_caught_long_before_everything_is_replaced() {
+        // A broken tool rewrites 41 photos an hour of 10,000: under the day's count, which
+        // never holds fewer than 1,000 files a day on a side this large.
+        let names = |hours: std::ops::Range<usize>| (hours.start * 41..hours.end * 41).map(|i| format!("f{i}.txt"));
+        let (source, destination) = (files(10_000), files(10_000));
+        let mut since_confirmed = LongCount::default();
+        let mut hour = 0;
+        loop {
+            let plan = replacing(names(hour..hour + 1));
+            let recent = Recent { destination: names(hour.saturating_sub(23)..hour).collect(), since_confirmed: since_confirmed.clone(), ..Recent::default() };
+            let found = with_recent(&plan, &source, &destination, &recent);
+            if !found.is_empty() {
+                assert!(found[0].contains("since you last confirmed a list"), "{found:?}");
+                break;
+            }
+            since_confirmed.destination.keys.extend(names(hour..hour + 1));
+            hour += 1;
+            assert!(hour * 41 < 10_000, "every file was replaced without a hold");
+        }
+        // Held once a quarter of the folder was replaced: within three days.
+        assert!(hour < 72, "held only after {hour} hours");
+
+        // Without the long count, the same pace is never held.
+        let day_only = Recent { destination: names(hour - 23..hour).collect(), ..Recent::default() };
+        assert!(with_recent(&replacing(names(hour..hour + 1)), &source, &destination, &day_only).is_empty());
+    }
+
+    #[test]
+    fn a_long_count_that_overflowed_or_was_lost_needs_a_look() {
+        let plan = replacing(["f0.txt".to_string()]);
+        let mut recent = Recent::default();
+        assert!(with_recent(&plan, &files(1_000_000), &files(1_000_000), &recent).is_empty());
+        recent.since_confirmed.destination.overflowing = true;
+        assert!(!with_recent(&plan, &files(1_000_000), &files(1_000_000), &recent).is_empty());
+        let lost = Recent { since_confirmed: LongCount { lost: true, ..LongCount::default() }, ..Recent::default() };
+        assert!(!with_recent(&plan, &files(100), &files(100), &lost).is_empty());
+        // A plan that removes and replaces nothing is no danger, whatever the count says.
+        let mut adding = Plan::default();
+        adding.push(Action::copy(Side::Destination, "new.txt", Entry::file(1, 10_000), None));
+        assert!(with_recent(&adding, &files(100), &files(100), &lost).is_empty());
     }
 
     #[test]
