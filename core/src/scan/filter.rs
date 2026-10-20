@@ -186,8 +186,11 @@ impl ExcludeFilter {
     }
 
     /// The pattern that leaves out exactly the item at `path` (relative, `/`-separated).
+    /// Every character a pattern gives a meaning is written as itself: `*`, `?`, brackets
+    /// and braces, and a backslash, which on macOS and Linux would make the next character
+    /// plain and drop out of the name.
     pub fn pattern_for(path: &str) -> String {
-        format!("/{}", globset::escape(path.trim_matches('/')))
+        format!("/{}", globset::escape(path.trim_matches('/')).replace('\\', "[\\]"))
     }
 
     /// Whether the item at `path` (relative, `/`-separated, NFC) is left alone.
@@ -264,6 +267,29 @@ mod tests {
         let exact = ExcludeFilter::new(&[ExcludeFilter::pattern_for("Scans [2019]/raw")], false).unwrap();
         assert!(exact.excludes("Scans [2019]/raw"));
         assert!(!exact.excludes("Scans 2/raw"));
+    }
+
+    /// "Leave this out" excludes exactly the item, whatever its name holds: on macOS and
+    /// Linux a name may hold a backslash, which a pattern otherwise reads as "the next
+    /// character is plain".
+    #[test]
+    fn the_pattern_for_an_item_leaves_out_exactly_that_item() {
+        let mut names = vec!["Scans [2019]/raw", "a*b?c", "{x,y}", "[!z]", "dir/[a-c]"];
+        if cfg!(unix) {
+            names.extend(["Q1\\Q2 report.pdf", "draft\\", "\\*", "a\\[b]"]);
+        }
+        for name in names {
+            let pattern = ExcludeFilter::pattern_for(name);
+            assert!(ExcludeFilter::check(std::slice::from_ref(&pattern)).is_ok(), "{pattern}");
+            for folded in [false, true] {
+                let filter = ExcludeFilter::new(std::slice::from_ref(&pattern), folded).unwrap();
+                assert!(filter.excludes(name), "{pattern} leaves out {name}");
+                let other = name.replace('\\', "");
+                assert!(other == name || !filter.excludes(&other), "{pattern} leaves out only {name}, not {other}");
+            }
+        }
+        let backslash = ExcludeFilter::new(&[ExcludeFilter::pattern_for("Q1\\Q2.pdf")], false).unwrap();
+        assert!(!backslash.excludes("Q1Q2.pdf") && !backslash.excludes("Q1/Q2.pdf"));
     }
 
     #[test]
