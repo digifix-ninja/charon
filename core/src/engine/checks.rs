@@ -296,6 +296,21 @@ impl Engine {
         }
     }
 
+    /// A job whose last sync is dated later than now synced while the clock on the wall was
+    /// ahead, or the clock is behind now. How long ago it really synced can't be told, so the
+    /// sync counts as made now: the row's "Not synced for N days" then comes once the job
+    /// hasn't synced for days from here, not days after the clock reaches the old date (see
+    /// `stale`). The new date holds while Charon runs even when it can't be saved.
+    pub fn correct_syncs_dated_ahead(&self) {
+        let now = Utc::now();
+        let ahead: Vec<JobId> = self.state().jobs.iter().filter(|job| job.last_synced.is_some_and(|at| at > now)).map(|job| job.id.clone()).collect();
+        for id in ahead {
+            if let Err(e) = self.change_job_anyway(&id, |job| job.last_synced = job.last_synced.map(|at| at.min(now))) {
+                log::warn!("couldn't save when job {id} last synced: {e}");
+            }
+            self.publish(&id);
+        }
+    }
 }
 
 #[cfg(test)]

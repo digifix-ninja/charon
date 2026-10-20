@@ -138,6 +138,8 @@ impl Autopilot {
             self.engine.after_a_gap();
         }
         self.last_tick = Some(moment);
+        // A sync dated later than now was made while the clock was ahead.
+        self.engine.correct_syncs_dated_ahead();
         // Notices an older Charon at work, so the window says so before anything tries to sync.
         self.engine.older_charon_running();
         // While Charon's state can't be saved, tries again now and then (at most once a
@@ -555,5 +557,28 @@ mod tests {
         engine.leave_a_removal_for_later(&id, "photo.jpg", looked);
         assert!(!engine.take_follow_up_at(&id, looked.after(minutes(1))));
         assert!(engine.take_follow_up_at(&id, looked.after(minutes(2))));
+    }
+
+    #[test]
+    fn a_sync_dated_later_than_now_counts_as_made_when_charon_finds_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, _, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, _changes) = pilot(&engine);
+        let synced = || engine.job(&id).unwrap().job.last_synced.unwrap();
+        let before = synced();
+        pilot.tick();
+        assert_eq!(synced(), before, "a sync dated before now stays as it was");
+
+        // The job synced while the clock was three days ahead, which has been set right since,
+        // and its drive then went into a drawer.
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() + chrono::Duration::days(3), own: Instant::now() });
+        fs::remove_dir_all(&b).unwrap();
+        let set_right = Utc::now();
+        pilot.tick();
+        assert!(set_right <= synced() && synced() <= Utc::now(), "still dated {}", synced());
+        // A week later, the row says it hasn't synced since.
+        let job = engine.job(&id).unwrap().job;
+        let later = synced() + chrono::Duration::days(7) + chrono::Duration::hours(1);
+        assert_eq!(Engine::stale(&job, None, true, later).as_deref(), Some("Not synced for 7 days"));
     }
 }
