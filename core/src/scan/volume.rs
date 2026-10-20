@@ -7,11 +7,9 @@
 //! computer's changes late. Charon looks at each folder's drive before it plans, so an item
 //! the other drive can't hold becomes a note instead of a step that fails on every run.
 
-use crate::scan::MARKER_FOLDER;
+use crate::scan::{is_partial, new_partial_name};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::path::Path;
 use unicode_normalization::UnicodeNormalization;
 
 /// The family of file system a drive uses.
@@ -50,6 +48,11 @@ pub struct Volume {
     pub network: bool,
     /// Whether "Report.pdf" and "report.pdf" are two names on this drive.
     pub case_sensitive: bool,
+    /// The drive couldn't be asked how it treats case (an empty folder Charon can't write
+    /// to, or names without letters), so `case_sensitive` is what its kind usually does.
+    /// Kept with the job's record of its drives, so a later answer isn't taken for a change.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub case_guessed: bool,
     /// A sync found that this drive refuses symbolic links (some network shares do, though
     /// their kind would allow them). Kept with the job's record of its drives.
     #[serde(default, skip_serializing_if = "is_false")]
@@ -154,10 +157,12 @@ impl Volume {
             name: Self::folder_name(root),
             network: false,
             case_sensitive: false,
+            case_guessed: false,
             refuses_links: false,
         });
-        let asked = system::case_sensitive(root).or_else(|| ProbeTurn::of(root).ask(|| probe_case(root).or_else(|| probe_case_with_own_file(root))));
-        volume.case_sensitive = asked.unwrap_or_else(|| volume.kind.usually_case_sensitive());
+        let answer = system::case_sensitive(root).or_else(|| probe_case(root)).or_else(|| probe_case_with_own_file(root));
+        volume.case_sensitive = answer.unwrap_or_else(|| volume.kind.usually_case_sensitive());
+        volume.case_guessed = answer.is_none();
         volume
     }
 
@@ -187,7 +192,15 @@ impl Volume {
     /// most cloud drives), which keeps its own picture of the folders for a while. A look at
     /// one item there opens it, so the drive itself answers.
     pub fn shows_changes_late(&self) -> bool {
-        self.network || self.fs.to_ascii_lowercase().contains("fuse")
+        self.network || self.run_by_a_program()
+    }
+
+    /// Whether a program runs this drive instead of the system (FUSE). A disk of the
+    /// computer's own that a program reads (on Linux, "fuseblk": a USB drive through
+    /// ntfs-3g or exfat-fuse) doesn't count: nobody else changes it.
+    fn run_by_a_program(&self) -> bool {
+        let fs = self.fs.to_ascii_lowercase();
+        fs.contains("fuse") && fs != "fuseblk"
     }
 
     /// Whether this drive keeps times in local time, so a daylight-saving change or a trip
@@ -324,7 +337,10 @@ pub(crate) fn windows_name_problem(name: &str) -> Option<&'static str> {
 
 /// Asks the drive whether it tells upper and lower case apart, using names already in the
 /// folder: if "Photos" exists, is "pHOTOS" the same item? Only ASCII letters are swapped.
-/// `None` when no name in the folder can tell.
+/// Charon's own temporary files are passed over (another look's probe, or a copy being
+/// made, may be gone a moment later), and a name only found once in its own spelling counts
+/// when it's still there after the look for the other spelling. `None` when no name in the
+/// folder can tell.
 fn probe_case(root: &Path) -> Option<bool> {
     let items = std::fs::read_dir(root).ok()?;
     let names = items.take(64).flatten().filter_map(|item| item.file_name().to_str().map(str::to_string));
@@ -332,13 +348,14 @@ fn probe_case(root: &Path) -> Option<bool> {
 }
 
 /// What the first of `names` that can tell says about case (see `probe_case`), looking
-/// items up with `look`. A name that isn't found in other case only tells when its own
-/// item is still there afterwards: an item removed in between (a temporary file an app
-/// cleared, or another look's probe folder) would make any drive look case-sensitive.
+/// items up with `look`. Charon's own temporary files are passed over, and a name that
+/// isn't found in other case only tells when its own item is still there afterwards: an
+/// item removed in between (a temporary file an app cleared) would make any drive look
+/// case-sensitive.
 fn case_told_by(names: impl Iterator<Item = String>, look: impl Fn(&str) -> std::io::Result<std::fs::Metadata>) -> Option<bool> {
     for name in names {
         let swapped = swap_case(&name);
-        if swapped == name {
+        if swapped == name || is_partial(&name) {
             continue;
         }
         let Ok(original) = look(&name) else { continue };
@@ -357,62 +374,22 @@ fn case_told_by(names: impl Iterator<Item = String>, look: impl Fn(&str) -> std:
 
 /// Asks the drive with a file of Charon's own where the folder's names can't tell (an empty
 /// folder, or names without letters), so a folder gets the same answer empty as once it
-/// fills up. The file is made in a `.charon` folder made for this, and both are removed at
-/// once. `None` where the folder can't be written to.
+/// fills up. The file has a name no other look or sync uses (one of Charon's temporary
+/// names, which every look passes over), so looks at the same folder at once each get the
+/// drive's answer, and it's removed at once. `None` where the folder can't be written to.
 fn probe_case_with_own_file(root: &Path) -> Option<bool> {
-    let folder = root.join(MARKER_FOLDER);
-    std::fs::create_dir(&folder).ok()?;
-    let name = format!("Case-Probe-{:016x}.tmp", uuid::Uuid::new_v4().as_u128() as u64);
-    let probe = folder.join(&name);
-    let answer = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).ok().and_then(|_| {
-        match std::fs::symlink_metadata(folder.join(swap_case(&name))) {
-            Ok(_) => Some(false),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
-            Err(_) => None,
-        }
-    });
-    let _ = std::fs::remove_file(&probe);
-    let _ = std::fs::remove_dir(&folder);
+    let name = new_partial_name();
+    let probe = root.join(&name);
+    std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).ok()?;
+    let answer = match std::fs::symlink_metadata(root.join(swap_case(&name))) {
+        Ok(_) => Some(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    };
+    if let Err(e) = std::fs::remove_file(&probe) {
+        log::warn!("couldn't remove the case probe {}: {e}", probe.display());
+    }
     answer
-}
-
-/// One look at a time asks a folder's drive about case. Two looks at once (a background look
-/// and a list the person asked for) would each see the other's probe folder come and go, and
-/// could answer differently: a drive that ignores case could look case-sensitive.
-struct ProbeTurn<'a> {
-    root: &'a Path,
-}
-
-impl<'a> ProbeTurn<'a> {
-    /// The folders being asked about right now, and the signal that one of them is free.
-    fn busy() -> &'static (Mutex<HashSet<PathBuf>>, Condvar) {
-        static BUSY: OnceLock<(Mutex<HashSet<PathBuf>>, Condvar)> = OnceLock::new();
-        BUSY.get_or_init(Default::default)
-    }
-
-    /// Waits until no other look is asking about `root`, then takes the turn.
-    fn of(root: &'a Path) -> Self {
-        let (busy, freed) = Self::busy();
-        let mut asking = busy.lock().unwrap_or_else(|e| e.into_inner());
-        while asking.contains(root) {
-            asking = freed.wait(asking).unwrap_or_else(|e| e.into_inner());
-        }
-        asking.insert(root.to_path_buf());
-        Self { root }
-    }
-
-    /// Asks, then gives the turn back (also if the asking panics).
-    fn ask<T>(self, probe: impl FnOnce() -> T) -> T {
-        probe()
-    }
-}
-
-impl Drop for ProbeTurn<'_> {
-    fn drop(&mut self) {
-        let (busy, freed) = Self::busy();
-        busy.lock().unwrap_or_else(|e| e.into_inner()).remove(self.root);
-        freed.notify_all();
-    }
 }
 
 /// `name` with the upper and lower case of its ASCII letters swapped.
@@ -479,7 +456,7 @@ mod system {
             "/" | "/System/Volumes/Data" => "startup disk".to_string(),
             other => Path::new(other).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| other.to_string()),
         };
-        Some(Volume { kind, fs, mount, name, network: !local, case_sensitive: false, refuses_links: false })
+        Some(Volume { kind, fs, mount, name, network: !local, case_sensitive: false, case_guessed: false, refuses_links: false })
     }
 
     /// macOS answers this directly.
@@ -502,6 +479,9 @@ mod system {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
+    /// The kind number `statfs` gives every drive run by a program (FUSE).
+    const FUSE: u64 = 0x6573_5546;
+
     pub fn volume_of(root: &Path) -> Option<Volume> {
         let path = CString::new(root.as_os_str().as_bytes()).ok()?;
         let mut info: libc::statfs = unsafe { std::mem::zeroed() };
@@ -521,18 +501,41 @@ mod system {
             0x2FC1_2FC1 => ("zfs", false),
             0x517B | 0xFF53_4D42 | 0xFE53_4D42 => ("cifs", true),
             0x6969 => ("nfs", true),
-            0x6573_5546 => ("fuse", false),
+            FUSE => ("fuse", false),
             0x0102_1994 => ("tmpfs", false),
             0x794C_7630 => ("overlay", false),
             _ => ("", false),
         };
         let fs = if fs.is_empty() { format!("0x{magic:x}") } else { fs.to_string() };
+        // A drive run by a program says which one in the system's list of mounts.
+        let fs = if magic == FUSE { fuse_type(root).unwrap_or(fs) } else { fs };
         let mount = mount_point(root);
         let name = match mount.as_str() {
             "/" => "system disk".to_string(),
             other => Path::new(other).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| other.to_string()),
         };
-        Some(Volume { kind: FsKind::from_name(&fs), fs, mount, name, network, case_sensitive: true, refuses_links: false })
+        Some(Volume { kind: FsKind::from_name(&fs), fs, mount, name, network, case_sensitive: true, case_guessed: false, refuses_links: false })
+    }
+
+    /// The type the system's list of mounts gives the FUSE drive `root` is on: "fuse.sshfs",
+    /// "fuse.rclone", or "fuseblk" for a disk a program reads (ntfs-3g, exfat-fuse).
+    fn fuse_type(root: &Path) -> Option<String> {
+        let device = std::fs::metadata(root).ok()?.dev();
+        let mounts = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+        mount_type(&mounts, libc::major(device), libc::minor(device))
+    }
+
+    /// The type of the mount of device `major:minor` in `mounts` (the lines of
+    /// `/proc/self/mountinfo`: the device is the third field, the type follows " - ").
+    pub(super) fn mount_type(mounts: &str, major: u32, minor: u32) -> Option<String> {
+        let device = format!("{major}:{minor}");
+        mounts.lines().find_map(|line| {
+            if line.split(' ').nth(2)? != device {
+                return None;
+            }
+            let (_, described) = line.split_once(" - ")?;
+            described.split(' ').next().map(str::to_string)
+        })
     }
 
     /// The topmost folder above `root` on the same drive.
@@ -610,7 +613,7 @@ mod system {
         let network = unc || remote;
         let name = if !label.is_empty() { label } else if !mount_text.is_empty() { mount_text.trim_end_matches('\\').to_string() } else { "drive".into() };
         let kind = if network { FsKind::Smb } else { FsKind::from_name(&fs) };
-        Some(Volume { kind, fs, mount: format!("{serial:08X}"), name, network, case_sensitive: false, refuses_links: false })
+        Some(Volume { kind, fs, mount: format!("{serial:08X}"), name, network, case_sensitive: false, case_guessed: false, refuses_links: false })
     }
 
     /// Windows programs see every drive as ignoring case.
@@ -638,7 +641,7 @@ mod tests {
     use super::*;
 
     fn volume(kind: FsKind) -> Volume {
-        Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Stick".into(), network: false, case_sensitive: false, refuses_links: false }
+        Volume { kind, fs: "x".into(), mount: "/x".into(), name: "Stick".into(), network: false, case_sensitive: false, case_guessed: false, refuses_links: false }
     }
 
     #[test]
@@ -715,16 +718,33 @@ mod tests {
         let fuse = Volume { fs: "fuse".into(), ..volume(FsKind::Other) };
         assert!(fuse.shows_changes_late() && fuse.coarse_times());
         assert!(Volume { fs: "macfuse".into(), ..volume(FsKind::Other) }.shows_changes_late());
+        assert!(Volume { fs: "fuse.sshfs".into(), ..volume(FsKind::Other) }.shows_changes_late());
         assert!(Volume { network: true, ..volume(FsKind::Smb) }.shows_changes_late());
+        // A USB drive read through ntfs-3g or exfat-fuse is the computer's own.
+        assert!(!Volume { fs: "fuseblk".into(), ..volume(FsKind::Other) }.shows_changes_late());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_list_of_mounts_tells_which_program_runs_a_drive() {
+        let mounts = "\
+22 1 8:2 / / rw,relatime shared:1 - ext4 /dev/sda2 rw
+49 28 0:41 / /mnt/nas rw,nosuid,nodev,relatime - fuse.sshfs me@nas:/photos rw,user_id=0,group_id=0
+51 28 8:17 / /media/me/USB\\040Stick rw,nosuid,nodev,relatime shared:9 - fuseblk /dev/sdb1 rw,user_id=0,group_id=0,blksize=4096
+";
+        assert_eq!(system::mount_type(mounts, 0, 41).as_deref(), Some("fuse.sshfs"));
+        assert_eq!(system::mount_type(mounts, 8, 17).as_deref(), Some("fuseblk"));
+        assert_eq!(system::mount_type(mounts, 8, 2).as_deref(), Some("ext4"));
+        assert_eq!(system::mount_type(mounts, 0, 99), None);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn an_empty_folder_gets_the_answer_it_gets_once_it_fills_up() {
-        // tmpfs is a kind of drive whose case setting Charon can't guess.
-        let shared_memory = Path::new("/dev/shm");
-        let tmp = if shared_memory.is_dir() { tempfile::tempdir_in(shared_memory) } else { tempfile::tempdir() }.unwrap();
-        assert!(Volume::of(tmp.path()).case_sensitive, "asked with a file of Charon's own");
+        use crate::scan::MARKER_FOLDER;
+        let tmp = folder_on_tmpfs();
+        let found = Volume::of(tmp.path());
+        assert!(found.case_sensitive && !found.case_guessed, "asked with a file of Charon's own");
         assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "and nothing is left behind");
         std::fs::write(tmp.path().join("Photos"), "x").unwrap();
         assert!(Volume::of(tmp.path()).case_sensitive);
@@ -735,25 +755,49 @@ mod tests {
         assert_eq!(std::fs::read_dir(tmp.path().join(MARKER_FOLDER)).unwrap().count(), 0);
     }
 
-    /// Two looks at the same empty folder at once (a background look and a list the person
-    /// asked for) get the same answer, and leave nothing behind.
-    #[test]
-    fn looks_at_the_same_empty_folder_at_once_agree() {
+    /// A folder on tmpfs, a kind of drive whose case setting Charon can't guess.
+    #[cfg(target_os = "linux")]
+    fn folder_on_tmpfs() -> tempfile::TempDir {
         let shared_memory = Path::new("/dev/shm");
-        let tmp = if shared_memory.is_dir() { tempfile::tempdir_in(shared_memory) } else { tempfile::tempdir() }.unwrap();
-        let expected = Volume::of(tmp.path()).case_sensitive;
-        for round in 0..40 {
-            let answers: Vec<bool> = std::thread::scope(|scope| {
-                let looks: Vec<_> = (0..6).map(|_| scope.spawn(|| Volume::of(tmp.path()).case_sensitive)).collect();
+        if shared_memory.is_dir() { tempfile::tempdir_in(shared_memory) } else { tempfile::tempdir() }.unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn looks_at_an_empty_folder_at_once_each_get_the_drives_answer() {
+        for _ in 0..50 {
+            let tmp = folder_on_tmpfs();
+            let answers: Vec<Volume> = std::thread::scope(|scope| {
+                let looks: Vec<_> = (0..4).map(|_| scope.spawn(|| Volume::of(tmp.path()))).collect();
                 looks.into_iter().map(|look| look.join().unwrap()).collect()
             });
-            assert!(answers.iter().all(|answer| *answer == expected), "round {round}: {answers:?}");
-            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "round {round}: nothing is left behind");
+            for answer in answers {
+                assert!(answer.case_sensitive && !answer.case_guessed, "{answer:?}");
+            }
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "nothing is left behind");
         }
     }
 
-    /// Another look's probe folder, or an app's temporary file, can go between the two looks
-    /// at a name: a name whose item went away tells nothing about case.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn charons_own_temporary_files_never_answer_for_the_drive() {
+        let tmp = folder_on_tmpfs();
+        std::fs::write(tmp.path().join(new_partial_name()), "").unwrap();
+        assert_eq!(probe_case(tmp.path()), None, "a copy being made may be gone a moment later");
+        assert!(Volume::of(tmp.path()).case_sensitive);
+    }
+
+    #[test]
+    fn a_guess_is_kept_with_the_record_only_when_there_was_one() {
+        let answered = volume(FsKind::Other);
+        assert!(!serde_json::to_string(&answered).unwrap().contains("caseGuessed"));
+        let guessed = Volume { case_guessed: true, ..volume(FsKind::Other) };
+        let saved = serde_json::to_string(&guessed).unwrap();
+        assert!(serde_json::from_str::<Volume>(&saved).unwrap().case_guessed);
+    }
+
+    /// An app's temporary file can go between the two looks at a name: a name whose item
+    /// went away tells nothing about case, and Charon's own temporary files never tell.
     #[test]
     fn an_item_that_goes_away_while_it_is_asked_about_tells_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -769,6 +813,7 @@ mod tests {
         assert_eq!(case_told_by(names(), vanishing), None, "removed after the first look");
         assert_eq!(case_told_by(names(), |name: &str| if name == ".charon" { Ok(item.clone()) } else { gone() }), Some(true));
         assert_eq!(case_told_by(names(), |_: &str| Ok(item.clone())), Some(false));
+        assert_eq!(case_told_by([new_partial_name()].into_iter(), |_: &str| Ok(item.clone())), None);
     }
 
     #[test]

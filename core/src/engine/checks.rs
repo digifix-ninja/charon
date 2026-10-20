@@ -6,7 +6,7 @@ use crate::engine::{Engine, EngineEvent};
 use crate::error::Error;
 use crate::model::{JobId, JobStatus, Trigger, WaitingJob};
 use crate::scan::{ExcludeFilter, Keys};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -82,11 +82,28 @@ impl Engine {
     }
 
     /// Whether the last look found changes a job that runs by itself would carry, and no
-    /// automatic run has tried them yet and ended before carrying anything.
+    /// automatic run has tried them yet and ended before carrying anything. Removals that
+    /// wait for an item to be missing a while longer don't count (see `Missing`).
     pub fn has_pending(&self, id: &JobId) -> bool {
+        let now = Utc::now();
         self.runtime().get(id).is_some_and(|rt| {
-            rt.look.as_ref().is_some_and(|look| look.items > 0 && rt.tried.is_none_or(|tried| look.at > tried))
+            rt.look.as_ref().is_some_and(|look| look.items > rt.missing.waiting(now) && rt.tried.is_none_or(|tried| look.at > tried))
         })
+    }
+
+    /// Whether removals a run left for later can be carried out now (see `Missing`): the job
+    /// then syncs once more, whatever starts its syncs otherwise.
+    pub fn take_follow_up(&self, id: &JobId) -> bool {
+        self.take_follow_up_at(id, Utc::now())
+    }
+
+    /// `take_follow_up` at the time `now`.
+    pub(crate) fn take_follow_up_at(&self, id: &JobId, now: DateTime<Utc>) -> bool {
+        if !self.runtime().get(id).is_some_and(|rt| rt.missing.follow_up_due(now)) {
+            return false;
+        }
+        let Ok(job) = self.stored_job(id) else { return false };
+        self.change_missing(&job, |missing| missing.take_follow_up(now))
     }
 
     /// Whether a list of the job's changes is being prepared or waits for the person's OK

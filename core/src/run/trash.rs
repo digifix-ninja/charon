@@ -21,7 +21,7 @@
 
 use crate::run::marker::hide;
 use crate::run::names;
-use crate::run::rename::rename_new;
+use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
 use crate::scan::{is_partial, Scanner, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
@@ -118,7 +118,7 @@ impl Trash {
         // The same path removed twice in one run (replaced, then replaced again): number it.
         for n in 1..=1000 {
             let name = Self::numbered(relative, n);
-            match rename_new(from, &base.join(&name)) {
+            match move_to_new_name(from, &base.join(&name)) {
                 Ok(()) => return Ok(self.list(root, &base, &name)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(e),
@@ -255,6 +255,9 @@ impl Trash {
         if !meta.is_file() {
             return Err(io::Error::other("only files are copied into the trash"));
         }
+        // A file only in the cloud is refused rather than downloaded (see
+        // `scan::Contents::open`); it stays open while it's copied.
+        let _reading = crate::scan::Contents::open(from)?;
         // The copy must be on the drive before the original is replaced.
         if let Err(e) = fs::copy(from, to).and_then(|_| Self::flush(to)) {
             let _ = fs::remove_file(to);

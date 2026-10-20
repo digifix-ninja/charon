@@ -19,8 +19,8 @@ mod volume;
 pub use contents::Contents;
 pub use entry::{Entry, EntryKind, ScanFacts, Skipped, Snapshot, MTIME_TOLERANCE_MS};
 pub use filter::{
-    is_charon_folder_in_other_case, is_clutter, is_legacy_partial, is_partial, is_system_folder, partial_started, ExcludeFilter, MARKER_FOLDER, PARTIAL_EXTENSION,
-    PARTIAL_PREFIX, PARTIAL_SUFFIX, TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, new_partial_name, partial_started, ExcludeFilter,
+    CLAIM_MODIFIED_MS, MARKER_FOLDER, PARTIAL_EXTENSION, PARTIAL_PREFIX, PARTIAL_SUFFIX, TRASH_FOLDER,
 };
 pub use keys::Keys;
 pub use root::RootId;

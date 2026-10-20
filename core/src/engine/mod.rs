@@ -12,8 +12,9 @@
 //!
 //! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
 //! the same order, the stored state before the live state. Nothing that looks at a job's
-//! folders or tells the window happens while either is held (saving the state file in the
-//! app's own data folder does, so a change counts only once it's saved).
+//! folders or tells the window happens while either is held (saving in the app's own data
+//! folder does: the state file, so a change counts only once it's saved, and what looks
+//! found missing, so two saves never come in the wrong order).
 
 mod checks;
 mod jobs;
@@ -29,8 +30,8 @@ pub use runs::SyncStart;
 use crate::error::{Error, Result};
 use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, UpgradeNotice, WaitingJob};
 use crate::plan::Side;
-use crate::store::{Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
-use runtime::{JobRuntime, Look};
+use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
+use runtime::{JobRuntime, Look, Missing};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,6 +78,8 @@ struct Inner {
     landings: Landings,
     /// Full automation: what automatic runs changed since the person last confirmed a list.
     unattended: Unattended,
+    /// Items found missing on a drive that may show changes late (see `Missing`).
+    absences: Absences,
     journal: Journal,
     state: Mutex<StoredState>,
     runtime: Mutex<HashMap<JobId, JobRuntime>>,
@@ -104,15 +107,25 @@ impl Engine {
         let lock = DataLock::acquire(folder.root())?;
         let state_file = StateFile::new(folder.state_file(), folder.legacy_state_file());
         let state = state_file.load()?;
+        let absences = Absences::new(folder.absences());
+        // What looks found missing before this launch, and since when.
+        let runtime = state
+            .jobs
+            .iter()
+            .map(|job| (job.id.clone(), absences.load(&job.id, &job.setup)))
+            .filter(|(_, kept)| !kept.is_empty())
+            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept), ..JobRuntime::default() }))
+            .collect();
         let engine = Self {
             inner: Arc::new(Inner {
                 state_file,
                 baselines: Baselines::new(folder.baselines()),
                 landings: Landings::new(folder.landings()),
                 unattended: Unattended::new(folder.unattended()),
+                absences,
                 journal: Journal::new(folder.logs()),
                 state: Mutex::new(state),
-                runtime: Mutex::new(HashMap::new()),
+                runtime: Mutex::new(runtime),
                 emit,
                 rev: AtomicU64::new(0),
                 quitting: AtomicBool::new(false),
@@ -321,6 +334,25 @@ impl Engine {
     /// Changes one job's live state.
     fn change_runtime<R>(&self, id: &JobId, change: impl FnOnce(&mut JobRuntime) -> R) -> R {
         change(self.runtime().entry(id.clone()).or_default())
+    }
+
+    /// Changes what the looks at `job` found missing (see `Missing`), and keeps it for the
+    /// next launch when that changed. It's saved while the live state is locked, so two
+    /// looks never save in the wrong order; a record that can't be saved is removed, so the
+    /// next launch starts the waits over rather than trust an old record.
+    fn change_missing<R>(&self, job: &Job, change: impl FnOnce(&mut Missing) -> R) -> R {
+        let mut runtime = self.runtime();
+        let missing = &mut runtime.entry(job.id.clone()).or_default().missing;
+        let before = missing.kept();
+        let result = change(missing);
+        let kept = missing.kept();
+        if kept != before {
+            if let Err(e) = self.inner.absences.save(&job.id, &job.setup, &kept) {
+                log::warn!("couldn't keep the items missing in {} for the next launch: {e}", job.setup.name);
+                let _ = self.inner.absences.forget(&job.id);
+            }
+        }
+        result
     }
 
     fn emit(&self, event: EngineEvent) {

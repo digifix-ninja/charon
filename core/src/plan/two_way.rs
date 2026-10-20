@@ -398,6 +398,7 @@ mod tests {
             name: "STICK".into(),
             network: false,
             case_sensitive: false,
+            case_guessed: false,
             refuses_links: false,
         });
         let dst = snap(&[("a.txt", file(3, 20_000_000))]);

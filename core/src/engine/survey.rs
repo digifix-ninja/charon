@@ -10,14 +10,14 @@ use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
 use crate::run::{Copier, Found, Markers, Room, Trash, TrashLook, Unread};
 use crate::scan::{
-    is_legacy_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot, Volume,
+    is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot,
+    Volume,
 };
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
 /// younger one may belong to a sync running right now in another job).
@@ -50,7 +50,8 @@ pub(crate) struct Housekeeping {
     /// What each side's trash holds: the dated folders old enough to be emptied, and files
     /// changed after they went in.
     pub trash: Vec<(Side, TrashLook)>,
-    /// Half-copied files left by an interrupted sync, per side (on-disk path, item).
+    /// Half-copied files left by an interrupted sync, and empty files it left holding a
+    /// name, per side (on-disk path, item).
     pub leftovers: Vec<(Side, Vec<(String, Entry)>)>,
 }
 
@@ -74,13 +75,21 @@ impl Housekeeping {
             ));
         }
         for (side, leftovers) in &self.leftovers {
-            let (legacy, current): (Vec<&str>, Vec<&str>) =
-                leftovers.iter().map(|(path, _)| path.as_str()).partition(|path| is_legacy_partial(Keys::name(path)));
+            let (claims, partials): (Vec<&str>, Vec<&str>) = leftovers.iter().map(|(path, _)| path.as_str()).partition(|path| !is_partial(Keys::name(path)));
+            let (legacy, current): (Vec<&str>, Vec<&str>) = partials.into_iter().partition(|path| is_legacy_partial(Keys::name(path)));
             if !current.is_empty() {
                 lines.push(format!(
                     "Also moves {} left by an interrupted sync into .charon-trash on the {}.",
                     plural(current.len() as u64, "half-copied file"),
                     side.word()
+                ));
+            }
+            if !claims.is_empty() {
+                lines.push(format!(
+                    "Also moves {} into .charon-trash on the {}: an interrupted sync left {} there, empty, to hold the name for a copy.",
+                    Self::names(&claims),
+                    side.word(),
+                    if claims.len() == 1 { "it" } else { "them" }
                 ));
             }
             if !legacy.is_empty() {
@@ -94,12 +103,13 @@ impl Housekeeping {
         lines
     }
 
-    /// The half-copied files in `snapshot` a sync made for `purpose` tidies away at `now`:
-    /// those nothing wrote to for an hour, and whose copy started more than an hour ago by
-    /// the time in their name (a copy being finished gets the original's old modification
-    /// time, so its change time counts too, and a long copy may belong to another
-    /// computer's sync). Files named like Charon 0.2's half-copied files may be the
-    /// person's own: only a list the person sees, which names them, moves those.
+    /// The half-copied files (and empty files left holding a name, see `scan::is_claim`) in
+    /// `snapshot` a sync made for `purpose` tidies away at `now`: those nothing wrote to for
+    /// an hour, and whose copy started more than an hour ago by the time in their name (a
+    /// copy being finished gets the original's old modification time, so its change time
+    /// counts too, and a long copy may belong to another computer's sync). Files named like
+    /// Charon 0.2's half-copied files may be the person's own: only a list the person sees,
+    /// which names them, moves those.
     fn leftovers(snapshot: &Snapshot, now: i64, purpose: Purpose) -> Vec<(String, Entry)> {
         snapshot
             .partials()
@@ -169,6 +179,9 @@ pub(crate) struct Survey {
     /// Mirror and Backup: the copies whose dates didn't stick that the plan was made with.
     pub landed: Baseline,
     pub plan: Plan,
+    /// Removals a run nobody looks at took out of `plan` and left for a later run (see
+    /// `Missing`).
+    pub left_for_later: Plan,
     /// Pairs of files found identical by their contents, though their dates differ.
     pub agreed: u64,
     /// Why this plan must not run at all.
@@ -233,7 +246,7 @@ impl Engine {
             }
         }
         let markers = Markers::read(&setup.source, &setup.destination, &job.id);
-        let volumes = (Volume::of(&setup.source), Volume::of(&setup.destination));
+        let volumes = (Self::drive_of(job, Side::Source), Self::drive_of(job, Side::Destination));
         let folded = !(volumes.0.case_sensitive && volumes.1.case_sensitive);
         let filter = ExcludeFilter::new(&setup.excludes, folded)?;
         // The folder watcher tells the changes that matter with the same filter.
@@ -317,7 +330,7 @@ impl Engine {
 
         let record = if setup.mode.is_two_way() { &baseline } else { &landed };
         let plan = plan::plan_for(&setup, &source, &destination, record, &compared.different);
-        self.change_runtime(&job.id, |rt| rt.missing.note(&plan, &source, &destination, Instant::now()));
+        self.change_missing(job, |missing| missing.note(&plan, &source, &destination, Utc::now()));
         let refusal = Guard::refusal(&plan, &source, &destination);
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
@@ -486,6 +499,7 @@ impl Engine {
             baseline,
             landed,
             plan,
+            left_for_later: Plan::default(),
             agreed,
             refusal,
             warnings,
@@ -636,7 +650,12 @@ impl Engine {
         // No memory yet (nothing to trust or distrust): nothing is removed.
         memory.tokens.as_ref()?;
         if memory.folded != folded {
-            return Some("One of the drives treats upper and lower case differently than at the last sync.".into());
+            let guessed = job.drives.as_ref().is_some_and(|drives| drives.source.case_guessed || drives.destination.case_guessed);
+            return Some(if guessed {
+                "At the last sync Charon couldn't ask one of the drives how it treats upper and lower case, and it can now: the drive does it differently than Charon assumed.".into()
+            } else {
+                "One of the drives treats upper and lower case differently than at the last sync.".into()
+            });
         }
         for side in [Side::Source, Side::Destination] {
             let expected = memory.token(side).unwrap_or_default();
@@ -807,8 +826,9 @@ impl Engine {
         })
     }
 
-    /// Old trash to empty and half-copied leftovers to tidy, on the sides the job writes to.
-    /// A background look only looks into the trash folders old enough to be emptied.
+    /// Old trash to empty and leftovers of interrupted syncs to tidy, on the sides the job
+    /// writes to. A background look only looks into the trash folders old enough to be
+    /// emptied.
     fn housekeeping(&self, setup: &JobSetup, source: &Snapshot, destination: &Snapshot, purpose: Purpose) -> Housekeeping {
         let trash_days = self.settings().trash_days;
         let now = Utc::now().timestamp_millis();
@@ -890,6 +910,23 @@ impl Engine {
             .fold(0u64, u64::saturating_add)
     }
 
+    /// The drive of the job's `side` folder. Where the drive can't be asked how it treats
+    /// upper and lower case this time, what it answered at the last sync holds while it's the
+    /// same drive: a guess never makes Charon distrust what it remembers of the folders.
+    fn drive_of(job: &Job, side: Side) -> Volume {
+        Self::case_kept_from(Volume::of(job.setup.root(side)), job.drives.as_ref().map(|drives| drives.side(side)))
+    }
+
+    /// `now`, with how it treats case taken from `before` (the drive at the last sync) where
+    /// `now` is only a guess and it's the same drive.
+    fn case_kept_from(mut now: Volume, before: Option<&Volume>) -> Volume {
+        if let Some(before) = before.filter(|before| now.case_guessed && Self::same_drive(before, &now)) {
+            now.case_sensitive = before.case_sensitive;
+            now.case_guessed = before.case_guessed;
+        }
+        now
+    }
+
     /// Whether a folder is on the same drive as before (unknown details never count as a change).
     pub(crate) fn same_drive(before: &Volume, now: &Volume) -> bool {
         let same_mount = before.mount.is_empty() || now.mount.is_empty() || before.mount == now.mount;
@@ -925,9 +962,45 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_file_left_holding_a_name_is_named_in_the_list() {
+        let now = 1_800_000_000_000;
+        let mut snapshot = Snapshot::new();
+        snapshot.facts_mut().partials = vec![("docs/report.txt".into(), Entry::file(0, crate::scan::CLAIM_MODIFIED_MS))];
+        let leftovers = vec![(Side::Source, Housekeeping::leftovers(&snapshot, now, Purpose::Automatic))];
+        let lines = Housekeeping { trash: Vec::new(), leftovers }.lines(30);
+        assert_eq!(
+            lines,
+            vec!["Also moves “docs/report.txt” into .charon-trash on the source: an interrupted sync left it there, empty, to hold the name for a copy."]
+        );
+    }
+
+    #[test]
     fn long_lists_of_names_are_cut_short() {
         assert_eq!(Housekeeping::names(&["a"]), "“a”");
         assert_eq!(Housekeeping::names(&["a", "b", "c"]), "“a”, “b” and “c”");
         assert_eq!(Housekeeping::names(&["a", "b", "c", "d", "e", "f", "g"]), "“a”, “b”, “c”, “d”, “e” and 2 more");
+    }
+
+    #[test]
+    fn a_drive_that_can_only_be_guessed_keeps_its_answer_from_the_last_sync() {
+        use crate::scan::FsKind;
+        let drive = |mount: &str, case_sensitive: bool, case_guessed: bool| Volume {
+            kind: FsKind::Other,
+            fs: "tmpfs".into(),
+            mount: mount.into(),
+            name: "Share".into(),
+            network: false,
+            case_sensitive,
+            case_guessed,
+            refuses_links: false,
+        };
+        let answered = drive("/mnt/share", true, false);
+        let guess = drive("/mnt/share", false, true);
+        assert_eq!(Engine::case_kept_from(guess.clone(), Some(&answered)), answered);
+        assert_eq!(Engine::case_kept_from(guess.clone(), None), guess, "nothing to keep before the first sync");
+        let elsewhere = drive("/mnt/other", true, false);
+        assert_eq!(Engine::case_kept_from(guess.clone(), Some(&elsewhere)), guess, "another drive's answer says nothing");
+        // An answer always counts, also when the last sync had to guess.
+        assert_eq!(Engine::case_kept_from(answered.clone(), Some(&guess)), answered);
     }
 }

@@ -3,6 +3,7 @@
 //! * `executor.rs` – `Executor`: checks each step against the disk, runs it, reports progress
 //! * `copier.rs`   – `Copier`: copies one file or link safely (partial file, then rename)
 //! * `rename.rs`   – renaming without ever replacing what's at the new name, and swapping two names
+//! * `identity.rs` – `Identity`: which file an item is, to tell it from another one saved under its name
 //! * `trash.rs`    – `Trash`: safe deletes into `.charon-trash`, what each run put there, and its clean-up
 //! * `room.rs`     – `Room`: how much room a drive has left, so a sync never fills one up
 //! * `durable.rs`  – making a run's changes durable on the drive before they're recorded
@@ -13,6 +14,7 @@
 mod copier;
 pub(crate) mod durable;
 mod executor;
+pub(crate) mod identity;
 mod marker;
 mod meter;
 mod names;

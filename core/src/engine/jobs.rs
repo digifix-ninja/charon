@@ -94,6 +94,10 @@ impl Engine {
                 // A count for other folders only makes the guard more careful.
                 log::warn!("couldn't start the count of automatic changes of job {id} again: {e}");
             }
+            if let Err(e) = self.inner.absences.forget(id) {
+                // The record names its folders, so it isn't used.
+                log::warn!("couldn't forget the items missing in the folders of job {id}: {e}");
+            }
         }
         self.inner.journal.info(id, if folders_changed { "folders or mode changed: Charon forgot the last sync" } else { "settings changed" });
         if automation_on {
@@ -155,6 +159,9 @@ impl Engine {
         }
         if let Err(e) = self.inner.unattended.forget(id) {
             log::warn!("couldn't forget the count of automatic changes of job {id}: {e}");
+        }
+        if let Err(e) = self.inner.absences.forget(id) {
+            log::warn!("couldn't forget the items missing in the folders of job {id}: {e}");
         }
         self.inner.journal.forget(id);
         for side in [Side::Source, Side::Destination] {

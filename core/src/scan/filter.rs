@@ -1,7 +1,7 @@
 //! Exclude patterns: which items Charon never looks at, copies or deletes.
 
 use crate::error::{Error, Result};
-use crate::scan::Keys;
+use crate::scan::{Entry, Keys};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 
 /// Charon's own safe-delete folder, at the root of each side.
@@ -15,6 +15,25 @@ pub const PARTIAL_SUFFIX: &str = ".charon-partial";
 /// name, then renamed once complete. The name is short, so a long name never gets too long.
 pub const PARTIAL_PREFIX: &str = ".charon-";
 pub const PARTIAL_EXTENSION: &str = ".part";
+/// The modification time of an empty file that holds a name for a moment, while an item is
+/// renamed onto it (see `run::rename`): 2 January 1980, 00:00:00 UTC. Every drive can keep
+/// it (FAT's dates start on 1 January 1980, in local time), and apps don't save files with
+/// it. An empty file with exactly this time is such a claim, left behind by a sync that was
+/// interrupted, not the person's own file.
+pub const CLAIM_MODIFIED_MS: i64 = 315_619_200_000;
+
+/// A fresh temporary name, `.charon-0123456789abcdef.part`: its first 8 hex digits are the
+/// time it was made, in seconds (see `partial_started`), the other 8 are random.
+pub fn new_partial_name() -> String {
+    let seconds = chrono::Utc::now().timestamp() as u32;
+    let random = uuid::Uuid::new_v4().as_u128() as u32;
+    format!("{PARTIAL_PREFIX}{seconds:08x}{random:08x}{PARTIAL_EXTENSION}")
+}
+
+/// Whether `entry` is an empty file that only held a name for Charon (see `CLAIM_MODIFIED_MS`).
+pub fn is_claim(entry: &Entry) -> bool {
+    entry.is_file() && entry.size == 0 && entry.modified == CLAIM_MODIFIED_MS
+}
 
 /// Whether `name` is a file Charon was copying (now or in an interrupted run).
 pub fn is_partial(name: &str) -> bool {
@@ -291,6 +310,25 @@ mod tests {
         assert_eq!(partial_started(".charon-ffffffff00000000.part", now), None, "random digits of an older version");
         assert_eq!(partial_started(".charon-0000000100000000.part", now), None);
         assert_eq!(partial_started("report.pdf", now), None);
+    }
+
+    #[test]
+    fn a_new_temporary_name_is_known_for_one() {
+        let now = chrono::Utc::now().timestamp_millis();
+        let name = new_partial_name();
+        assert!(is_partial(&name) && !is_legacy_partial(&name));
+        assert!(partial_started(&name, now).is_some_and(|started| (now - started).abs() < 5_000), "{name}");
+        assert_ne!(new_partial_name(), name);
+    }
+
+    #[test]
+    fn only_an_empty_file_with_the_claims_time_is_a_claim() {
+        assert!(is_claim(&Entry::file(0, CLAIM_MODIFIED_MS)));
+        assert!(!is_claim(&Entry::file(1, CLAIM_MODIFIED_MS)));
+        assert!(!is_claim(&Entry::file(0, CLAIM_MODIFIED_MS + 1_000)));
+        // Files from zip archives without dates get midnight of 1 January 1980 (local time).
+        assert!(!is_claim(&Entry::file(0, 315_532_800_000)));
+        assert!(!is_claim(&Entry::link(b"", CLAIM_MODIFIED_MS)));
     }
 
     #[test]

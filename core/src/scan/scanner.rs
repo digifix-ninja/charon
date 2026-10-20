@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_charon_folder_in_other_case, is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Snapshot, Volume, MARKER_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Snapshot, Volume, MARKER_FOLDER,
     TRASH_FOLDER,
 };
 use std::fs;
@@ -182,7 +182,15 @@ impl<'a> Scanner<'a> {
                         Some(reason) => snapshot.freeze(&key, reason),
                         None => {
                             let changed = if change_times { Self::change_time(&meta) } else { 0 };
-                            Self::add(&mut snapshot, key, disk, Entry::file(meta.len(), Self::modified_ms(&meta)).changed_at(changed))
+                            let entry = Entry::file(meta.len(), Self::modified_ms(&meta)).changed_at(changed);
+                            if is_claim(&entry) {
+                                // An empty file that held this name for an interrupted sync: a
+                                // leftover of Charon's, like a half-copied file.
+                                snapshot.facts_mut().partials.push((disk, entry));
+                                snapshot.occupy_folders_of(&key);
+                            } else {
+                                Self::add(&mut snapshot, key, disk, entry)
+                            }
                         }
                     },
                     Err(e) => snapshot.freeze(&key, Self::io_reason(&e)),
@@ -212,7 +220,7 @@ impl<'a> Scanner<'a> {
     /// Why the file is left alone if it's only a placeholder for a file in the cloud
     /// (iCloud Drive, OneDrive, Dropbox): reading it would download it, and its size and
     /// time say nothing about its contents here.
-    fn placeholder(meta: &fs::Metadata) -> Option<String> {
+    pub(crate) fn placeholder(meta: &fs::Metadata) -> Option<String> {
         #[cfg(target_os = "macos")]
         {
             use std::os::macos::fs::MetadataExt;
@@ -569,6 +577,20 @@ mod tests {
         assert_eq!(s.partials().len(), 2);
         assert!(s.get("a/big.mov.charon-partial").is_none());
         assert!(s.is_occupied("a"), "a folder with a leftover isn't empty");
+    }
+
+    #[test]
+    fn an_empty_file_left_holding_a_name_is_a_leftover_not_an_item() {
+        let tmp = tempfile::tempdir().unwrap();
+        let claim = tmp.path().join("a/report.txt");
+        write(&claim, "");
+        filetime::set_file_mtime(&claim, filetime::FileTime::from_unix_time(crate::scan::CLAIM_MODIFIED_MS / 1000, 0)).unwrap();
+        write(&tmp.path().join("a/empty.txt"), "");
+        let s = scan(tmp.path(), &[]);
+        assert!(s.get("a/report.txt").is_none(), "never taken for the person's new file");
+        assert_eq!(s.partials().iter().map(|(path, _)| path.as_str()).collect::<Vec<_>>(), vec!["a/report.txt"]);
+        assert!(s.get("a/empty.txt").is_some(), "an empty file of the person's own is an item");
+        assert!(s.is_occupied("a"));
     }
 
     #[test]

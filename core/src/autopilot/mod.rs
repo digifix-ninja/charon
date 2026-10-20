@@ -17,7 +17,11 @@
 //!    (on-change jobs that run by themselves) or look (every other job).
 //! 3. **Schedule:** an interval or daily job is due → sync, or look. Either way the next
 //!    time is counted from now.
-//! 4. **Regular look:** every few minutes, in case the watcher missed something (network
+//! 4. **Removals left for later:** a run of a job that runs by itself left removals for
+//!    later, because the items went missing only a few minutes ago on a network share or a
+//!    cloud drive (see `Engine::take_follow_up`). Once they've been missing long enough →
+//!    sync, whatever the job's trigger.
+//! 5. **Regular look:** every few minutes, in case the watcher missed something (network
 //!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs.
 //!
 //! A sync that is due waits (it isn't dropped) while another job uses the same folders, and
@@ -177,7 +181,12 @@ impl Autopilot {
                 }
                 continue;
             }
-            // 4. Regular look.
+            // 4. Removals left for later.
+            if by_itself && self.engine.take_follow_up(id) {
+                self.run(id, "to carry out removals left for later");
+                continue;
+            }
+            // 5. Regular look.
             if by_itself && job.setup.trigger.syncs_on_change() && self.engine.has_pending(id) {
                 self.run(id, "for changes found by a look");
             } else if self.engine.check_due(id, settings.check_minutes) {

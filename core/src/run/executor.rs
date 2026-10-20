@@ -17,8 +17,9 @@
 use crate::error::{Error, Result};
 use crate::plan::{Action, Clearing, Pair, Plan, Settled, Side, Step, Unit};
 use crate::run::durable;
+use crate::run::identity::Identity;
 use crate::run::names;
-use crate::run::rename::{rename_new, swap};
+use crate::run::rename::{move_to_new_name, rename_new, swap};
 use crate::run::{Copier, ProgressMeter, Room, Trash};
 use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
@@ -145,30 +146,6 @@ struct Staged {
     partial: PathBuf,
     /// The original's details the copy couldn't take along.
     unkept: BTreeSet<&'static str>,
-}
-
-/// Which file an item is on its drive (its device and inode numbers), to tell it from
-/// another file saved under the same name. Known on macOS and Linux.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Identity(u64, u64);
-
-impl Identity {
-    fn of(meta: &fs::Metadata) -> Option<Identity> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Some(Identity(meta.dev(), meta.ino()))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = meta;
-            None
-        }
-    }
-
-    fn at(path: &Path) -> Option<Identity> {
-        fs::symlink_metadata(path).ok().as_ref().and_then(Self::of)
-    }
 }
 
 /// The two files of a swap (see `Executor::replace`): the one checked at the target a
@@ -1072,7 +1049,8 @@ impl<'a> Executor<'a> {
             }
             Some(old) if keep_old && old.is_file() => {
                 // Keep a copy of the old version, then replace it in place (see `Trash`).
-                let kept = match self.room_for_kept_copy(to, old.size).and_then(|()| self.trash.preserve(root, &relative).map_err(|e| Error::file(&target, e))) {
+                // The old version may be only in the cloud since the scan: then it's left alone.
+                let kept = match self.room_for_kept_copy(to, old.size).and_then(|()| self.trash.preserve(root, &relative).map_err(|e| Copier::unreadable(&target, e, 0))) {
                     Ok(kept) => kept,
                     Err(e) => {
                         Copier::discard(&partial);
@@ -1226,11 +1204,12 @@ impl<'a> Executor<'a> {
     }
 
     /// Renames the item at `path` to a fresh temporary name next to it, and returns that
-    /// name; `None` if nothing is there anymore.
+    /// name; `None` if nothing is there anymore. Whatever is at `path` at that instant moves,
+    /// even a version an app saved a moment ago: the look after the move sees it.
     fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
         for _ in 0..5 {
             let aside = Copier::partial_path(path);
-            match rename_new(path, &aside) {
+            match move_to_new_name(path, &aside) {
                 Ok(()) => return Ok(Some(aside)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(None),
@@ -1387,7 +1366,7 @@ impl<'a> Executor<'a> {
         }
         let conflict_key = self.free_conflict_name(key)?;
         let aside = self.path(Side::Destination, &conflict_key);
-        rename_new(&destination_path, &aside).map_err(|e| Error::file(&destination_path, e))?;
+        move_to_new_name(&destination_path, &aside).map_err(|e| Error::file(&destination_path, e))?;
         self.touch(&aside);
         self.touch(&destination_path);
         let moved = Self::look(&aside)?.ok_or_else(|| Error::Invalid(format!("{} vanished", aside.display())))?;
@@ -1434,7 +1413,7 @@ impl<'a> Executor<'a> {
             return Ok(true);
         };
         if keep && planned.is_file() && self.clones(side) {
-            let kept = self.trash.preserve(root, relative).map_err(|e| Error::file(target, e))?;
+            let kept = self.trash.preserve(root, relative).map_err(|e| Copier::unreadable(target, e, 0))?;
             self.touch(&kept);
             let removed = self.remove_checked(side, relative, target, planned);
             if !matches!(removed, Ok(true)) {
@@ -2190,6 +2169,7 @@ mod tests {
             name: "share".into(),
             network: true,
             case_sensitive: false,
+            case_guessed: false,
             refuses_links: false,
         });
         let local = Snapshot::new();

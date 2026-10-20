@@ -10,7 +10,7 @@
 use crate::error::{Error, Result};
 use crate::run::durable;
 use crate::run::rename::rename_new;
-use crate::scan::{Entry, Refusal, Scanner, PARTIAL_EXTENSION, PARTIAL_PREFIX};
+use crate::scan::{new_partial_name, Contents, Entry, Refusal, Scanner};
 use std::collections::BTreeSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const CHUNK: usize = 1024 * 1024;
+/// Why a file the cloud took back since the scan was left alone.
+const CLOUD_SINCE_SCAN: &str = "only in the cloud since the scan (not downloaded to this computer), so Charon left it alone";
 /// On a drive that keeps times in steps of a second or more, a file saved this recently
 /// may still be being written within the same step, where its time can't show it.
 const STILL_BEING_WRITTEN_MS: i64 = 3_000;
@@ -151,9 +153,7 @@ impl<'a> Copier<'a> {
     /// never mistaken for the leftover of an interrupted sync because of the old time it
     /// carries at the end (see `scan::partial_started`).
     pub fn partial_path(to: &Path) -> PathBuf {
-        let seconds = chrono::Utc::now().timestamp() as u32;
-        let random = uuid::Uuid::new_v4().as_u128() as u32;
-        to.with_file_name(format!("{PARTIAL_PREFIX}{seconds:08x}{random:08x}{PARTIAL_EXTENSION}"))
+        to.with_file_name(new_partial_name())
     }
 
     /// Creates the temporary file: always a new file, never an existing one and never
@@ -177,7 +177,7 @@ impl<'a> Copier<'a> {
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
     /// take along.
     fn write_partial(&self, from: &Path, partial: &Path, mut writer: File, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<BTreeSet<&'static str>> {
-        let mut reader = File::open(from).map_err(|e| Self::unreadable(from, e, 0))?;
+        let mut reader = Contents::open(from).map_err(|e| Self::unreadable(from, e, 0))?;
         let before = reader.metadata().map_err(|e| Error::file(from, e))?;
         let changed = Scanner::change_time(&before);
         if !before.is_file() || !Entry::file(before.len(), Scanner::modified_ms(&before)).changed_at(changed).unchanged(expected) {
@@ -239,15 +239,14 @@ impl<'a> Copier<'a> {
         Ok(unkept)
     }
 
-    /// Why the file to copy couldn't be read. A file the cloud took back since the scan
-    /// (iCloud Drive, OneDrive and Dropbox free up space that way) can't be read without
-    /// downloading it, which Charon never does: that's a change since the scan, not a failure.
-    /// A file the system won't let Charon read is `Error::ReadDenied` (see `refusal_to_read`),
-    /// with where reading stopped (`at`).
+    /// Why the file at `from` couldn't be read (or copied into the trash). A file the cloud
+    /// took back since the scan (iCloud Drive, OneDrive and Dropbox free up space that way)
+    /// can't be read without downloading it, which Charon never does: that's a change since
+    /// the scan, not a failure. A file the system won't let Charon read is
+    /// `Error::ReadDenied` (see `refusal_to_read`), with where reading stopped (`at`).
     pub(crate) fn unreadable(from: &Path, error: std::io::Error, at: u64) -> Error {
-        #[cfg(target_os = "macos")]
-        if error.raw_os_error() == Some(libc::EDEADLK) {
-            return Error::Changed("only in the cloud since the scan (not downloaded to this computer), so Charon left it alone".into());
+        if Contents::only_in_the_cloud(&error) {
+            return Error::Changed(CLOUD_SINCE_SCAN.into());
         }
         match Self::refusal_to_read(&error) {
             Some(reason) => Error::ReadDenied { path: from.to_path_buf(), reason, at },
@@ -290,7 +289,7 @@ impl<'a> Copier<'a> {
     /// chunk at `at`, where reading stopped. A program may lock part of a file and still let
     /// others open it and read the rest.
     pub fn read_refusal(path: &Path, at: u64) -> Option<String> {
-        let read = File::open(path).and_then(|mut file| {
+        let read = Contents::open(path).and_then(|mut file| {
             file.seek(SeekFrom::Start(at))?;
             file.read(&mut vec![0u8; CHUNK])
         });
@@ -490,6 +489,40 @@ mod tests {
         if Scanner::change_time(&fs::metadata(&from).unwrap()) != planned.changed {
             assert!(matches!(Copier::new(&never).file(&from, &to, &planned, &mut |_| {}), Err(Error::Changed(_))));
         }
+    }
+
+    #[test]
+    fn a_file_found_only_in_the_cloud_is_left_alone_not_failed() {
+        let path = Path::new("notes.txt");
+        assert!(matches!(Copier::unreadable(path, std::io::Error::other("the disk broke"), 0), Error::File { .. }));
+        #[cfg(target_os = "macos")]
+        assert!(matches!(
+            Copier::unreadable(path, std::io::Error::from_raw_os_error(libc::EDEADLK), 0),
+            Error::Changed(why) if why.contains("only in the cloud")
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_the_cloud_took_back_since_the_scan_is_never_downloaded() {
+        use windows_sys::Win32::Storage::FileSystem::{GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_OFFLINE};
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("a.txt"), tmp.path().join("b.txt"));
+        fs::write(&from, "in the cloud").unwrap();
+        let planned = entry_of(&from);
+        // A cloud drive that frees up a file marks it so; only its name and details stay.
+        let path = crate::run::rename::wide(&from);
+        // SAFETY: `path` is NUL-terminated.
+        unsafe {
+            let attributes = GetFileAttributesW(path.as_ptr());
+            assert_ne!(SetFileAttributesW(path.as_ptr(), attributes | FILE_ATTRIBUTE_OFFLINE), 0);
+        }
+        let never = AtomicBool::new(false);
+        let result = Copier::new(&never).file(&from, &to, &planned, &mut |_| {});
+        assert!(matches!(&result, Err(Error::Changed(why)) if why.contains("only in the cloud")), "{result:?}");
+        // Nor is it downloaded to keep a copy of it in the trash.
+        let trash = crate::run::Trash::for_run(chrono::Local::now());
+        assert!(trash.preserve(tmp.path(), "a.txt").is_err_and(|e| Contents::only_in_the_cloud(&e)));
     }
 
     #[test]

@@ -326,7 +326,7 @@ mod tests {
 
     fn snap(items: &[(&str, Entry)], kind: FsKind) -> Snapshot {
         let mut s: Snapshot = items.iter().map(|(k, e)| (k.to_string(), *e)).collect();
-        s.facts_mut().volume = Some(Volume { kind, fs: "x".into(), mount: "/m".into(), name: "Stick".into(), network: false, case_sensitive: false, refuses_links: false });
+        s.facts_mut().volume = Some(Volume { kind, fs: "x".into(), mount: "/m".into(), name: "Stick".into(), network: false, case_sensitive: false, case_guessed: false, refuses_links: false });
         s
     }
 

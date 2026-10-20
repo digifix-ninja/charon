@@ -171,6 +171,10 @@ pub struct RunSummary {
     /// attributes), because the receiving drive can't keep them.
     #[serde(default)]
     pub unkept: u64,
+    /// Removals left for a later run nobody looks at: the items went missing only a little
+    /// while ago on a drive that may show changes late (see `engine::Missing`).
+    #[serde(default)]
+    pub left_for_later: u64,
     pub cancelled: bool,
     /// Why the whole run failed, if it did.
     pub error: Option<String>,
@@ -198,6 +202,7 @@ impl RunSummary {
             found_unreadable: 0,
             settled: 0,
             unkept: 0,
+            left_for_later: 0,
             cancelled: false,
             error: None,
             approved,
@@ -274,6 +279,12 @@ impl RunSummary {
         if self.unkept > 0 {
             let their = if self.unkept == 1 { "its" } else { "their" };
             parts.push(format!("{} arrived without {their} Finder tags or other details", plural(self.unkept, "file")));
+        }
+        if self.left_for_later > 0 {
+            parts.push(format!(
+                "{} left for a later sync (missing for only a little while on a drive that may show changes late)",
+                plural(self.left_for_later, "removal")
+            ));
         }
         if parts.is_empty() {
             "already in sync".into()
