@@ -350,6 +350,22 @@ pub(crate) fn windows_name_problem(name: &str) -> Option<&'static str> {
     reserved.then_some("its name is reserved by Windows (like CON or NUL)")
 }
 
+/// A Windows path as it's written for people: `\\?\C:\Photos` → `C:\Photos`, and
+/// `\\?\UNC\nas\share` → `\\nas\share`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn plain_windows_path(path: &str) -> String {
+    match path.strip_prefix(r"\\?\UNC\") {
+        Some(share) => format!(r"\\{share}"),
+        None => path.strip_prefix(r"\\?\").unwrap_or(path).to_string(),
+    }
+}
+
+/// Whether a Windows path is on a network share: `\\nas\share`, or `\\?\UNC\nas\share`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_share_path(path: &str) -> bool {
+    path.starts_with(r"\\?\UNC\") || (path.starts_with(r"\\") && !path.starts_with(r"\\?\"))
+}
+
 /// Asks the drive whether it tells upper and lower case apart, using names already in the
 /// folder: if "Photos" exists, is "pHOTOS" the same item? Only ASCII letters are swapped.
 /// Charon's own temporary files are passed over (another look's probe, or a copy being
@@ -576,7 +592,6 @@ mod system {
 #[cfg(windows)]
 mod system {
     use super::{FsKind, Volume};
-    use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
@@ -609,20 +624,19 @@ mod system {
         let text = |buffer: &[u16]| String::from_utf16_lossy(&buffer[..buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len())]);
         let fs = text(&fs_name);
         let label = text(&label);
-        let plain: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        // Where the folder really is, which its path may not show: through a link or a mapped
+        // drive, a share is still a share (`\\?\UNC\nas\share\…`).
+        let real = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let real_text = real.as_os_str().to_string_lossy();
+        let plain: Vec<u16> = super::plain_windows_path(&real_text).encode_utf16().chain(std::iter::once(0)).collect();
         let mut mount = [0u16; 1024];
         // SAFETY: the path is NUL-terminated and `mount` is valid for its length.
         let ask = |path: &[u16], mount: &mut [u16; 1024]| unsafe { GetVolumePathNameW(path.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } != 0;
         // A path longer than 260 characters only works in its long form (`\\?\C:\…`), which
         // then comes back in the answer too.
-        let has_mount = ask(&plain, &mut mount) || ask(&crate::run::rename::wide(root), &mut mount);
-        let mount_text = if has_mount { text(&mount) } else { String::new() };
-        let mount_text = match mount_text.strip_prefix(r"\\?\UNC\") {
-            Some(share) => format!(r"\\{share}"),
-            None => mount_text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(mount_text),
-        };
-        let spelled = root.as_os_str().to_string_lossy();
-        let unc = spelled.starts_with(r"\\?\UNC\") || (spelled.starts_with(r"\\") && !spelled.starts_with(r"\\?\"));
+        let has_mount = ask(&plain, &mut mount) || ask(&crate::run::rename::wide(&real), &mut mount);
+        let mount_text = if has_mount { super::plain_windows_path(&text(&mount)) } else { String::new() };
+        let unc = super::is_share_path(&real_text);
         // SAFETY: `mount` is NUL-terminated when `has_mount`.
         let remote = has_mount && unsafe { GetDriveTypeW(mount.as_ptr()) } == DRIVE_REMOTE;
         let network = unc || remote;
@@ -849,5 +863,36 @@ mod tests {
             std::fs::write(tmp.path().join("Probe"), "x").unwrap();
             assert!(Volume::of(tmp.path()).case_sensitive, "Linux temp folders tell case apart");
         }
+    }
+
+    #[test]
+    fn windows_paths_tell_shares_apart() {
+        assert_eq!(plain_windows_path(r"\\?\C:\Users\me"), r"C:\Users\me");
+        assert_eq!(plain_windows_path(r"\\?\UNC\nas\share\Photos"), r"\\nas\share\Photos");
+        assert_eq!(plain_windows_path(r"D:\"), r"D:\");
+        assert!(is_share_path(r"\\?\UNC\nas\share\Photos") && is_share_path(r"\\nas\share"));
+        assert!(!is_share_path(r"\\?\C:\NAS\Photos") && !is_share_path(r"C:\NAS\Photos"));
+    }
+
+    /// A folder reached through a link to a network share is on that share: it may show
+    /// changes late, and its times can't be held against this computer's clock.
+    #[cfg(windows)]
+    #[test]
+    fn a_share_reached_through_a_link_is_a_share() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The computer's own drive, as Windows shares it with administrators (\\localhost\C$).
+        let real = plain_windows_path(&std::fs::canonicalize(tmp.path()).unwrap().to_string_lossy());
+        let Some((drive, inside)) = real.split_once(':') else { return };
+        let share = std::path::PathBuf::from(format!(r"\\localhost\{drive}${inside}"));
+        if !share.is_dir() {
+            return; // no administrative share here
+        }
+        let link = tmp.path().join("NAS");
+        if std::os::windows::fs::symlink_dir(&share, &link).is_err() {
+            return; // no right to make links
+        }
+        let volume = Volume::of(&link);
+        assert!(volume.network && volume.kind == FsKind::Smb && volume.shows_changes_late(), "{volume:?}");
+        assert!(!Volume::of(tmp.path()).network);
     }
 }
