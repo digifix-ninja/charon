@@ -10,8 +10,10 @@
 //! way and others the other way would leave a mix that the app may not open, or would
 //! quietly damage. So the whole unit becomes one conflict, and the person chooses whose
 //! version to keep as a whole (see `plan::Resolution`). A run carries a unit's files
-//! together too: all of them, or none when anything of the unit changed meanwhile (see
-//! `run::Executor`).
+//! together too: all of them, or none when anything of the unit changed meanwhile, and
+//! what it no longer has goes only once all its new versions have landed (see
+//! `run::Executor`). A library the receiving side doesn't have yet has no version there to
+//! mix with: its files go one by one, and only a database in it goes with its journals.
 
 use crate::scan::{Entry, Keys, Snapshot};
 

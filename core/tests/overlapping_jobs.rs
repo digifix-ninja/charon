@@ -846,7 +846,7 @@ fn a_library_settled_while_another_charon_writes_into_it_is_never_mixed() {
     wait_idle(&engine, &id);
 
     let run = view(&engine, &id).job.last_run.expect("the settled list ran");
-    assert_eq!((run.copied, run.skipped), (0, 2), "{run:?}");
+    assert_eq!((run.copied, run.skipped, run.waited), (0, 1, 1), "b.txt changed meanwhile, a.txt waits for it: {run:?}");
     assert_eq!(fs::read_to_string(song(&nas, "a.txt")).unwrap(), "a2 from studio-mac, a longer take", "nothing of the project moves");
     assert_eq!(fs::read_to_string(song(&nas, "b.txt")).unwrap(), "b3 from studio-mac, saved again");
 }

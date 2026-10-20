@@ -227,6 +227,7 @@ export class Format {
     if (run.conflicts) parts.push(`${Format.plural(run.conflicts, "conflict")} to resolve`);
     if (run.failed) parts.push(`${Format.plural(run.failed, "file")} failed`);
     if (run.skipped) parts.push(`${Format.plural(run.skipped, "item")} skipped (changed meanwhile)`);
+    if (run.waited) parts.push(`${Format.plural(run.waited, "item")} left for the next sync with the rest of ${run.waited === 1 ? "its" : "their"} app library or database`);
     if (run.leftOut) parts.push(`${Format.plural(run.leftOut, "item")} left out (a drive couldn't hold ${run.leftOut === 1 ? "it" : "them"})`);
     if (run.kept) parts.push(`kept ${Format.plural(run.kept, "folder")} that still hold files`);
     if (run.unreadable) parts.push(`${Format.plural(run.unreadable, "place")} couldn't be read`);

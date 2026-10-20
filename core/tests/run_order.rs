@@ -10,7 +10,13 @@
 //! writing to never stops the rest of a job's removals. An app library the run removes
 //! something of is carried whole after every other copy, and before anything else is
 //! removed: what it removes waits like any removal, and what it brings lands before its
-//! other copy goes.
+//! other copy goes. Every library carried then is ready before any of them takes its
+//! place, and what each removes goes only once they all landed, so a file moved from one
+//! library into another keeps its old copy when the other can't take it. A library is never
+//! left half changed: when a new version of it can't land, nothing of it is removed, and a
+//! database's old journal goes back next to it. A library new on the receiving side has no
+//! old version to be mixed with: its files land as each is ready, while a database in it
+//! waits for its journal.
 
 use charon_core::model::{Review, StepFilter};
 use charon_core::{ConflictRule, Engine, EngineEvent, JobSetup, JobView, Phase, SyncMode, Trigger};
@@ -505,4 +511,334 @@ fn two_way_keeps_the_old_copy_of_a_take_moved_into_a_library_that_waits() {
 #[test]
 fn mirror_keeps_the_old_copy_of_a_take_moved_into_a_library_that_waits() {
     a_take_moved_into_a_library_keeps_its_old_copy_when_the_library_waits(SyncMode::Mirror);
+}
+
+/// Every file under `root`, by its path there with `/` between the names, in order.
+fn files_in(root: &Path) -> Vec<String> {
+    let mut files: Vec<String> = walk(root)
+        .iter()
+        .map(|path| path.strip_prefix(root).unwrap().components().map(|part| part.as_os_str().to_string_lossy().into_owned()).collect::<Vec<_>>().join("/"))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Puts a file where `root`'s .charon-trash goes: nothing can be kept there until it's
+/// removed, so a copy that has to keep the version it replaces fails.
+fn block_the_trash(root: &Path) {
+    let trash = root.join(".charon-trash");
+    if trash.is_dir() {
+        fs::remove_dir_all(&trash).unwrap();
+    }
+    fs::write(&trash, "a file where the trash goes").unwrap();
+}
+
+/// A job whose folders hold the same two Logic projects after its first confirmed sync, an
+/// album with a take and a single with an old take. Then, in the source, the take is moved
+/// from the album into the single (to `into`, a path in the single), and the single's old
+/// take is removed. Returns the folders and the job.
+fn a_take_moved_between_two_projects(rig: &Rig, root: &Path, mode: SyncMode, into: &str) -> (PathBuf, PathBuf, String) {
+    let (src, dst) = (root.join("src"), root.join("dst"));
+    write(&src.join("Album.logicx/arrangement.txt"), "the album");
+    write(&src.join("Album.logicx/take.wav"), "the take");
+    write(&src.join("Single.logicx/arrangement.txt"), "the single");
+    write(&src.join("Single.logicx/old.wav"), "an old take");
+    let id = rig.engine.add_job(job_setup(&src, &dst, mode)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take");
+    let moved = src.join("Single.logicx").join(into);
+    fs::create_dir_all(moved.parent().unwrap()).unwrap();
+    fs::rename(src.join("Album.logicx/take.wav"), &moved).unwrap();
+    fs::remove_file(src.join("Single.logicx/old.wav")).unwrap();
+    (src, dst, id)
+}
+
+/// A take moved from one Logic project into another that loses an old take too, and an app
+/// writes to the take in its new place while the run goes on. Both projects remove
+/// something, so both are carried after every other copy, the album first by name, and what
+/// they remove goes only once both landed: the single waits for the next sync, and so does
+/// the take's old copy in the album, the destination's only one.
+fn a_take_moved_between_libraries_keeps_its_old_copy_when_the_receiving_one_waits(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst, id) = a_take_moved_between_two_projects(&rig, tmp.path(), mode, "take.wav");
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 2, "{:?}", review.tally);
+    let take = src.join("Single.logicx/take.wav");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&take).unwrap().write_all(b", recorded again").unwrap());
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "old.wav"], "the single waits whole");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.deleted), (0, 0), "{}", run.describe());
+
+    // The next sync carries the take into the single, then removes its old copies.
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join("Single.logicx/take.wav")), "the take, recorded again");
+    assert_eq!(files_in(&dst.join("Album.logicx")), ["arrangement.txt"]);
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "take.wav"]);
+}
+
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_that_waits() {
+    a_take_moved_between_libraries_keeps_its_old_copy_when_the_receiving_one_waits(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_keeps_the_old_copy_of_a_take_moved_into_another_library_that_waits() {
+    a_take_moved_between_libraries_keeps_its_old_copy_when_the_receiving_one_waits(SyncMode::Mirror);
+}
+
+/// The same, but the take goes into a new folder of the single, and that folder can't be
+/// made on the destination (a file took its name meanwhile), so the take's copy fails:
+/// neither project changes there.
+fn a_take_moved_between_libraries_keeps_its_old_copy_when_its_copy_fails(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (_src, dst, id) = a_take_moved_between_two_projects(&rig, tmp.path(), mode, "Audio Files/take.wav");
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.destination.removed, 2, "{:?}", review.tally);
+    let in_the_way = dst.join("Single.logicx/Audio Files");
+    rig.at_first_step(move || write(&in_the_way, "a file where the new folder goes"));
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(read(&dst.join("Single.logicx/old.wav")), "an old take", "the single waits whole");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert!(run.failed > 0 && run.deleted == 0, "{}", run.describe());
+}
+
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_when_its_copy_fails() {
+    a_take_moved_between_libraries_keeps_its_old_copy_when_its_copy_fails(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_keeps_the_old_copy_of_a_take_moved_into_another_library_when_its_copy_fails() {
+    a_take_moved_between_libraries_keeps_its_old_copy_when_its_copy_fails(SyncMode::Mirror);
+}
+
+/// The same in a two-way job, but the single's arrangement changed too, and its new
+/// version can't take its place on the destination (the version it replaces can't be kept
+/// there: .charon-trash is a file). Every project is ready by then, so this only shows once
+/// the single's new versions take their places: the album's removal still waits for them,
+/// and neither project changes.
+#[test]
+fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_whose_new_version_cant_land() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst, id) = a_take_moved_between_two_projects(&rig, tmp.path(), SyncMode::TwoWay, "take.wav");
+    write(&src.join("Single.logicx/arrangement.txt"), "the single, with a new chorus");
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.replaced, review.tally.destination.removed), (1, 2), "{:?}", review.tally);
+    let blocked = dst.clone();
+    rig.at_first_step(move || block_the_trash(&blocked));
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "old.wav"], "the single isn't mixed");
+    assert_eq!(read(&dst.join("Single.logicx/arrangement.txt")), "the single");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert!(run.failed > 0 && run.deleted == 0, "{}", run.describe());
+
+    // With the trash a folder again, the next sync carries both projects.
+    fs::remove_file(dst.join(".charon-trash")).unwrap();
+    confirm(&rig.engine, &id);
+    assert_eq!(files_in(&dst.join("Album.logicx")), ["arrangement.txt"]);
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "take.wav"]);
+    assert_eq!(read(&dst.join("Single.logicx/arrangement.txt")), "the single, with a new chorus");
+}
+
+/// A Photos library whose albums changed and whose photo was renamed, in a two-way job,
+/// and the albums' new version can't take its place on the destination (the version it
+/// replaces can't be kept there: .charon-trash is a file). Nothing of a library is removed
+/// before all its new versions have landed: it stays exactly as it was, with the photo
+/// under its old name, the destination's only copy of it.
+#[test]
+fn two_way_leaves_a_library_as_it_was_when_a_new_version_cant_take_its_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let library = |root: &Path| root.join("Lib.photoslibrary");
+    write(&library(&src).join("Albums/data.bin"), "the albums");
+    write(&library(&src).join("originals/IMG_1.jpg"), "a photo");
+    let id = rig.engine.add_job(job_setup(&src, &dst, SyncMode::TwoWay)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    write(&library(&src).join("Albums/data.bin"), "the albums, with a new one");
+    fs::rename(library(&src).join("originals/IMG_1.jpg"), library(&src).join("originals/IMG_0001.jpg")).unwrap();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.replaced, review.tally.destination.removed), (1, 1), "{:?}", review.tally);
+    let blocked = dst.clone();
+    rig.at_first_step(move || block_the_trash(&blocked));
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(files_in(&library(&dst)), ["Albums/data.bin", "originals/IMG_1.jpg"], "nothing of the library changed");
+    assert_eq!(read(&library(&dst).join("Albums/data.bin")), "the albums");
+    assert_eq!(read(&library(&dst).join("originals/IMG_1.jpg")), "a photo");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert!(run.failed > 0 && (run.copied, run.deleted) == (0, 0), "{}", run.describe());
+
+    // With the trash a folder again, the next sync carries the whole library.
+    fs::remove_file(dst.join(".charon-trash")).unwrap();
+    confirm(&rig.engine, &id);
+    assert_eq!(files_in(&library(&dst)), ["Albums/data.bin", "originals/IMG_0001.jpg"]);
+    assert_eq!(read(&library(&dst).join("Albums/data.bin")), "the albums, with a new one");
+}
+
+/// A library with a new album, a renamed photo, and a database to replace with a version
+/// too big to keep in .charon-trash on the destination's drive (the database there grew to
+/// 8 TiB, all of it a hole that takes no room), in a Mirror job with safe deletes on.
+/// Before any new version of a library takes its place, the trash must have room for every
+/// version they replace: none lands, not even the album that would come first, nothing is
+/// removed, and the run says why. Where kept copies are clones (APFS), they take no room,
+/// and the whole library lands. Never half of it.
+#[test]
+fn mirror_leaves_a_library_whole_when_the_trash_has_no_room_for_what_it_replaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let library = |root: &Path| root.join("Lib.photoslibrary");
+    write(&library(&src).join("database/Photos.sqlite"), "the database");
+    write(&library(&src).join("originals/IMG_1.jpg"), "a photo");
+    let mut setup = job_setup(&src, &dst, SyncMode::Mirror);
+    setup.safe_delete = true;
+    let id = rig.engine.add_job(setup).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    let huge = library(&dst).join("database/Photos.sqlite");
+    if fs::OpenOptions::new().write(true).open(&huge).unwrap().set_len(1 << 43).is_err() {
+        eprintln!("SKIPPED mirror_leaves_a_library_whole_when_the_trash_has_no_room_for_what_it_replaces: the temporary folder's drive can't hold a sparse 8 TiB file");
+        return;
+    }
+    write(&library(&src).join("Albums/Trip.album"), "an album");
+    fs::rename(library(&src).join("originals/IMG_1.jpg"), library(&src).join("originals/IMG_0001.jpg")).unwrap();
+    confirm(&rig.engine, &id);
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    if cfg!(target_os = "macos") && library(&dst).join("originals/IMG_0001.jpg").exists() {
+        assert_eq!(files_in(&library(&dst)), ["Albums/Trip.album", "database/Photos.sqlite", "originals/IMG_0001.jpg"], "{}", run.describe());
+        assert_eq!(read(&library(&dst).join("database/Photos.sqlite")), "the database");
+        return;
+    }
+    assert_eq!(files_in(&library(&dst)), ["database/Photos.sqlite", "originals/IMG_1.jpg"], "nothing of the library changed: {}", run.describe());
+    assert_eq!(fs::metadata(&huge).unwrap().len(), 1 << 43);
+    assert_eq!((run.copied, run.deleted, run.failed), (0, 0, 1), "{}", run.describe());
+    let log = rig.engine.log(&id, 20);
+    assert!(
+        log.iter().any(|line| line.text.contains("to keep the replaced versions of “Lib.photoslibrary” in .charon-trash")),
+        "the log says why: {:?}",
+        log.iter().map(|line| &line.text).collect::<Vec<_>>()
+    );
+}
+
+/// A database checkpointed in the source (its journal written into it, and removed), in a
+/// two-way job, and its new version can't take its place on the destination (the version
+/// it replaces can't be kept there: .charon-trash is a file). The old journal, renamed aside
+/// before the new version would have met it, goes back next to its database: the
+/// destination's database keeps the changes only its journal holds.
+fn a_database_keeps_its_journal_when_its_new_version_cant_take_its_place(database: &str) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let journal = format!("{database}-wal");
+    let folder = Path::new(database).parent().unwrap();
+    let names = |names: &[&str]| -> Vec<String> {
+        names.iter().map(|name| format!("{}{name}", Path::new(database).file_name().unwrap().to_string_lossy())).collect()
+    };
+    write(&src.join(database), "the database");
+    write(&src.join(&journal), "changes not in the database yet");
+    let id = rig.engine.add_job(job_setup(&src, &dst, SyncMode::TwoWay)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    write(&src.join(database), "the database, with the changes written into it");
+    fs::remove_file(src.join(&journal)).unwrap();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.replaced, review.tally.destination.removed), (1, 1), "{:?}", review.tally);
+    let blocked = dst.clone();
+    rig.at_first_step(move || block_the_trash(&blocked));
+    let_progress_throttle_pass();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&dst.join(database)), "the database");
+    assert_eq!(read(&dst.join(&journal)), "changes not in the database yet", "the journal is back next to its database");
+    assert_eq!(files_in(&dst.join(folder)), names(&["", "-wal"]), "nothing else is left there");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert!(run.failed > 0 && (run.copied, run.deleted) == (0, 0), "{}", run.describe());
+
+    // With the trash a folder again, the next sync carries the new version, and the old
+    // journal goes.
+    fs::remove_file(dst.join(".charon-trash")).unwrap();
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&dst.join(database)), "the database, with the changes written into it");
+    assert_eq!(files_in(&dst.join(folder)), names(&[""]));
+    assert_eq!(view(&rig.engine, &id).job.last_run.unwrap().deleted, 1);
+}
+
+#[test]
+fn two_way_keeps_the_journal_of_a_database_whose_new_version_cant_take_its_place() {
+    a_database_keeps_its_journal_when_its_new_version_cant_take_its_place("app/data.db");
+}
+
+#[test]
+fn two_way_keeps_the_journal_of_a_library_database_whose_new_version_cant_take_its_place() {
+    a_database_keeps_its_journal_when_its_new_version_cant_take_its_place("Lib.photoslibrary/database/Photos.sqlite");
+}
+
+/// The first sync of a Photos library while its app writes to the database's journal now
+/// and then, once during each run. The destination has no version of the library yet that
+/// a new one could be mixed with: its photos land as each is ready, and only the database,
+/// which goes with its journal, waits for the next sync. The run says so truthfully: the
+/// journal changed meanwhile, the database only waits for it.
+fn a_busy_library_new_on_the_destination_lands_but_its_database(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let library = |root: &Path| root.join("Photos Library.photoslibrary");
+    write(&library(&src).join("database/Photos.sqlite"), "the database");
+    write(&library(&src).join("database/Photos.sqlite-wal"), "recent changes");
+    for n in 1..=5 {
+        write(&library(&src).join(format!("originals/IMG_{n}.jpg")), &format!("photo {n}"));
+    }
+    let id = rig.engine.add_job(job_setup(&src, &dst, mode)).expect("the job is added").job.id;
+    let wal = library(&src).join("database/Photos.sqlite-wal");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&wal).unwrap().write_all(b", one more").unwrap());
+    let_progress_throttle_pass();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    for n in 1..=5 {
+        assert_eq!(read(&library(&dst).join(format!("originals/IMG_{n}.jpg"))), format!("photo {n}"));
+    }
+    assert!(!library(&dst).join("database").join("Photos.sqlite").exists(), "the database waits for its journal");
+    assert!(!library(&dst).join("database").join("Photos.sqlite-wal").exists());
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.skipped, run.waited), (5, 1, 1), "{}", run.describe());
+    assert!(
+        run.describe().ends_with("1 item skipped (changed meanwhile), 1 item left for the next sync with the rest of its app library or database"),
+        "{}",
+        run.describe()
+    );
+
+    // The next sync, while the app is quiet, carries the database with its journal.
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite")), "the database");
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite-wal")), "recent changes, one more");
+}
+
+#[test]
+fn two_way_carries_the_photos_of_a_busy_library_new_on_the_destination() {
+    a_busy_library_new_on_the_destination_lands_but_its_database(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_carries_the_photos_of_a_busy_library_new_on_the_destination() {
+    a_busy_library_new_on_the_destination_lands_but_its_database(SyncMode::Mirror);
 }
