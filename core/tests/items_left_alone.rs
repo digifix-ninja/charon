@@ -123,3 +123,28 @@ fn a_link_left_under_a_temporary_name_by_an_interrupted_sync_is_tidied_away() {
     assert!(kept.iter().any(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())), "into the trash: {kept:?}");
     assert_eq!(fs::read_to_string(dst.join("photos/cat.jpg")).unwrap(), "meow");
 }
+
+/// Finder leaves a `.DS_Store` in every folder it shows: in Charon's trash when the person
+/// looks there for a removed file, in the hidden `.charon` folder too. Both stay Charon's,
+/// and nothing says an item can't be synced.
+#[test]
+fn finders_clutter_in_charons_folders_leaves_them_charons() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write(&a.join("keep.txt"), "k");
+    write(&a.join("gone.txt"), "g");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    fs::remove_file(a.join("gone.txt")).unwrap();
+    confirm(&engine, &id);
+    assert!(b.join(".charon-trash").is_dir() && b.join(".charon").is_dir());
+
+    write(&b.join(".charon-trash/.DS_Store"), "Finder");
+    write(&b.join(".charon/.DS_Store"), "Finder");
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.notes.is_empty(), "{:?}", review.notes);
+    assert_eq!(review.total_steps, 0);
+    assert!(review.warnings.iter().all(|warning| !warning.text.contains("can't be synced")), "{:?}", review.warnings);
+}

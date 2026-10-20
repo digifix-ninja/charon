@@ -296,7 +296,9 @@ impl<'a> Scanner<'a> {
     }
 
     /// Whether an item named `.charon` or `.charon-trash` really is one of Charon's: a
-    /// folder holding only markers, or only dated trash folders (or nothing).
+    /// folder holding only Charon's own files (see `Marker::is_charons_file`), or only dated
+    /// trash folders (or nothing). The files the system scatters into every folder it shows
+    /// (Finder's `.DS_Store`, Explorer's `desktop.ini`) don't count.
     fn looks_like_charons(path: &Path, name: &str, is_dir: bool) -> bool {
         if !is_dir {
             return false;
@@ -305,9 +307,10 @@ impl<'a> Scanner<'a> {
         items.into_iter().all(|item| {
             let Ok(item) = item else { return false };
             let (Ok(kind), Some(inner)) = (item.file_type(), item.file_name().to_str().map(str::to_owned)) else { return false };
-            if name == MARKER_FOLDER {
-                kind.is_file()
-                    && [".json", crate::run::BUSY_EXTENSION, crate::run::PROBE_EXTENSION, ".tmp"].iter().any(|extension| inner.ends_with(extension))
+            if kind.is_file() && is_clutter(&inner) {
+                true
+            } else if name == MARKER_FOLDER {
+                kind.is_file() && crate::run::Marker::is_charons_file(&inner)
             } else {
                 kind.is_dir() && crate::run::Trash::is_run_folder(&inner)
             }
@@ -539,36 +542,70 @@ mod tests {
         assert!(windows_name_problem(".env").is_none());
     }
 
+    /// Ids of jobs, and of a note that a sync is at work, as Charon makes them.
+    const MINE: &str = "0123456789abcdef0123456789abcdef";
+    const OTHER: &str = "fedcba9876543210fedcba9876543210";
+    const NOTE: &str = "00112233445566778899aabbccddeeff";
+
     #[test]
     fn the_persons_own_items_named_like_charons_folders_are_noted_not_hidden() {
         let tmp = tempfile::tempdir().unwrap();
         // Charon's own: the marker folder at the top, and another job's inside.
-        write(&tmp.path().join(".charon/job1.json"), "{}");
-        write(&tmp.path().join("inner/.charon/job2.json"), "{}");
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
         write(&tmp.path().join("inner/.charon-trash/2026-01-02_03-04-05/old.txt"), "x");
-        // The person's own.
+        // The person's own, whatever the names of the files in them end with.
         write(&tmp.path().join("projects/app/.charon/settings.toml"), "x");
+        write(&tmp.path().join("projects/web/.charon/settings.json"), "{}");
+        write(&tmp.path().join("projects/web/.charon/cache.tmp"), "x");
         write(&tmp.path().join("notes/.charon-trash"), "a file");
         let s = scan(tmp.path(), &[]);
         let mut noted: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
         noted.sort();
-        assert_eq!(noted, vec!["notes/.charon-trash", "projects/app/.charon"]);
+        assert_eq!(noted, vec!["notes/.charon-trash", "projects/app/.charon", "projects/web/.charon"]);
         assert!(s.is_occupied("projects/app") && s.is_occupied("inner"));
         assert!(!s.contains("projects/app/.charon/settings.toml"));
+        let mut met: Vec<&str> = s.charon_folders().iter().map(|c| c.folder.as_str()).collect();
+        met.sort();
+        assert_eq!(met, vec!["", "inner"]);
     }
 
     #[test]
     fn charons_folders_met_are_noted_with_their_markers() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join(".charon/mine.json"), "{}");
-        write(&tmp.path().join("Work/Inner/.charon/other.json"), "{}");
-        write(&tmp.path().join("Busy/.charon/0123.busy"), "{}");
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!("Work/Inner/.charon/{OTHER}.json")), "{}");
+        write(&tmp.path().join(format!("Busy/.charon/{NOTE}.busy")), "{}");
         write(&tmp.path().join("notes/.charon/settings.toml"), "the person's own");
         let s = scan(tmp.path(), &[]);
         let mut seen: Vec<(&str, Vec<String>)> = s.charon_folders().iter().map(|c| (c.folder.as_str(), c.jobs.clone())).collect();
         seen.sort();
-        assert_eq!(seen, vec![("", vec!["mine".to_string()]), ("Busy", vec![]), ("Work/Inner", vec!["other".to_string()])]);
+        assert_eq!(seen, vec![("", vec![MINE.to_string()]), ("Busy", vec![]), ("Work/Inner", vec![OTHER.to_string()])]);
         assert!(s.is_occupied("Busy"), "a folder holding Charon's own folder is never removed");
+    }
+
+    /// Finder leaves a `.DS_Store` in every folder it shows, Charon's trash too when the
+    /// person looks for a removed file there. That doesn't make it the person's folder.
+    #[test]
+    fn the_systems_clutter_in_charons_folders_leaves_them_charons() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(format!(".charon/{MINE}.json")), "{}");
+        write(&tmp.path().join(format!(".charon/.{MINE}.json.4711-3.tmp")), "{}");
+        write(&tmp.path().join(format!(".charon/{NOTE}.busy")), "{}");
+        write(&tmp.path().join(format!(".charon/._{NOTE}.busy")), "x");
+        write(&tmp.path().join(".charon/.DS_Store"), "x");
+        write(&tmp.path().join(".charon-trash/2026-01-02_03-04-05/old.txt"), "x");
+        write(&tmp.path().join(".charon-trash/.DS_Store"), "x");
+        write(&tmp.path().join(".charon-trash/desktop.ini"), "x");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
+        write(&tmp.path().join("inner/.charon/Thumbs.db"), "x");
+        let s = scan(tmp.path(), &[]);
+        assert!(s.skipped().is_empty(), "{:?}", s.skipped());
+        let reserved: Vec<&str> = s.reserved().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(reserved, vec![".charon", ".charon-trash", "inner/.charon"]);
+        let mut seen: Vec<(&str, Vec<String>)> = s.charon_folders().iter().map(|c| (c.folder.as_str(), c.jobs.clone())).collect();
+        seen.sort();
+        assert_eq!(seen, vec![("", vec![MINE.to_string()]), ("inner", vec![OTHER.to_string()])]);
     }
 
     #[test]
@@ -790,7 +827,7 @@ mod tests {
     fn names_kept_for_charons_own_use_are_remembered() {
         let tmp = tempfile::tempdir().unwrap();
         write(&tmp.path().join(".charon-trash/2026-01-01_00-00-00/a.txt"), "x");
-        write(&tmp.path().join("inner/.charon/job.json"), "{}");
+        write(&tmp.path().join(format!("inner/.charon/{OTHER}.json")), "{}");
         write(&tmp.path().join("a/.charon-00112233445566ff.part"), "half");
         write(&tmp.path().join("node_modules/x.js"), "x");
         write(&tmp.path().join("b.charon-partial/inside.txt"), "x");
