@@ -3,10 +3,14 @@
 //!
 //! The systems offer this directly (Linux `renameat2` with `RENAME_NOREPLACE`, macOS
 //! `renamex_np` with `RENAME_EXCL`, Windows `MoveFileExW` without `REPLACE_EXISTING`).
-//! Where a drive doesn't support it (some network shares), a file gets its new name as a
-//! hard link first, which can't replace anything either, and then loses the old name. Only
-//! where a drive has neither does Charon look first and then rename: the gap is a few
-//! microseconds.
+//! Some drives don't support it (NFS shares, sshfs and other drives run by a program). There
+//! a look before renaming isn't enough: the computer answers such a look from its own
+//! picture of the folder, which can miss a file another computer saved seconds ago. So the
+//! new name is made on the drive itself, which refuses a name that's taken:
+//!
+//! 1. as a second name of the same file (a hard link), after which the old name goes;
+//! 2. where the drive has no second names either (and always for a folder), by creating an
+//!    empty file (or folder) under the new name and then renaming over that empty one.
 //!
 //! Replacing a file goes through `swap` where the drive can exchange two names in one step
 //! (Linux `RENAME_EXCHANGE`, macOS `RENAME_SWAP`): what was swapped out can then be checked,
@@ -19,16 +23,7 @@ use std::path::Path;
 /// Renames `from` to `to`, failing with `AlreadyExists` if something is at `to`.
 pub fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     match system::rename_no_replace(from, to) {
-        Err(e) if is_unsupported(&e) => match link_then_unlink(from, to) {
-            Err(e) if is_unsupported(&e) => {
-                log::debug!("{} can't be renamed without a look first: {e}", to.display());
-                if fs::symlink_metadata(to).is_ok() {
-                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "something is already there"));
-                }
-                fs::rename(from, to)
-            }
-            other => other,
-        },
+        Err(e) if is_unsupported(&e) => rename_through_second_name(from, to),
         other => other,
     }
 }
@@ -42,24 +37,97 @@ pub fn swap(a: &Path, b: &Path) -> io::Result<()> {
     }
 }
 
-/// `rename_new` for drives without a renaming call that refuses to replace: a hard link
-/// under the new name (refused if anything is there), then the old name goes. Regular files
-/// only; anything else, or a drive without hard links, answers `Unsupported`.
-fn link_then_unlink(from: &Path, to: &Path) -> io::Result<()> {
-    if !fs::symlink_metadata(from)?.is_file() {
-        return Err(io::Error::new(io::ErrorKind::Unsupported, "only files are linked"));
+/// `rename_new` on a drive without its own way: `to` becomes a second name of the file at
+/// `from` (the drive refuses it if the name is taken), then `from` goes. A folder has no
+/// second names, so it claims its new name instead.
+fn rename_through_second_name(from: &Path, to: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(from)?.is_dir() {
+        return rename_into_claimed_name(from, to);
     }
     match fs::hard_link(from, to) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
-        Err(e) => return Err(io::Error::new(io::ErrorKind::Unsupported, e.to_string())),
+        Err(e) if has_no_second_names(&e) => return rename_into_claimed_name(from, to),
+        Err(e) => return Err(e),
     }
     if let Err(e) = fs::remove_file(from) {
-        // Both names lead to the same file: the new one goes again, and nothing moved.
-        let _ = fs::remove_file(to);
+        // The file keeps its old name only, as if nothing happened.
+        if same_file(from, to) {
+            let _ = fs::remove_file(to);
+        }
         return Err(e);
     }
     Ok(())
+}
+
+/// `rename_new` on a drive without second names (FAT, exFAT, most cloud drives), and for
+/// folders: an empty file (or an empty folder, for a folder) claims the name `to` first (the
+/// drive refuses it if the name is taken), and the item at `from` then takes its place. A
+/// claimed folder that something was saved into meanwhile isn't empty, and the drive refuses
+/// to rename over it.
+fn rename_into_claimed_name(from: &Path, to: &Path) -> io::Result<()> {
+    let folder = fs::symlink_metadata(from)?.is_dir();
+    let claimed = if folder {
+        fs::create_dir(to)?;
+        fs::symlink_metadata(to).ok()
+    } else {
+        let claim = fs::OpenOptions::new().write(true).create_new(true).open(to)?;
+        claim.metadata().ok()
+    };
+    if let Err(e) = fs::rename(from, to) {
+        // The name is given back, unless something else took the place of the empty claim.
+        let still_the_claim = |now: &fs::Metadata| claimed.as_ref().is_some_and(|claimed| same_item(now, claimed));
+        match fs::symlink_metadata(to) {
+            Ok(now) if folder && now.is_dir() && still_the_claim(&now) => {
+                // Refused if something was saved into it meanwhile: then it stays.
+                let _ = fs::remove_dir(to);
+            }
+            Ok(now) if !folder && now.is_file() && now.len() == 0 && still_the_claim(&now) => {
+                let _ = fs::remove_file(to);
+            }
+            _ => {}
+        }
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Whether `a` and `b` are names of one and the same file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::symlink_metadata(a), fs::symlink_metadata(b)) {
+        (Ok(a), Ok(b)) => same_item(&a, &b),
+        _ => false,
+    }
+}
+
+/// Whether two looks found the same item (by its drive and number; never on systems
+/// without them, so nothing is removed on a guess).
+fn same_item(a: &fs::Metadata, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
+/// Whether a hard link failed because the drive (or the file's owner) doesn't allow one.
+fn has_no_second_names(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::Unsupported {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        matches!(error.raw_os_error(), Some(code) if code == libc::EPERM || code == libc::ENOSYS || code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::EMLINK)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 /// `path` as a NUL-terminated UTF-16 string for a direct Windows call: absolute, with `\`
@@ -207,32 +275,66 @@ mod system {
 mod tests {
     use super::*;
 
-    #[test]
-    fn never_replaces() {
+    /// Renames `a` onto a taken name `b`, then onto a free one, the way `rename` does.
+    fn never_replaces_with(rename: fn(&Path, &Path) -> io::Result<()>) {
         let tmp = tempfile::tempdir().unwrap();
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
         fs::write(&a, "new").unwrap();
         fs::write(&b, "precious").unwrap();
-        assert_eq!(rename_new(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(rename(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&b).unwrap(), "precious");
+        assert_eq!(fs::read_to_string(&a).unwrap(), "new", "the file keeps its old name");
         fs::remove_file(&b).unwrap();
-        rename_new(&a, &b).unwrap();
+        rename(&a, &b).unwrap();
         assert_eq!(fs::read_to_string(&b).unwrap(), "new");
+        assert!(fs::symlink_metadata(&a).is_err(), "the old name is gone");
     }
 
     #[test]
-    fn linking_never_replaces_either() {
+    fn never_replaces() {
+        never_replaces_with(rename_new);
+    }
+
+    #[test]
+    fn never_replaces_on_drives_without_their_own_way() {
+        // NFS shares, sshfs and the like: the drive itself refuses a second name that's taken.
+        never_replaces_with(rename_through_second_name);
+        // Drives without second names: the drive itself refuses to create a file that's there.
+        never_replaces_with(rename_into_claimed_name);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn links_keep_being_links_on_drives_without_their_own_way() {
         let tmp = tempfile::tempdir().unwrap();
-        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
-        fs::write(&a, "new").unwrap();
-        fs::write(&b, "precious").unwrap();
-        assert_eq!(link_then_unlink(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(fs::read_to_string(&b).unwrap(), "precious");
-        assert!(a.exists());
-        fs::remove_file(&b).unwrap();
-        link_then_unlink(&a, &b).unwrap();
-        assert_eq!(fs::read_to_string(&b).unwrap(), "new");
-        assert!(!a.exists());
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
+        std::os::unix::fs::symlink("../elsewhere", &a).unwrap();
+        rename_through_second_name(&a, &b).unwrap();
+        assert_eq!(fs::read_link(&b).unwrap(), Path::new("../elsewhere"));
+        rename_into_claimed_name(&b, &c).unwrap();
+        assert_eq!(fs::read_link(&c).unwrap(), Path::new("../elsewhere"));
+    }
+
+    #[test]
+    fn a_failed_rename_gives_the_claimed_name_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (missing, to) = (tmp.path().join("missing"), tmp.path().join("to"));
+        assert!(rename_into_claimed_name(&missing, &to).is_err());
+        assert!(fs::symlink_metadata(&to).is_err(), "no empty file is left under the name");
+    }
+
+    #[test]
+    fn folders_claim_their_new_name_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, c) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("c"));
+        fs::create_dir(&a).unwrap();
+        fs::write(a.join("inside"), "kept").unwrap();
+        fs::create_dir(&b).unwrap();
+        assert_eq!(rename_through_second_name(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists, "an empty folder is taken too");
+        assert!(a.join("inside").exists() && b.read_dir().unwrap().next().is_none());
+        rename_through_second_name(&a, &c).unwrap();
+        assert_eq!(fs::read_to_string(c.join("inside")).unwrap(), "kept");
+        assert!(fs::symlink_metadata(&a).is_err(), "the old name is gone");
     }
 
     #[test]

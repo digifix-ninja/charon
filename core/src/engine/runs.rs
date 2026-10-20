@@ -10,12 +10,14 @@
 //! memory and clear that mark. A run that never got there (Charon closed, the computer
 //! stopped) is recognised at the next look, which then doesn't trust the memory.
 
+use crate::engine::runtime::MISSING_FOR;
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Progress, ReviewKind, RunSummary};
 use crate::plan::{Action, Baseline, NoteKind, Side};
 use crate::run::{Care, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
+use crate::scan::never_download_on_this_thread;
 use crate::store::{Landings, Memory};
 use chrono::Utc;
 use serde::Serialize;
@@ -192,9 +194,28 @@ impl Engine {
         let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: reason.to_string(), resolving: None };
         self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
             Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
-            Ok(survey) => engine.cross(&job, &survey, &cancel, &crossing),
+            Ok(mut survey) => {
+                engine.hold_back_recent_removals(&job, &mut survey);
+                engine.cross(&job, &survey, &cancel, &crossing);
+            }
             Err(e) => engine.unfinished(&job, &crossing, e),
         })
+    }
+
+    /// Leaves for a later run the removals that follow an item missing for only a few
+    /// minutes on a drive that may show changes late (see `Missing`), and says so in the log.
+    fn hold_back_recent_removals(&self, job: &Job, survey: &mut Survey) {
+        let held = self.change_runtime(&job.id, |rt| rt.missing.hold_back_recent(&mut survey.plan, &survey.source, &survey.destination, Instant::now()));
+        if held > 0 {
+            self.inner.journal.info(
+                &job.id,
+                &format!(
+                    "left {} for a later sync: the items went missing less than {} minutes ago on a network share or a cloud drive, which can show changes late",
+                    plural(held, "removal"),
+                    MISSING_FOR.as_secs() / 60
+                ),
+            );
+        }
     }
 
     /// Marks the job as running, if it may run now: it isn't running already, and no
@@ -265,7 +286,9 @@ impl Engine {
         }
     }
 
-    /// Runs `work` on its own thread for a job marked as running.
+    /// Runs `work` on its own thread for a job marked as running. The thread never downloads
+    /// files that are only in the cloud: one the cloud took back since the list was made is
+    /// left alone, as the scan leaves such files alone.
     pub(crate) fn spawn_crossing(
         &self,
         job: Job,
@@ -275,7 +298,10 @@ impl Engine {
     ) -> Result<()> {
         let engine = self.clone();
         let id = job.id.clone();
-        let spawned = thread::Builder::new().name("charon-sync".into()).spawn(move || work(&engine, job, cancel, crossing));
+        let spawned = thread::Builder::new().name("charon-sync".into()).spawn(move || {
+            never_download_on_this_thread();
+            work(&engine, job, cancel, crossing)
+        });
         if let Err(e) = spawned {
             self.change_runtime(&id, |rt| {
                 rt.cancel = None;

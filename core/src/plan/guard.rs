@@ -10,7 +10,7 @@
 use crate::model::{human_count, plural};
 use crate::plan::{Action, Baseline, Plan, Side};
 use crate::scan::{Keys, Snapshot};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Removals that need a look: at least this many files on one side…
 const FEW: u64 = 3;
@@ -100,9 +100,7 @@ impl Guard {
             if let Some(concern) = Self::emptied_files(plan, side) {
                 concerns.push(concern);
             }
-            if let Some(concern) = Self::emptied_folders(plan, other, baseline, side) {
-                concerns.push(concern);
-            }
+            concerns.extend(Self::emptied_folders(plan, other, baseline, side));
         }
         concerns
     }
@@ -165,39 +163,60 @@ impl Guard {
         })
     }
 
-    /// Folders on the other side (`other`) that are there but look empty, although they held
-    /// several items at the last sync, while the plan carries that emptiness over to `side`.
-    /// A share or a cloud folder that lists a folder before it has loaded looks exactly like that.
-    fn emptied_folders(plan: &Plan, other: &Snapshot, baseline: &Baseline, side: Side) -> Option<String> {
-        let candidates: BTreeSet<&str> = plan
-            .actions
-            .iter()
-            .filter_map(|a| match a {
-                Action::Delete { side: s, path, .. } if *s == side => Some(path.as_str()),
-                _ => None,
-            })
-            .flat_map(Keys::ancestors)
-            .collect();
-        let emptied: Vec<&str> = candidates
+    /// Folders on the other side (`other`) that are there but look empty, while the plan
+    /// carries that emptiness over to `side`: they held several items at the last sync
+    /// (two-way), or the plan removes several items from the same folder on `side` (Mirror,
+    /// which keeps no record of the last sync). A share or a cloud folder that lists a folder
+    /// before it has loaded looks exactly like that.
+    fn emptied_folders(plan: &Plan, other: &Snapshot, baseline: &Baseline, side: Side) -> Vec<String> {
+        // How many items the plan removes from each folder on `side`, at any depth.
+        let mut removed_inside: BTreeMap<&str, usize> = BTreeMap::new();
+        for action in &plan.actions {
+            if let Action::Delete { side: s, path, .. } = action {
+                if *s == side {
+                    for folder in Keys::ancestors(path) {
+                        *removed_inside.entry(folder).or_default() += 1;
+                    }
+                }
+            }
+        }
+        let emptied: Vec<&str> = removed_inside
             .into_iter()
-            .filter(|folder| {
+            .filter(|(folder, removed)| {
                 let looks_empty = other.get(folder).is_some_and(|e| e.is_dir()) && other.inside(folder).next().is_none();
-                looks_empty && baseline.held_at_least(folder, EMPTIED_FOLDER)
+                looks_empty && (baseline.held_at_least(folder, EMPTIED_FOLDER) || *removed >= EMPTIED_FOLDER)
             })
+            .map(|(folder, _)| folder)
             .collect();
         // Only the topmost of nested ones.
         let folders: Vec<&str> =
             emptied.iter().copied().filter(|f| !emptied.iter().any(|top| top != f && Keys::is_within(f, top))).collect();
-        (!folders.is_empty()).then(|| {
-            format!(
+        let (remembered, removing): (Vec<&str>, Vec<&str>) =
+            folders.into_iter().partition(|folder| baseline.held_at_least(folder, EMPTIED_FOLDER));
+        let looks = |folders: &[&str]| if folders.len() == 1 { "looks" } else { "look" };
+        let mut concerns = Vec::new();
+        if !remembered.is_empty() {
+            concerns.push(format!(
                 "{} on the {} now {} empty, though {} several items at the last sync: {}.",
-                Self::subject(folders.len(), "folder"),
+                Self::subject(remembered.len(), "folder"),
                 side.opposite().word(),
-                if folders.len() == 1 { "looks" } else { "look" },
-                if folders.len() == 1 { "it held" } else { "they held" },
-                Self::list(&folders)
-            )
-        })
+                looks(&remembered),
+                if remembered.len() == 1 { "it held" } else { "they held" },
+                Self::list(&remembered)
+            ));
+        }
+        if !removing.is_empty() {
+            concerns.push(format!(
+                "{} on the {} now {} empty, while this sync would remove several items from the same {} on the {}: {}.",
+                Self::subject(removing.len(), "folder"),
+                side.opposite().word(),
+                looks(&removing),
+                if removing.len() == 1 { "folder" } else { "folders" },
+                side.word(),
+                Self::list(&removing)
+            ));
+        }
+        concerns
     }
 
     /// "1 file", "3 files" at the start of a sentence.
@@ -347,5 +366,31 @@ mod tests {
         destination.insert("contracts", Entry::dir());
         let found = Guard::concerns(&plan, &files(1_000), &destination, &baseline, None);
         assert!(found.iter().any(|c| c.contains("contracts") && c.contains("destination")), "{found:?}");
+    }
+
+    /// A Mirror whose source folder `photos` is there but lists none of the `n` files the
+    /// destination holds in it, in folders of a thousand files.
+    fn mirror_of_an_empty_looking_folder(n: usize) -> Vec<String> {
+        let mut plan = Plan::default();
+        let mut source = files(1_000);
+        let mut destination = files(1_000);
+        source.insert("photos", Entry::dir());
+        destination.insert("photos", Entry::dir());
+        for i in 0..n {
+            let path = format!("photos/p{i}.jpg");
+            destination.insert(path.clone(), Entry::file(1, 1));
+            plan.push(Action::delete(Side::Destination, &path, Entry::file(1, 1), None));
+        }
+        concerns(&plan, &source, &destination)
+    }
+
+    #[test]
+    fn a_mirrored_folder_that_suddenly_looks_empty_needs_a_look() {
+        // Mirror keeps no record of the last sync: what the destination holds there counts.
+        let found = mirror_of_an_empty_looking_folder(6);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("photos") && found[0].contains("source"), "{found:?}");
+        // Emptying a small folder is ordinary work.
+        assert!(mirror_of_an_empty_looking_folder(4).is_empty());
     }
 }

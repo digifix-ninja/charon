@@ -7,6 +7,7 @@
 //! computer's changes late. Charon looks at each folder's drive before it plans, so an item
 //! the other drive can't hold becomes a note instead of a step that fails on every run.
 
+use crate::scan::MARKER_FOLDER;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -49,14 +50,14 @@ pub struct Volume {
 }
 
 impl Volume {
-    /// The drive of the folder `root`. Never fails: what can't be found out is assumed in the
-    /// careful direction (another kind of drive, ignoring case).
     /// The drive `root` is on, without asking how it treats case: quick enough to ask
     /// every second. `None` where the system can't tell.
     pub fn basics(root: &Path) -> Option<Volume> {
         system::volume_of(root)
     }
 
+    /// The drive of the folder `root`. Never fails: what can't be found out is assumed in the
+    /// careful direction (another kind of drive, ignoring case).
     pub fn of(root: &Path) -> Volume {
         let mut volume = system::volume_of(root).unwrap_or_else(|| Volume {
             kind: FsKind::Other,
@@ -66,11 +67,8 @@ impl Volume {
             network: false,
             case_sensitive: false,
         });
-        if let Some(sensitive) = system::case_sensitive(root).or_else(|| probe_case(root)) {
-            volume.case_sensitive = sensitive;
-        } else {
-            volume.case_sensitive = volume.kind.usually_case_sensitive();
-        }
+        let asked = system::case_sensitive(root).or_else(|| probe_case(root)).or_else(|| probe_case_with_own_file(root));
+        volume.case_sensitive = asked.unwrap_or_else(|| volume.kind.usually_case_sensitive());
         volume
     }
 
@@ -95,6 +93,14 @@ impl Volume {
         }
     }
 
+    /// Whether this drive may show changes late: a network share (another computer's
+    /// change), or a drive run by a program instead of the system (FUSE: sshfs, rclone and
+    /// most cloud drives), which keeps its own picture of the folders for a while. A look at
+    /// one item there opens it, so the drive itself answers.
+    pub fn shows_changes_late(&self) -> bool {
+        self.network || self.fs.to_ascii_lowercase().contains("fuse")
+    }
+
     /// Whether this drive keeps times in local time, so a daylight-saving change or a trip
     /// to another time zone moves every file's time by whole hours.
     pub fn shifts_times(&self) -> bool {
@@ -110,9 +116,10 @@ impl Volume {
     }
 
     /// Whether this drive keeps modification times in steps of a second or more (Mac OS
-    /// Extended, FAT, exFAT, network shares), so two writes within one step look the same.
+    /// Extended, FAT, exFAT, network shares, and drives run by a program, like sshfs), so two
+    /// writes within one step look the same.
     pub fn coarse_times(&self) -> bool {
-        self.network || matches!(self.kind, FsKind::Hfs | FsKind::Fat | FsKind::Exfat | FsKind::Smb | FsKind::Nfs | FsKind::Afp)
+        self.shows_changes_late() || matches!(self.kind, FsKind::Hfs | FsKind::Fat | FsKind::Exfat | FsKind::Smb | FsKind::Nfs | FsKind::Afp)
     }
 
     /// Whether this drive's times can be held against another drive's to say which version
@@ -222,10 +229,7 @@ fn probe_case(root: &Path) -> Option<bool> {
     for item in items.take(64).flatten() {
         let name = item.file_name();
         let Some(name) = name.to_str() else { continue };
-        let swapped: String = name
-            .chars()
-            .map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() })
-            .collect();
+        let swapped = swap_case(name);
         if swapped == name {
             continue;
         }
@@ -237,6 +241,34 @@ fn probe_case(root: &Path) -> Option<bool> {
         }
     }
     None
+}
+
+/// Asks the drive with a file of Charon's own where the folder's names can't tell (an empty
+/// folder, or names without letters), so a folder gets the same answer empty as once it
+/// fills up. The file is made in a `.charon` folder made for this, and both are removed at
+/// once. `None` where the folder can't be written to.
+fn probe_case_with_own_file(root: &Path) -> Option<bool> {
+    let folder = root.join(MARKER_FOLDER);
+    std::fs::create_dir(&folder).ok()?;
+    let name = format!("Case-Probe-{:016x}.tmp", uuid::Uuid::new_v4().as_u128() as u64);
+    let probe = folder.join(&name);
+    let answer = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).ok().and_then(|_| {
+        match std::fs::symlink_metadata(folder.join(swap_case(&name))) {
+            Ok(_) => Some(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(true),
+            Err(_) => None,
+        }
+    });
+    let _ = std::fs::remove_file(&probe);
+    let _ = std::fs::remove_dir(&folder);
+    answer
+}
+
+/// `name` with the upper and lower case of its ASCII letters swapped.
+fn swap_case(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_ascii_uppercase() { c.to_ascii_lowercase() } else { c.to_ascii_uppercase() })
+        .collect()
 }
 
 /// Whether two looks found the same item. Some network shares make up item numbers per
@@ -482,6 +514,32 @@ mod tests {
         assert!(fat.too_big(1_000).is_none());
         assert!(!fat.holds_links() && !fat.holds_extended_attributes() && fat.shifts_times());
         assert!(volume(FsKind::Exfat).too_big(5_000_000_000).is_none());
+    }
+
+    #[test]
+    fn shares_and_drives_run_by_a_program_may_show_changes_late() {
+        assert!(!volume(FsKind::Ext).shows_changes_late());
+        let fuse = Volume { fs: "fuse".into(), ..volume(FsKind::Other) };
+        assert!(fuse.shows_changes_late() && fuse.coarse_times());
+        assert!(Volume { fs: "macfuse".into(), ..volume(FsKind::Other) }.shows_changes_late());
+        assert!(Volume { network: true, ..volume(FsKind::Smb) }.shows_changes_late());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_empty_folder_gets_the_answer_it_gets_once_it_fills_up() {
+        // tmpfs is a kind of drive whose case setting Charon can't guess.
+        let shared_memory = Path::new("/dev/shm");
+        let tmp = if shared_memory.is_dir() { tempfile::tempdir_in(shared_memory) } else { tempfile::tempdir() }.unwrap();
+        assert!(Volume::of(tmp.path()).case_sensitive, "asked with a file of Charon's own");
+        assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "and nothing is left behind");
+        std::fs::write(tmp.path().join("Photos"), "x").unwrap();
+        assert!(Volume::of(tmp.path()).case_sensitive);
+        // A `.charon` folder that was there before is never touched.
+        std::fs::remove_file(tmp.path().join("Photos")).unwrap();
+        std::fs::create_dir(tmp.path().join(MARKER_FOLDER)).unwrap();
+        assert!(Volume::of(tmp.path()).case_sensitive);
+        assert_eq!(std::fs::read_dir(tmp.path().join(MARKER_FOLDER)).unwrap().count(), 0);
     }
 
     #[test]

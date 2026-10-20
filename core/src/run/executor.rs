@@ -1129,13 +1129,13 @@ impl<'a> Executor<'a> {
         self.shores.root(side).join(self.spellings.disk(side, key))
     }
 
-    /// `look`, but on a network share a file is opened and asked directly: a share's
-    /// listing can show another computer's change late.
+    /// `look`, but on a drive that may show changes late (a network share, a cloud drive) a
+    /// file is opened and asked directly: its listing can show another computer's change late.
     fn look_fresh(&self, side: Side, path: &Path) -> Result<Option<Entry>> {
         let seen = Self::look(path)?;
-        let network = self.spellings.snapshot(side).volume().is_some_and(|v| v.network);
+        let late = self.spellings.snapshot(side).volume().is_some_and(|v| v.shows_changes_late());
         match seen {
-            Some(entry) if network && entry.is_file() => match fs::File::open(path).and_then(|file| file.metadata()) {
+            Some(entry) if late && entry.is_file() => match fs::File::open(path).and_then(|file| file.metadata()) {
                 Ok(meta) if meta.is_file() => Ok(Some(Entry::file(meta.len(), Scanner::modified_ms(&meta)).changed_at(Scanner::change_time(&meta)))),
                 Ok(_) => Err(Error::Changed("changed since the scan".into())),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),

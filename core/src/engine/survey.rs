@@ -14,6 +14,7 @@ use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
 /// younger one may belong to a sync running right now in another job).
@@ -174,6 +175,8 @@ impl Engine {
         let volumes = (Volume::of(&setup.source), Volume::of(&setup.destination));
         let folded = !(volumes.0.case_sensitive && volumes.1.case_sensitive);
         let filter = ExcludeFilter::new(&setup.excludes, folded)?;
+        // The folder watcher tells the changes that matter with the same filter.
+        self.change_runtime(&job.id, |rt| rt.filter = Some((setup.clone(), filter.clone())));
         let (mut source, mut destination) = self.scan_both(job, &filter, volumes.clone(), cancel, purpose != Purpose::Check)?;
         if folded {
             source.fold();
@@ -234,7 +237,7 @@ impl Engine {
             self.inner.landings.load(&job.id, &setup, folded, &markers.destination)
         };
         let compared = if setup.mode.is_two_way() {
-            self.compare_contents(job, &source, &destination, &mut baseline, purpose, cancel)?
+            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, purpose, cancel))?
         } else {
             Compared::default()
         };
@@ -242,6 +245,7 @@ impl Engine {
 
         let record = if setup.mode.is_two_way() { &baseline } else { &landed };
         let plan = plan::plan_for(&setup, &source, &destination, record, &compared.different);
+        self.change_runtime(&job.id, |rt| rt.missing.note(&plan, &source, &destination, Instant::now()));
         let refusal = Guard::refusal(&plan, &source, &destination);
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
@@ -438,7 +442,6 @@ impl Engine {
     fn scan_both(&self, job: &Job, filter: &ExcludeFilter, volumes: (Volume, Volume), cancel: &AtomicBool, report: bool) -> Result<(Snapshot, Snapshot)> {
         let (source_volume, destination_volume) = volumes;
         let scan = |side: Side, volume: Volume| {
-            never_download_on_this_thread();
             let counter = |items: u64| {
                 if report {
                     self.emit(EngineEvent::ScanProgress { id: job.id.clone(), side, items });
@@ -451,8 +454,11 @@ impl Engine {
             Scanner::new(filter).cancellable(cancel).counting(&counter).scan(root, volume)
         };
         let (source, destination) = std::thread::scope(|scope| {
-            let source = std::thread::Builder::new().name("charon-scan".into()).spawn_scoped(scope, || scan(Side::Source, source_volume));
-            let destination = scan(Side::Destination, destination_volume);
+            let source = std::thread::Builder::new().name("charon-scan".into()).spawn_scoped(scope, || {
+                never_download_on_this_thread();
+                scan(Side::Source, source_volume)
+            });
+            let destination = Self::without_downloads("The scan of the destination", || scan(Side::Destination, destination_volume));
             let source = match source {
                 Ok(handle) => handle.join().unwrap_or_else(|_| Err(Error::Invalid("The scan of the source stopped unexpectedly.".into()))),
                 Err(e) => Err(Error::Io(e)),
@@ -460,6 +466,19 @@ impl Engine {
             (source, destination)
         });
         Ok((source?, destination?))
+    }
+
+    /// Runs `work` on a thread of its own that never downloads files that are only in the
+    /// cloud. A look may be asked for on any thread (the window's, for a list), and that
+    /// thread keeps its own setting. `what` names the work if it stops unexpectedly.
+    fn without_downloads<T: Send>(what: &str, work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
+        std::thread::scope(|scope| {
+            let handle = std::thread::Builder::new().name("charon-scan".into()).spawn_scoped(scope, || {
+                never_download_on_this_thread();
+                work()
+            })?;
+            handle.join().unwrap_or_else(|_| Err(Error::Invalid(format!("{what} stopped unexpectedly."))))
+        })
     }
 
     /// Mirror and Backup: why the destination may not be the folder of the last sync.

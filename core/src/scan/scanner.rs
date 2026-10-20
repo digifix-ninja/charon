@@ -50,6 +50,7 @@ impl<'a> Scanner<'a> {
         snapshot.facts_mut().root = root_id;
         let change_times = volume.keeps_change_times();
         snapshot.facts_mut().volume = Some(volume);
+        let drive_top = Self::top_of_drive(root);
         let mut walker = WalkDir::new(root).follow_links(false).min_depth(1).into_iter();
         let mut seen: u64 = 0;
 
@@ -86,6 +87,14 @@ impl<'a> Scanner<'a> {
             if item.depth() == 1 && is_system_folder(name) {
                 if file_type.is_dir() {
                     walker.skip_current_dir();
+                }
+                // Below the top of a drive it's the person's own item, only named like one
+                // of the drive's folders: left alone too, and said so.
+                if !drive_top {
+                    snapshot.facts_mut().skipped.push(Skipped {
+                        path: disk,
+                        reason: "named like a folder drives keep for themselves, so Charon leaves it alone".into(),
+                    });
                 }
                 continue;
             }
@@ -206,8 +215,6 @@ impl<'a> Scanner<'a> {
         }
     }
 
-    /// Why the folder `item` must not be entered: it's on another drive than the scanned
-    /// folder, or Charon can't tell.
     /// Whether an item named `.charon` or `.charon-trash` really is one of Charon's: a
     /// folder holding only markers, or only dated trash folders (or nothing).
     fn looks_like_charons(path: &Path, name: &str, is_dir: bool) -> bool {
@@ -226,6 +233,8 @@ impl<'a> Scanner<'a> {
         })
     }
 
+    /// Why the folder `item` must not be entered: it's on another drive than the scanned
+    /// folder, or Charon can't tell.
     #[cfg(unix)]
     fn other_drive(item: &walkdir::DirEntry, root: Option<RootId>) -> Option<String> {
         let root = root?;
@@ -240,6 +249,25 @@ impl<'a> Scanner<'a> {
     #[cfg(not(unix))]
     fn other_drive(_item: &walkdir::DirEntry, _root: Option<RootId>) -> Option<String> {
         None
+    }
+
+    /// Whether `root` is the top folder of its drive, where the drive keeps folders of its
+    /// own (a recycle bin, an index, `lost+found`). When that can't be told, it counts as
+    /// the top: such folders are left alone either way, only not mentioned.
+    #[cfg(unix)]
+    fn top_of_drive(root: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Ok(real) = fs::canonicalize(root) else { return true };
+        let Some(parent) = real.parent() else { return true };
+        match (fs::metadata(&real), fs::metadata(parent)) {
+            (Ok(here), Ok(above)) => here.dev() != above.dev(),
+            _ => true,
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn top_of_drive(root: &Path) -> bool {
+        fs::canonicalize(root).ok().is_none_or(|real| real.parent().is_none())
     }
 
     /// The folder must be there and readable.
@@ -427,6 +455,27 @@ mod tests {
         let s = scan(tmp.path(), &[]);
         assert!(s.get("System Volume Information").is_none());
         assert!(s.get("photos/lost+found/kept.txt").is_some(), "only at the top");
+    }
+
+    #[test]
+    fn a_persons_own_folders_named_like_a_drives_are_left_alone_and_mentioned() {
+        // A temporary folder is never the top of its drive.
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("lost+found/notes.txt"), "x");
+        write(&tmp.path().join(".TemporaryItems/draft.txt"), "x");
+        let s = scan(tmp.path(), &[]);
+        assert!(s.get("lost+found/notes.txt").is_none() && s.get(".TemporaryItems").is_none(), "never touched");
+        let mut noted: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
+        noted.sort();
+        assert_eq!(noted, vec![".TemporaryItems", "lost+found"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_top_of_a_drive_is_told_apart_from_a_folder_on_it() {
+        assert!(Scanner::top_of_drive(Path::new("/")));
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!Scanner::top_of_drive(tmp.path()));
     }
 
     #[test]

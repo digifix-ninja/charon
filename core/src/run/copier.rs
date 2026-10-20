@@ -152,7 +152,7 @@ impl<'a> Copier<'a> {
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
     /// take along.
     fn write_partial(&self, from: &Path, partial: &Path, mut writer: File, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<BTreeSet<&'static str>> {
-        let mut reader = File::open(from).map_err(|e| Error::file(from, e))?;
+        let mut reader = File::open(from).map_err(|e| Self::unreadable(from, e))?;
         let before = reader.metadata().map_err(|e| Error::file(from, e))?;
         let changed = Scanner::change_time(&before);
         if !before.is_file() || !Entry::file(before.len(), Scanner::modified_ms(&before)).changed_at(changed).unchanged(expected) {
@@ -170,7 +170,7 @@ impl<'a> Copier<'a> {
             let n = match reader.read(&mut buffer) {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Error::file(from, e)),
+                Err(e) => return Err(Self::unreadable(from, e)),
             };
             if n == 0 {
                 break;
@@ -212,6 +212,17 @@ impl<'a> Copier<'a> {
             log::warn!("couldn't copy the permissions of {}: {e}", from.display());
         }
         Ok(unkept)
+    }
+
+    /// Why the file to copy couldn't be read. A file the cloud took back since the scan
+    /// (iCloud Drive, OneDrive and Dropbox free up space that way) can't be read without
+    /// downloading it, which Charon never does: that's a change since the scan, not a failure.
+    fn unreadable(from: &Path, error: std::io::Error) -> Error {
+        #[cfg(target_os = "macos")]
+        if error.raw_os_error() == Some(libc::EDEADLK) {
+            return Error::Changed("only in the cloud since the scan (not downloaded to this computer), so Charon left it alone".into());
+        }
+        Error::file(from, error)
     }
 
     /// Gives the copy the original's modification (and access) time. A drive that refuses

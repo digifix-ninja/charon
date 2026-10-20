@@ -112,10 +112,11 @@ impl Engine {
             return true;
         }
         let excluded = self.change_runtime(id, |rt| {
-            let fresh = rt.filter.as_ref().is_some_and(|(patterns, _)| patterns == &job.setup.excludes);
+            let fresh = rt.filter.as_ref().is_some_and(|(setup, _)| setup == &job.setup);
             if !fresh {
-                // Patterns compared ignoring case: a change that matters is never missed.
-                rt.filter = ExcludeFilter::new(&job.setup.excludes, true).ok().map(|filter| (job.setup.excludes.clone(), filter));
+                // Until a look finds out how the drives treat case, patterns match it exactly:
+                // they then leave out the fewest items, so a change that matters is never missed.
+                rt.filter = ExcludeFilter::new(&job.setup.excludes, false).ok().map(|filter| (job.setup.clone(), filter));
             }
             rt.filter.as_ref().is_some_and(|(_, filter)| {
                 filter.excludes(&key) || Keys::ancestors(&key).any(|folder| filter.excludes(folder))
