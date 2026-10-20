@@ -237,14 +237,15 @@ export class Format {
 
   /**
    * What a review's tally adds up to, both sides together: files copied (new ones and
-   * kept-both copies), replaced (including newest-wins settlements), removed.
+   * kept-both copies), replaced, removed. Rust counts a conflict settled by newest wins
+   * among the replaced files of the side it replaces, so it's counted once.
    */
   static changeCounts(tally) {
     const sides = [tally.source, tally.destination];
     const sum = key => sides.reduce((n, side) => n + (side?.[key] || 0), 0);
     return {
       copy: sum("newFiles") + (tally.keepBoth || 0),
-      replace: sum("replaced") + (tally.newestWins || 0),
+      replace: sum("replaced"),
       remove: sum("removed"),
       removeFolders: sum("removedFolders"),
     };

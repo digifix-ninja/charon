@@ -31,7 +31,7 @@ const NOT_SYNCED = ["left-out", "name-clash", "blocked"];
 const FILTER_KINDS = {
   removals: ["remove"],
   replacements: ["replace", "settle"],
-  conflicts: ["conflict", "keep-both"],
+  conflicts: ["conflict", "keep-both", "settle"],
   new: ["new", "folder"],
 };
 
@@ -1021,8 +1021,12 @@ function tallyOf(steps, agreed) {
         else st.removed++;
         break;
       case "settle":
+        // Counted among the replaced files of the side it replaces too, as Rust does.
         t.newestWins++;
-        if (st) st.bytesIn += s.bytes;
+        if (st) {
+          st.replaced++;
+          st.bytesIn += s.bytes;
+        }
         t.bytes += s.bytes;
         break;
       case "keep-both":
