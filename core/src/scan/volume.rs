@@ -272,12 +272,19 @@ impl Volume {
         // names longer there than they look.
         let too_long = if self.kind == FsKind::Hfs {
             name.nfd().map(char::len_utf16).sum::<usize>() > 255
-        } else if self.kind.counts_utf16() {
+        } else if self.counts_utf16() {
             name.encode_utf16().count() > 255
         } else {
             name.len() > 255
         };
         too_long.then(|| format!("its name is too long for the {}", self.describe()))
+    }
+
+    /// Whether this drive counts the length of a name in UTF-16 units rather than bytes (see
+    /// `FsKind::counts_utf16`). On Linux, a disk a program reads ("fuseblk") is an NTFS or
+    /// exFAT drive read through ntfs-3g or exfat-fuse, which count so too.
+    fn counts_utf16(&self) -> bool {
+        self.kind.counts_utf16() || self.fs == "fuseblk"
     }
 
     /// "Backup SSD (exFAT)".
@@ -296,9 +303,11 @@ impl FsKind {
         matches!(self, FsKind::Fat | FsKind::Exfat | FsKind::Ntfs | FsKind::Refs | FsKind::Smb)
     }
 
-    /// Drives that count name length in UTF-16 units rather than bytes.
+    /// Drives that count name length in UTF-16 units rather than bytes: the drives made for
+    /// Windows, and Apple's (APFS holds every name Mac OS Extended could, so a name of 90
+    /// Japanese characters fits there, though it takes 270 bytes).
     fn counts_utf16(self) -> bool {
-        matches!(self, FsKind::Fat | FsKind::Exfat | FsKind::Ntfs | FsKind::Refs | FsKind::Smb | FsKind::Hfs)
+        matches!(self, FsKind::Fat | FsKind::Exfat | FsKind::Ntfs | FsKind::Refs | FsKind::Smb | FsKind::Hfs | FsKind::Apfs)
     }
 
     /// The usual case setting of this kind of drive, when the drive can't be asked.
@@ -669,6 +678,14 @@ mod tests {
         assert!(volume(FsKind::Hfs).cannot_hold(&name).is_some());
         assert!(volume(FsKind::Hfs).cannot_hold(&"e".repeat(200)).is_none());
         assert!(volume(FsKind::Apfs).cannot_hold(&"é".repeat(120)).is_none());
+        // 90 Japanese characters take 270 bytes, and 90 UTF-16 units.
+        let japanese = "\u{3042}".repeat(90);
+        assert!(volume(FsKind::Apfs).cannot_hold(&japanese).is_none(), "APFS holds what Mac OS Extended held");
+        assert!(volume(FsKind::Ext).cannot_hold(&japanese).is_some());
+        assert!(Volume { fs: "fuseblk".into(), ..volume(FsKind::Other) }.cannot_hold(&japanese).is_none(), "NTFS or exFAT through a program");
+        assert!(Volume { fs: "fuse.sshfs".into(), ..volume(FsKind::Other) }.cannot_hold(&japanese).is_some());
+        assert!(volume(FsKind::Apfs).cannot_hold(&"\u{3042}".repeat(256)).is_some());
+        assert!(volume(FsKind::Apfs).cannot_hold(&"\u{1f600}".repeat(128)).is_some(), "an emoji takes two UTF-16 units");
     }
 
     #[test]
