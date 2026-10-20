@@ -84,6 +84,10 @@ pub(crate) struct JobRuntime {
     /// that couldn't be saved). Changes found by that look aren't tried again until a newer
     /// look finds them: a run that fails every time mustn't start every second.
     pub tried: Option<DateTime<Utc>>,
+    /// The job's last sync as Charon found it dated later than now, and when it found it so,
+    /// by its own clock (see `Engine::note_syncs_dated_ahead`). Only while Charon runs: the
+    /// date Charon keeps stays as it is.
+    pub dated_ahead: Option<(DateTime<Utc>, Instant)>,
 }
 
 impl JobRuntime {

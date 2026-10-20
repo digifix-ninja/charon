@@ -139,8 +139,8 @@ impl Autopilot {
             self.engine.after_a_gap();
         }
         self.last_tick = Some(moment);
-        // A sync dated later than now was made while the clock was ahead.
-        self.engine.correct_syncs_dated_ahead();
+        // A sync dated later than now: the clock was ahead then, or is behind now.
+        self.engine.note_syncs_dated_ahead();
         // Notices an older Charon at work, so the window says so before anything tries to sync.
         self.engine.older_charon_running();
         // While Charon's state can't be saved, tries again now and then (at most once a
@@ -576,26 +576,66 @@ mod tests {
         assert!(engine.take_follow_up_at(&id, looked.after(minutes(2))));
     }
 
+    /// The job's last sync as Charon keeps it (in its state file too), and as its row shows it.
+    fn last_synced(engine: &Engine, id: &JobId, data: &Path) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+        let kept = engine.job_list().into_iter().find(|job| &job.id == id).and_then(|job| job.last_synced).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(data.join("charon-state.json")).unwrap()).unwrap();
+        let saved = state["jobs"].as_array().unwrap().iter().find(|job| job["id"] == id.as_str()).unwrap()["lastSynced"].clone();
+        let saved: DateTime<Utc> = serde_json::from_value(saved).unwrap();
+        (kept, saved, engine.job(id).unwrap().job.last_synced.unwrap())
+    }
+
     #[test]
     fn a_sync_dated_later_than_now_counts_as_made_when_charon_finds_it() {
         let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
         let (engine, id, _, b) = on_change_job(tmp.path(), 30);
         let (mut pilot, _changes) = pilot(&engine);
-        let synced = || engine.job(&id).unwrap().job.last_synced.unwrap();
-        let before = synced();
+        let (synced, _, shown) = last_synced(&engine, &id, &data);
         pilot.tick();
-        assert_eq!(synced(), before, "a sync dated before now stays as it was");
+        assert_eq!(shown, synced);
+        assert_eq!(last_synced(&engine, &id, &data), (synced, synced, synced), "a sync dated before now shows as it was");
 
         // The job synced while the clock was three days ahead, which has been set right since,
         // and its drive then went into a drawer.
-        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() + chrono::Duration::days(3), own: Instant::now() });
+        let ahead = Utc::now() + chrono::Duration::days(3);
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: ahead, own: Instant::now() });
         fs::remove_dir_all(&b).unwrap();
         let set_right = Utc::now();
         pilot.tick();
-        assert!(set_right <= synced() && synced() <= Utc::now(), "still dated {}", synced());
+        let (kept, saved, shown) = last_synced(&engine, &id, &data);
+        assert_eq!((kept, saved), (ahead, ahead), "the date Charon keeps changed");
+        assert!(set_right <= shown && shown <= Utc::now(), "the row shows {shown}");
         // A week later, the row says it hasn't synced since.
         let job = engine.job(&id).unwrap().job;
-        let later = synced() + chrono::Duration::days(7) + chrono::Duration::hours(1);
+        let later = shown + chrono::Duration::days(7) + chrono::Duration::hours(1);
         assert_eq!(Engine::stale(&job, None, true, later).as_deref(), Some("Not synced for 7 days"));
+    }
+
+    #[test]
+    fn a_clock_behind_at_launch_never_dates_a_recent_sync_years_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let (engine, id, _, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, _changes) = pilot(&engine);
+        // The computer starts with its clock years behind (a flat clock battery: here, that's
+        // the clock the test runs by). The job really synced a day ago, and its drive is in a
+        // drawer.
+        let behind = chrono::Duration::days(2850);
+        let synced = Utc::now() + behind - chrono::Duration::days(1);
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: synced, own: Instant::now() });
+        fs::remove_dir_all(&b).unwrap();
+        pilot.tick();
+        let (kept, saved, shown) = last_synced(&engine, &id, &data);
+        assert_eq!((kept, saved), (synced, synced), "the date Charon keeps changed");
+        assert!(shown <= Utc::now(), "until the clock is right, the row counts the sync as made when Charon found it so");
+
+        // Once the system sets the clock right, the row says when the job really synced, and
+        // that's not long ago.
+        let job = engine.job_list().into_iter().find(|job| job.id == id).unwrap();
+        let found = Some((synced, Instant::now()));
+        let set_right = Moment { wall: Utc::now() + behind, own: Instant::now() };
+        assert_eq!(Engine::last_synced(&job, found, set_right), Some(synced));
+        assert_eq!(Engine::stale(&job, None, true, set_right.wall), None);
     }
 }

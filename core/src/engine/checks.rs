@@ -296,18 +296,30 @@ impl Engine {
         }
     }
 
-    /// A job whose last sync is dated later than now synced while the clock on the wall was
-    /// ahead, or the clock is behind now. How long ago it really synced can't be told, so the
-    /// sync counts as made now: the row's "Not synced for N days" then comes once the job
-    /// hasn't synced for days from here, not days after the clock reaches the old date (see
-    /// `stale`). The new date holds while Charon runs even when it can't be saved.
-    pub fn correct_syncs_dated_ahead(&self) {
+    /// Notes the jobs whose last sync is dated later than now. Such a job synced while the
+    /// clock on the wall was ahead, or the clock is behind now, as it often is for a moment
+    /// after the computer starts. Which of the two can't be told, so the date Charon keeps
+    /// stays as it is (it's true again once the clock is right), and the job's row counts the
+    /// sync as made when Charon found it so, by Charon's own clock (see `last_synced`): the
+    /// row then never says "Synced just now" for days, and its "Not synced for N days" comes
+    /// once the job hasn't synced for that long since then. A date that's no longer later
+    /// than now is the row's again.
+    pub fn note_syncs_dated_ahead(&self) {
         let now = Utc::now();
-        let ahead: Vec<JobId> = self.state().jobs.iter().filter(|job| job.last_synced.is_some_and(|at| at > now)).map(|job| job.id.clone()).collect();
-        for id in ahead {
-            if let Err(e) = self.change_job_anyway(&id, |job| job.last_synced = job.last_synced.map(|at| at.min(now))) {
-                log::warn!("couldn't save when job {id} last synced: {e}");
+        let mut changed = Vec::new();
+        {
+            let state = self.state();
+            let mut runtime = self.runtime();
+            for job in &state.jobs {
+                let ahead = job.last_synced.filter(|at| *at > now);
+                let noted = runtime.get(&job.id).and_then(|rt| rt.dated_ahead).map(|(at, _)| at);
+                if ahead != noted {
+                    runtime.entry(job.id.clone()).or_default().dated_ahead = ahead.map(|at| (at, Instant::now()));
+                    changed.push(job.id.clone());
+                }
             }
+        }
+        for id in changed {
             self.publish(&id);
         }
     }
@@ -457,6 +469,42 @@ mod tests {
         assert!(review.is_err());
         engine.end_check(&job, &Arc::new(AtomicBool::new(false)), before, Err(Error::Invalid("gone".into())));
         assert!(engine.runtime().get(&job.id).is_none(), "no live state is left for a removed job");
+    }
+
+    #[test]
+    fn a_sync_dated_later_than_now_counts_from_when_charon_found_that_date() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, job) = engine_with_a_job(tmp.path());
+        let id = &job.id;
+        let row = |now: Moment| {
+            let (stored, dated_ahead) = (engine.stored_job(id).unwrap(), engine.runtime().get(id).and_then(|rt| rt.dated_ahead));
+            Engine::last_synced(&stored, dated_ahead, now)
+        };
+        let a_day = Duration::from_secs(24 * 60 * 60);
+        // The job synced while the clock was an hour ahead. A day after Charon found it so (by
+        // its own clock), with the clock behind that date still, it counts as made a day ago.
+        let first = Utc::now() + chrono::Duration::hours(1);
+        engine.pretend_the_last_sync_ended(id, Moment { wall: first, own: Instant::now() });
+        engine.note_syncs_dated_ahead();
+        let found = Moment::now();
+        assert_eq!(engine.stored_job(id).unwrap().last_synced, Some(first), "the date Charon keeps changed");
+        let next_day = Moment { wall: found.wall, own: found.own + a_day };
+        assert!(row(next_day).is_some_and(|shown| shown <= found.wall - chrono::Duration::days(1)), "{:?}", row(next_day));
+
+        // It syncs again while the clock is ahead again: that sync counts from when Charon
+        // found its date, not from when it found the one before.
+        let second = Utc::now() + chrono::Duration::hours(2);
+        engine.pretend_the_last_sync_ended(id, Moment { wall: second, own: Instant::now() });
+        let before = Moment::now();
+        engine.note_syncs_dated_ahead();
+        let shown = row(Moment { wall: before.wall, own: before.own + a_day }).unwrap();
+        assert!(shown >= before.wall - chrono::Duration::days(1), "counted from when Charon found the date before: {shown}");
+
+        // Once the clock is past the date, the row shows it as kept.
+        engine.pretend_the_last_sync_ended(id, Moment { wall: Utc::now() - chrono::Duration::minutes(1), own: Instant::now() });
+        engine.note_syncs_dated_ahead();
+        assert!(engine.runtime().get(id).is_some_and(|rt| rt.dated_ahead.is_none()));
+        assert_eq!(row(Moment::now()), engine.stored_job(id).unwrap().last_synced);
     }
 
     #[test]
