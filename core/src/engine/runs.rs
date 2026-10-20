@@ -835,6 +835,7 @@ impl Engine {
         summary.failed = outcome.failed.len() as u64;
         summary.failed_items = outcome.failed.iter().take(FAILED_NAMED).map(|(path, _)| survey.spelling(path)).collect();
         summary.skipped = outcome.skipped.len() as u64;
+        summary.waited = outcome.waited.len() as u64;
         summary.left_out = outcome.left_out.len() as u64;
         summary.kept = outcome.kept.len() as u64;
         // Places the look couldn't read, and files this run couldn't.
@@ -870,7 +871,7 @@ impl Engine {
         for (path, reason) in outcome.failed.iter().take(LOGGED_ITEMS) {
             journal.warn(id, &format!("{path}: {reason}"));
         }
-        for (path, reason) in outcome.skipped.iter().chain(&outcome.left_out).take(LOGGED_ITEMS) {
+        for (path, reason) in outcome.skipped.iter().chain(&outcome.waited).chain(&outcome.left_out).take(LOGGED_ITEMS) {
             journal.info(id, &format!("{path}: {reason}"));
         }
         let unread: Vec<Place> = outcome
@@ -940,7 +941,7 @@ impl Engine {
             }
             _ => None,
         };
-        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.left_out.is_empty() || !unread.is_empty();
+        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.waited.is_empty() || !outcome.left_out.is_empty() || !unread.is_empty();
         drop(claim);
         self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left, unread }));
     }
@@ -1392,7 +1393,8 @@ struct Recorded {
     drives: Option<Drives>,
     /// Files removed or replaced on the source and on the destination.
     destroyed: (Vec<String>, Vec<String>),
-    /// Steps failed, were skipped or left out, or files couldn't be read.
+    /// Steps failed, were skipped, waited with their library or database, or were left out,
+    /// or files couldn't be read.
     left: bool,
     /// The files this run couldn't read, as places for the row.
     unread: Vec<Place>,

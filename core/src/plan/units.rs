@@ -10,8 +10,12 @@
 //! way and others the other way would leave a mix that the app may not open, or would
 //! quietly damage. So the whole unit becomes one conflict, and the person chooses whose
 //! version to keep as a whole (see `plan::Resolution`). A run carries a unit's files
-//! together too: all of them, or none when anything of the unit changed meanwhile (see
-//! `run::Executor`).
+//! together too: all of them, or none when anything of the unit changed meanwhile, and
+//! what it no longer has goes only once all its new versions have landed (see
+//! `run::Executor`). What only adds to a library (a new file that isn't a database's) lands
+//! even when the rest of it waits: the version there goes on as it was, with an item it
+//! doesn't use. A library the receiving side doesn't have yet has no version there to mix
+//! with: its files go one by one, and only a database in it goes with its journals.
 
 use crate::scan::{Entry, Keys, Snapshot};
 
@@ -66,16 +70,25 @@ impl Unit {
     /// "travel-journal" alone is an ordinary file). Both are files: a folder "notes" next to
     /// a file "notes-journal" is no database, and neither is a file next to a folder.
     pub fn database_of(key: &str, source: &Snapshot, destination: &Snapshot) -> Option<String> {
-        let name = key.rsplit('/').next().unwrap_or(key);
-        for journal in JOURNALS {
-            if name.len() > journal.len() && name.ends_with(journal) {
-                let database = &key[..key.len() - journal.len()];
-                return (Self::a_file(database, source, destination) && Self::no_other_kind(key, source, destination, Entry::is_file))
-                    .then(|| database.to_string());
-            }
+        if Self::journal_ending(key).is_some() {
+            return Self::journal_of(key, source, destination);
         }
         let journaled = JOURNALS.iter().any(|journal| Self::a_file(&format!("{key}{journal}"), source, destination));
         (journaled && Self::no_other_kind(key, source, destination, Entry::is_file)).then(|| key.to_string())
+    }
+
+    /// The database `key` is a journal of, if it is one: a file named like one, next to its
+    /// database (see `database_of`). The key of the database file.
+    pub fn journal_of(key: &str, source: &Snapshot, destination: &Snapshot) -> Option<String> {
+        let database = &key[..key.len() - Self::journal_ending(key)?.len()];
+        (Self::a_file(database, source, destination) && Self::no_other_kind(key, source, destination, Entry::is_file)).then(|| database.to_string())
+    }
+
+    /// The journal ending of `key`'s name, if it has one (a name that is only an ending has
+    /// none).
+    fn journal_ending(key: &str) -> Option<&'static str> {
+        let name = key.rsplit('/').next().unwrap_or(key);
+        JOURNALS.iter().copied().find(|journal| name.len() > journal.len() && name.ends_with(journal))
     }
 
     /// The key that stands for the whole unit (the package folder, or the database file).
@@ -201,6 +214,9 @@ mod tests {
             Some("Lib.photoslibrary/database/Photos.sqlite".into()),
             "inside a library too"
         );
+        assert_eq!(Unit::journal_of("app/data.db-wal", &source, &none), Some("app/data.db".into()));
+        assert_eq!(Unit::journal_of("app/data.db", &source, &none), None, "the database itself is no journal");
+        assert_eq!(Unit::journal_of("notes/travel-journal", &alone, &none), None, "without its database it's an ordinary file");
         let unit = Unit::Database("app/data.db".into());
         assert!(unit.holds("app/data.db-wal") && unit.holds("app/data.db") && !unit.holds("app/data.db2"));
     }

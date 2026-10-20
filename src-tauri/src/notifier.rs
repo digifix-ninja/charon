@@ -137,12 +137,16 @@ impl Notifier {
     /// sync. A drive's owner waits for this one before ejecting it.
     fn big_sync(name: &str, run: &RunSummary) -> (String, String) {
         let mut text = format!("Copied {} ({}).", plural(run.copied, "file"), human_bytes(run.bytes));
-        if run.skipped == 0 && run.left_for_later == 0 {
+        if run.skipped == 0 && run.waited == 0 && run.left_for_later == 0 {
             return (format!("{name} is in sync"), text);
         }
         if run.skipped > 0 {
             let (they, wait) = if run.skipped == 1 { ("it was left as it was", "waits") } else { ("they were left as they were", "wait") };
             text.push_str(&format!(" {} changed while Charon synced, so {they} and {wait} for the next sync.", plural(run.skipped, "item")));
+        }
+        if run.waited > 0 {
+            let (wait, its) = if run.waited == 1 { ("waits", "its") } else { ("wait", "their") };
+            text.push_str(&format!(" {} {wait} for the next sync with the rest of {its} app library or database.", plural(run.waited, "item")));
         }
         if run.left_for_later > 0 {
             let (were, items) = if run.left_for_later == 1 { ("was", "the item") } else { ("were", "the items") };
@@ -271,6 +275,17 @@ mod tests {
             body,
             "Copied 1,500 files (12.0 GB). 3 removals were left for a later sync: the items went missing only a little while ago on a drive that may show changes late."
         );
+        // Items that only wait for the rest of their app library aren't on the drive yet either.
+        let (title, body) = big(serde_json::json!({ "skipped": 1, "waited": 5 }));
+        assert_eq!(title, "Documents isn't fully in sync yet");
+        assert_eq!(
+            body,
+            "Copied 1,500 files (12.0 GB). 1 item changed while Charon synced, so it was left as it was and waits for the next sync. \
+             5 items wait for the next sync with the rest of their app library or database."
+        );
+        let (title, body) = big(serde_json::json!({ "waited": 1 }));
+        assert_eq!(title, "Documents isn't fully in sync yet");
+        assert_eq!(body, "Copied 1,500 files (12.0 GB). 1 item waits for the next sync with the rest of its app library or database.");
         let (_, body) = big(serde_json::json!({ "skipped": 1, "leftForLater": 1 }));
         assert_eq!(
             body,

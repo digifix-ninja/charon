@@ -150,6 +150,10 @@ pub struct RunSummary {
     /// look picks them up again.
     #[serde(default)]
     pub skipped: u64,
+    /// Steps left for the next sync only because the rest of their app library or database
+    /// was: another item of it couldn't be synced, or something of it changed meanwhile.
+    #[serde(default)]
+    pub waited: u64,
     /// Steps left out because a drive turned out not to hold the item (a link, a name, a
     /// path or a size it refused). The next looks list them, with the reason.
     #[serde(default)]
@@ -196,6 +200,7 @@ impl RunSummary {
             failed: 0,
             failed_items: Vec::new(),
             skipped: 0,
+            waited: 0,
             left_out: 0,
             kept: 0,
             unreadable: 0,
@@ -265,6 +270,10 @@ impl RunSummary {
         }
         if self.skipped > 0 {
             parts.push(format!("{} skipped (changed meanwhile)", plural(self.skipped, "item")));
+        }
+        if self.waited > 0 {
+            let their = if self.waited == 1 { "its" } else { "their" };
+            parts.push(format!("{} left for the next sync with the rest of {their} app library or database", plural(self.waited, "item")));
         }
         if self.left_out > 0 {
             let them = if self.left_out == 1 { "it" } else { "them" };

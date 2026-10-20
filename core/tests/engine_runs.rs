@@ -874,7 +874,8 @@ fn a_database_whose_journal_changes_mid_sync_isnt_half_copied() {
     assert!(hook.lock().unwrap().is_none(), "the app wrote during the sync");
     assert_eq!(fs::read_to_string(b.join("data.db")).unwrap(), "db 1", "the database waits for its journal");
     assert_eq!(fs::read_to_string(b.join("data.db-wal")).unwrap(), "wal 1");
-    assert_eq!(engine.job(&id).unwrap().job.last_run.unwrap().skipped, 2);
+    let run = engine.job(&id).unwrap().job.last_run.unwrap();
+    assert_eq!((run.skipped, run.waited), (1, 1), "the journal changed meanwhile, the database only waits for it: {run:?}");
     // The next sync carries both, as they are now.
     confirm(&engine, &id);
     assert_eq!(fs::read_to_string(b.join("data.db")).unwrap(), "db 2 checkpointed");
@@ -976,8 +977,9 @@ fn a_library_written_to_on_the_other_side_during_the_sync_isnt_mixed() {
         confirm(&engine, &id);
         assert!(hook.lock().unwrap().is_none(), "{case}: something wrote during the sync");
         let run = engine.job(&id).unwrap().job.last_run.unwrap();
-        let expected = if carried { ((2, 0), "2 from a") } else { ((0, 2), "1") };
-        assert_eq!((run.copied, run.skipped), expected.0, "{case}: {run:?}");
+        // The two files themselves didn't change: they wait for the rest of the library.
+        let expected = if carried { ((2, 0, 0), "2 from a") } else { ((0, 0, 2), "1") };
+        assert_eq!((run.copied, run.skipped, run.waited), expected.0, "{case}: {run:?}");
         for name in ["a.txt", "b.txt"] {
             assert_eq!(fs::read_to_string(song(&b, name)).unwrap(), expected.1, "{case}: {name}");
         }
