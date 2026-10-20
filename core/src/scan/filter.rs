@@ -84,6 +84,20 @@ pub fn is_clutter(name: &str) -> bool {
         || [".ds_store", "thumbs.db", "ehthumbs.db", "desktop.ini"].contains(&name.to_lowercase().as_str())
 }
 
+/// The name of the file a cloud service freed up, when `name` is the placeholder it left in
+/// its place: iCloud Drive before macOS 14 turns `Report.pdf` into a hidden
+/// `.Report.pdf.icloud`, and the virtual files of Nextcloud and ownCloud are
+/// `Report.pdf.nextcloud` and `Report.pdf.owncloud`. The file itself is then missing from
+/// its folder, though it's still there, in the cloud.
+pub fn freed_up_item(name: &str) -> Option<&str> {
+    let item = name
+        .strip_prefix('.')
+        .and_then(|hidden| hidden.strip_suffix(".icloud"))
+        .or_else(|| name.strip_suffix(".nextcloud"))
+        .or_else(|| name.strip_suffix(".owncloud"))?;
+    (!matches!(item, "" | "." | "..")).then_some(item)
+}
+
 /// Folders a drive keeps for itself at its top level (recycle bins, indexes, repair
 /// folders). At the top of a job's folder they are never looked at.
 pub fn is_system_folder(name: &str) -> bool {
@@ -301,6 +315,20 @@ mod tests {
         assert!(f.excludes("ΔΟΚΙΜΈΣ/notes.tmp"), "the final sigma too");
         assert!(!f.excludes("Projekte/Entwurf"));
         assert!(!filter(&["Entwürfe"]).excludes("Projekte/ENTWÜRFE"), "patterns match case exactly where both drives do");
+    }
+
+    #[test]
+    fn a_cloud_services_placeholder_names_the_file_it_stands_for() {
+        assert_eq!(freed_up_item(".Report.pdf.icloud"), Some("Report.pdf"));
+        assert_eq!(freed_up_item("..env.icloud"), Some(".env"));
+        assert_eq!(freed_up_item("Plans.odt.nextcloud"), Some("Plans.odt"));
+        assert_eq!(freed_up_item("Budget.xlsx.owncloud"), Some("Budget.xlsx"));
+        assert_eq!(freed_up_item("Report.pdf.icloud"), None, "iCloud's placeholders are hidden");
+        assert_eq!(freed_up_item(".icloud"), None);
+        assert_eq!(freed_up_item("..icloud"), None);
+        assert_eq!(freed_up_item("...icloud"), None);
+        assert_eq!(freed_up_item(".nextcloud"), None);
+        assert_eq!(freed_up_item("Report.pdf"), None);
     }
 
     #[test]

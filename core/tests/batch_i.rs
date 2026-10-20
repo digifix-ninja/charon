@@ -191,3 +191,79 @@ fn a_folder_named_like_a_drives_own_is_left_alone_and_listed() {
     assert!(dst.join("a.txt").exists());
     assert!(!dst.join("lost+found").exists(), "left alone");
 }
+
+/// Frees up `file` the way iCloud Drive does before macOS 14: the file goes, and a hidden
+/// placeholder takes its place.
+fn free_up(file: &Path) {
+    fs::remove_file(file).unwrap();
+    let name = file.file_name().unwrap().to_str().unwrap();
+    write(&file.with_file_name(format!(".{name}.icloud")), "placeholder");
+}
+
+/// Downloads `file` again: its placeholder goes, and the file is back as it was.
+fn download(file: &Path, text: &str, secs: u64) {
+    let name = file.file_name().unwrap().to_str().unwrap();
+    fs::remove_file(file.with_file_name(format!(".{name}.icloud"))).unwrap();
+    write(file, text);
+    set_modified(file, secs);
+}
+
+#[test]
+fn a_file_the_cloud_freed_up_never_looks_removed() {
+    for mode in [SyncMode::TwoWay, SyncMode::Mirror] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+        for i in 0..10 {
+            write(&src.join(format!("Docs/n{i}.txt")), "x");
+        }
+        write(&src.join("Docs/Report.pdf"), "the report");
+        set_modified(&src.join("Docs/Report.pdf"), 1_700_000_000);
+        fs::create_dir_all(&dst).unwrap();
+        let engine = engine(&data);
+        let mut job = setup(&src, &dst, mode, ConflictRule::Ask);
+        job.full_automation = true;
+        let id = engine.add_job(job).unwrap().job.id;
+        confirm(&engine, &id);
+        assert!(dst.join("Docs/Report.pdf").exists());
+
+        free_up(&src.join("Docs/Report.pdf"));
+        assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+        wait(&engine, &id);
+        assert_eq!(fs::read_to_string(dst.join("Docs/Report.pdf")).unwrap(), "the report", "{mode:?}: the other side's copy stays");
+        assert!(!dst.join("Docs/.Report.pdf.icloud").exists(), "{mode:?}: the placeholder isn't copied");
+        assert!(!dst.join(".charon-trash").exists(), "{mode:?}: nothing was removed");
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.total_steps, 0, "{mode:?}");
+        assert!(
+            review.notes.iter().any(|note| note.kind == NoteKind::Unreadable && note.path == "Docs/Report.pdf" && note.reason.contains("only in the cloud")),
+            "{mode:?}: {:?}",
+            review.notes
+        );
+
+        download(&src.join("Docs/Report.pdf"), "the report", 1_700_000_000);
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.total_steps, 0, "{mode:?}: in sync again");
+        assert!(review.notes.is_empty(), "{mode:?}: {:?}", review.notes);
+    }
+}
+
+/// A Mirror into a folder the cloud frees files up in never copies over a file that's only
+/// in the cloud, and never removes its placeholder (which would remove the file there).
+#[test]
+fn a_mirror_leaves_alone_what_the_cloud_freed_up_in_its_destination() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("Docs/Report.pdf"), "the report");
+    write(&src.join("Docs/Notes.txt"), "notes");
+    fs::create_dir_all(&dst).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::Mirror, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+
+    free_up(&dst.join("Docs/Report.pdf"));
+    write(&src.join("Docs/Report.pdf"), "edited on the source");
+    let review = confirm(&engine, &id);
+    assert!(review.notes.iter().any(|note| note.kind == NoteKind::Unreadable && note.path == "Docs/Report.pdf"), "{:?}", review.notes);
+    assert!(dst.join("Docs/.Report.pdf.icloud").exists(), "the placeholder stays");
+    assert!(!dst.join("Docs/Report.pdf").exists(), "nothing is copied over the file in the cloud");
+}
