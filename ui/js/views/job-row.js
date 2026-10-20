@@ -104,9 +104,12 @@ export class JobRow {
       case "pending":
         parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`, synced);
         break;
-      case "conflict":
-        parts.push(html`<span class="warn">${Format.plural(job.conflicts.length, "conflict")} to settle</span>`, synced);
+      case "conflict": {
+        // Conflicts show first, but a failed last run still says what went wrong.
+        const problem = JobRow.problem(job);
+        parts.push(html`<span class="warn">${Format.plural(job.conflicts.length, "conflict")} to settle</span>`, problem ? html`<span class="bad">${problem}</span>` : synced);
         break;
+      }
       case "error":
       case "offline":
         parts.push(html`<span class="warn">${JobRow.problem(job) ?? "Something went wrong"}</span>`);
