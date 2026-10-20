@@ -42,6 +42,9 @@ const FILTER_KINDS = {
 const needsYou = j => j.status === "error" || j.status === "conflict" || j.conflicts.length > 0
   || (!["offline", "syncing"].includes(j.status) && Boolean(j.problem || j.lastRun?.error));
 
+/** Whether all that waits is files a look couldn't compare yet, as Rust's Waiting::only_to_compare says. */
+const onlyToCompare = waiting => !waiting.held && !waiting.items && !waiting.conflicts && waiting.uncompared > 0;
+
 /** The order steps are listed in: what can hurt first. */
 const KIND_ORDER = ["conflict", "remove", "replace", "settle", "keep-both", "new", "folder"];
 
@@ -389,7 +392,8 @@ export class DemoBackend {
       jobs: this.jobs.length,
       syncing: count("syncing"),
       pending: count("pending"),
-      waiting: this.jobs.filter(j => j.waiting).length,
+      waiting: this.jobs.filter(j => j.waiting && !onlyToCompare(j.waiting)).length,
+      toCompare: this.jobs.filter(j => j.waiting && onlyToCompare(j.waiting)).length,
       attention: this.jobs.filter(needsYou).length,
       offline: count("offline"),
       looking: count("looking"),
@@ -1003,7 +1007,10 @@ export class DemoBackend {
     return {
       syncAll: () => this.emit("sync-all"),
       showWaiting: () => this.emit("show-waiting"),
-      quit: () => this.emit("confirm-quit", { jobs: this.jobs.filter(j => j.waiting).length }),
+      quit: () => this.emit("confirm-quit", {
+        jobs: this.jobs.filter(j => j.waiting && !onlyToCompare(j.waiting)).length,
+        toCompare: this.jobs.filter(j => j.waiting && onlyToCompare(j.waiting)).length,
+      }),
       quitting: () => {
         const running = this.jobs.filter(j => this.syncing(j)).map(j => j.name);
         this.emit("quitting", { jobs: running.length ? running : [this.jobs[0]?.name ?? "Projects"] });

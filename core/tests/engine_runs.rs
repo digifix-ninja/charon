@@ -1,7 +1,7 @@
 //! End-to-end: real folders on disk, real looks, reviews and runs through the engine.
 
 use charon_core::model::{ConflictChoice, Level, ReviewKind, StepFilter, StepKind, SyncMode};
-use charon_core::{ConflictRule, Engine, EngineEvent, Error, JobSetup, JobStatus, SyncStart, Trigger};
+use charon_core::{ConflictRule, Emitter, Engine, EngineEvent, Error, JobSetup, JobStatus, SyncStart, Trigger};
 use std::fs;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -11,9 +11,22 @@ use std::time::{Duration, Instant};
 /// Opens the engine once a previous one on `data` has let go of it (its threads may still
 /// hold it for a moment after the last handle is dropped).
 fn engine(data: &Path) -> Engine {
+    opened(data, Arc::new(|_: EngineEvent| {}))
+}
+
+/// An engine that keeps every event it sends, opened as `engine` opens one.
+fn recording(data: &Path) -> (Engine, Arc<Mutex<Vec<EngineEvent>>>) {
+    let events: Arc<Mutex<Vec<EngineEvent>>> = Arc::default();
+    let sink = events.clone();
+    let engine = opened(data, Arc::new(move |event: EngineEvent| sink.lock().unwrap().push(event)));
+    (engine, events)
+}
+
+/// The engine on `data`, sending its events to `emit`, once a previous one has let go of it.
+fn opened(data: &Path, emit: Emitter) -> Engine {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        match Engine::open(data, Arc::new(|_: EngineEvent| {})) {
+        match Engine::open(data, emit.clone()) {
             Ok(engine) => return engine,
             Err(Error::AlreadyRunning) => {
                 assert!(Instant::now() < deadline, "the previous engine never let go of the data folder");
@@ -22,14 +35,6 @@ fn engine(data: &Path) -> Engine {
             Err(e) => panic!("the engine doesn't open: {e}"),
         }
     }
-}
-
-/// An engine that keeps every event it sends.
-fn recording(data: &Path) -> (Engine, Arc<Mutex<Vec<EngineEvent>>>) {
-    let events: Arc<Mutex<Vec<EngineEvent>>> = Arc::default();
-    let sink = events.clone();
-    let engine = Engine::open(data, Arc::new(move |event: EngineEvent| sink.lock().unwrap().push(event))).unwrap();
-    (engine, events)
 }
 
 fn setup(src: &Path, dst: &Path, mode: SyncMode, conflict: ConflictRule) -> JobSetup {
@@ -374,7 +379,8 @@ fn edit_vault(folder: &Path, seconds: i64) {
 }
 
 /// Whether the drive of `folder` keeps a change time for each file: only there does a change
-/// of a file's details alone show, and only there is what a read found kept.
+/// of a file's details alone show.
+#[cfg(unix)]
 fn keeps_change_times(folder: &Path) -> bool {
     let keeps = charon_core::scan::Volume::of(folder).keeps_change_times();
     if !keeps {
@@ -443,6 +449,121 @@ fn a_large_file_whose_details_alone_changed_keeps_no_job_waiting_after_a_restart
     let again = engine(&data);
     look(&again, &id);
     assert_eq!(again.job(&id).unwrap().status, JobStatus::InSync, "the row says a change waits, and the list it opens has none");
+}
+
+/// A folder on a drive that keeps no change times (tmpfs, as an exFAT drive or a network
+/// share), for the other side of a job. `None` where there is none at hand.
+#[cfg(target_os = "linux")]
+fn untimed_folder() -> Option<tempfile::TempDir> {
+    let shared_memory = Path::new("/dev/shm");
+    if !shared_memory.is_dir() {
+        eprintln!("no drive at hand that keeps no change times");
+        return None;
+    }
+    let folder = tempfile::tempdir_in(shared_memory).unwrap();
+    assert!(!charon_core::scan::Volume::of(folder.path()).keeps_change_times());
+    Some(folder)
+}
+
+/// The job's other side is on a drive that keeps no change times (an exFAT drive, a network
+/// share). A large file whose details alone changed on the side that keeps them isn't
+/// compared by a background look. Once a list has read it and found both sides identical,
+/// the job is in sync after every launch, and no reminder says a file waits to be compared.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_large_file_whose_details_alone_changed_keeps_no_job_waiting_where_the_other_drive_keeps_no_change_times() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(far) = untimed_folder() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), far.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    look(&first, &id);
+    let waiting = first.job(&id).unwrap().waiting.unwrap();
+    assert_eq!((waiting.items, waiting.uncompared), (0, 1), "without reading it, nothing tells what changed");
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+    drop(first);
+
+    for launch in 1..=2 {
+        let (again, events) = recording(&data);
+        look(&again, &id);
+        let view = again.job(&id).unwrap();
+        assert_eq!(view.status, JobStatus::InSync, "launch {launch}: {:?}", view.waiting);
+        again.remind();
+        assert!(!events.lock().unwrap().iter().any(|e| matches!(e, EngineEvent::Waiting(_))), "launch {launch}: a reminder");
+    }
+}
+
+/// Both sides are on drives that keep no change times, and a drive moved the large file's
+/// time by a second (a rounding). Once a list has read it and found both sides identical,
+/// the job is in sync after a launch too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_large_file_whose_time_a_drive_moved_keeps_no_job_waiting_where_no_drive_keeps_change_times() {
+    let Some(far) = untimed_folder() else { return };
+    let (a, b, data) = (far.path().join("a"), far.path().join("b"), far.path().join("data"));
+    if !vaults(&[&a, &b]) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    filetime::set_file_mtime(b.join("vault.hc"), vault_time(1)).unwrap();
+    look(&first, &id);
+    let waiting = first.job(&id).unwrap().waiting.unwrap();
+    assert_eq!((waiting.items, waiting.uncompared), (0, 1), "without reading it, nothing tells what changed");
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+    drop(first);
+
+    let again = engine(&data);
+    look(&again, &id);
+    assert_eq!(again.job(&id).unwrap().status, JobStatus::InSync);
+}
+
+/// What a list found identical holds only for the folders it read. On a drive that keeps no
+/// change times another drive under the same name, or the same folder restored from an
+/// older copy, can hold a file of the same size and time with other contents: once a
+/// folder's marker isn't the one it carried, the file is not compared yet, never in sync,
+/// and once the person confirms the folders as they are now, it's the conflict their list
+/// found.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_a_list_found_identical_holds_only_while_the_folders_carry_the_same_markers() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(far) = untimed_folder() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), far.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+    drop(first);
+
+    // The destination is now an older copy of itself, holding another version of the file
+    // with the same size and time.
+    set_marker_generation(&b, &id, 0);
+    edit_vault(&b, 0);
+    let again = engine(&data);
+    look(&again, &id);
+    let view = again.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Review);
+    let waiting = view.waiting.unwrap();
+    assert_eq!((waiting.items, waiting.uncompared), (0, 1), "not compared yet");
+    assert_eq!(confirm(&again, &id).tally.conflicts, 1, "the list reads it: the sides differ");
+    drop(again);
+
+    let last = engine(&data);
+    look(&last, &id);
+    assert_eq!(last.job(&id).unwrap().status, JobStatus::Conflict);
 }
 
 /// What a list found about a large file holds only while neither side changes: an edit that
@@ -568,24 +689,27 @@ fn a_large_file_a_background_look_leaves_unread_starts_a_sync_of_a_job_that_sync
 fn files_found_identical_are_forgotten_with_the_jobs_memory() {
     let tmp = tempfile::tempdir().unwrap();
     let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
-    for (side, seconds) in [(&a, 0), (&b, 60)] {
+    for side in [&a, &b] {
         write(&side.join("same.txt"), "same");
-        filetime::set_file_mtime(side.join("same.txt"), vault_time(seconds)).unwrap();
-    }
-    if !keeps_change_times(&a) {
-        return;
+        filetime::set_file_mtime(side.join("same.txt"), vault_time(0)).unwrap();
     }
     let engine = engine(&data);
     let two_way = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
     let id = engine.add_job(two_way.clone()).unwrap().job.id;
     let record = data.join("same-contents").join(format!("{id}.json"));
-    engine.prepare_review(&id).unwrap();
+    // After a sync, a drive moves the file's time by a second: a list reads both sides.
+    let found_identical = |seconds: i64| {
+        confirm(&engine, &id);
+        filetime::set_file_mtime(a.join("same.txt"), vault_time(seconds)).unwrap();
+        engine.prepare_review(&id).unwrap();
+    };
+    found_identical(1);
     assert!(record.is_file(), "the list read both files and found them identical");
 
     engine.update_job(&id, JobSetup { mode: SyncMode::Mirror, ..two_way.clone() }).unwrap();
     assert!(!record.exists(), "the job's mode changed");
     engine.update_job(&id, two_way).unwrap();
-    engine.prepare_review(&id).unwrap();
+    found_identical(2);
     assert!(record.is_file());
     engine.remove_job(&id).unwrap();
     assert!(!record.exists(), "the job was removed");

@@ -33,7 +33,7 @@ impl Tray {
     /// Puts the icon in the menu bar (macOS) or system tray (Windows, Linux).
     pub fn install(app: &AppHandle, overview: &Overview) -> tauri::Result<()> {
         let status = MenuItem::with_id(app, "status", overview.headline(), false, None::<&str>)?;
-        let waiting = MenuItem::with_id(app, "waiting", "Review Waiting Jobs…", overview.waiting > 0, None::<&str>)?;
+        let waiting = MenuItem::with_id(app, "waiting", "Review Waiting Jobs…", overview.lists_waiting() > 0, None::<&str>)?;
         let pause = MenuItem::with_id(app, "pause", Self::pause_label(overview), true, None::<&str>)?;
         let update = MenuItem::with_id(app, "update", CHECK_FOR_UPDATES, true, None::<&str>)?;
         let menu = Menu::with_items(
@@ -73,7 +73,7 @@ impl Tray {
     pub fn refresh(app: &AppHandle, overview: &Overview) {
         let Some(tray) = app.try_state::<Tray>() else { return };
         let _ = tray.status.set_text(overview.headline());
-        let _ = tray.waiting.set_enabled(overview.waiting > 0);
+        let _ = tray.waiting.set_enabled(overview.lists_waiting() > 0);
         let _ = tray.pause.set_text(Self::pause_label(overview));
         if let Some(icon) = app.tray_by_id(TRAY_ID) {
             let _ = icon.set_tooltip(Some(format!("Charon · {}", overview.headline())));
@@ -81,11 +81,13 @@ impl Tray {
         Self::badge(app, overview);
     }
 
-    /// macOS: the Dock icon counts the jobs waiting for an OK.
+    /// macOS: the Dock icon counts the jobs whose lists wait for the person (changes to
+    /// confirm, or files to compare).
     fn badge(app: &AppHandle, overview: &Overview) {
         #[cfg(target_os = "macos")]
         if let Some(window) = app.get_webview_window("main") {
-            let count = (overview.waiting > 0).then_some(overview.waiting as i64);
+            let waiting = overview.lists_waiting();
+            let count = (waiting > 0).then_some(waiting as i64);
             let _ = window.set_badge_count(count);
         }
         let _ = (app, overview);

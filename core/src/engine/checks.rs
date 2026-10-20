@@ -258,6 +258,7 @@ impl Engine {
                     removals: view.waiting.as_ref().map_or(0, |w| w.removals.total()),
                     conflicts,
                     uncompared: view.waiting.as_ref().map_or(0, |w| w.uncompared),
+                    held: job.held.is_some(),
                     drive_connected: job.setup.trigger == Trigger::DriveConnected,
                 });
             }

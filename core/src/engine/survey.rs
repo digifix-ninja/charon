@@ -13,7 +13,7 @@ use crate::scan::{
     is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, Scanner, Snapshot,
     Volume,
 };
-use crate::store::{Memory, SameContents};
+use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
@@ -407,7 +407,7 @@ impl Engine {
             self.inner.landings.load(&job.id, &setup, folded, &markers.destination)
         };
         let compared = if setup.mode.is_two_way() {
-            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, &guide, purpose, cancel))?
+            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &markers, &mut baseline, &guide, purpose, cancel))?
         } else {
             Compared::default()
         };
@@ -855,17 +855,19 @@ impl Engine {
     ///   after all, they're a conflict (`different`), never "already in sync".
     ///
     /// A background look reads at most `CHECK_COMPARE_BYTES`. Past that, it goes by what full
-    /// reads found before: identical, while both sides are still exactly as they were then
-    /// (see `store::SameContents`), or different and left for the person (see `Guide`). The
-    /// rest is not compared yet (`Compared::uncompared`): the look never shows as in sync what
-    /// it didn't read. Pairs found identical are kept for the looks after this one, even after
-    /// a restart.
+    /// reads found before: identical, while both sides are still exactly as they were then and
+    /// both folders carry the `markers` (as read before the scans) they carried then (see
+    /// `store::SameContents`), or different and left for the person (see `Guide`). The rest
+    /// is not compared yet (`Compared::uncompared`): the look never shows as in sync what it
+    /// didn't read. Pairs found identical are kept for the looks after this one, even after a
+    /// restart.
     #[allow(clippy::too_many_arguments)]
     fn compare_contents(
         &self,
         job: &Job,
         source: &Snapshot,
         destination: &Snapshot,
+        markers: &Markers,
         baseline: &mut Baseline,
         guide: &Guide,
         purpose: Purpose,
@@ -875,9 +877,10 @@ impl Engine {
         let total_bytes: u64 = candidates.iter().map(|c| c.source.size).sum();
         let total_files = candidates.len() as u64;
         let mut compared = Compared::default();
-        // The pairs full reads found identical before, and those this look knows to be.
+        // The pairs full reads found identical before in these folders, and those this look
+        // knows to be.
         let folded = source.is_folded();
-        let found_before = self.inner.same_contents.load(&job.id, &job.setup, folded);
+        let found_before = self.inner.same_contents.load(&job.id, &job.setup, folded, markers);
         let mut found_now = Baseline::new();
         let (mut done_files, mut done_bytes, mut read_bytes) = (0u64, 0u64, 0u64);
         let mut last_sent: Option<std::time::Instant> = None;
@@ -919,9 +922,7 @@ impl Engine {
             };
             match same {
                 Some(true) => {
-                    if SameContents::can_keep(&pair) {
-                        found_now.insert(key.clone(), pair);
-                    }
+                    found_now.insert(key.clone(), pair);
                     baseline.insert(key, pair);
                     compared.agreed += 1;
                 }
@@ -944,23 +945,24 @@ impl Engine {
             }
         }
         if found_now != found_before {
-            self.keep_same_contents(job, folded, &found_now);
+            self.keep_same_contents(job, folded, markers, &found_now);
         }
         Ok(compared)
     }
 
     /// Keeps the pairs a look found identical for the background looks after it, even after a
-    /// restart (see `store::SameContents`): those that are no longer to be read go. Saved
-    /// while the stored state is locked, and only while the job is still there with the
-    /// folders and mode the look was made with: removing the job or changing them forgets
-    /// the record, and a look that was under way then never brings it back. A record that
-    /// can't be saved is removed, and the pairs are read again or not compared yet.
-    fn keep_same_contents(&self, job: &Job, folded: bool, pairs: &Baseline) {
+    /// restart, in the folders that carry `markers` (see `store::SameContents`): those that
+    /// are no longer to be read go. Saved while the stored state is locked, and only while
+    /// the job is still there with the folders and mode the look was made with: removing the
+    /// job or changing them forgets the record, and a look that was under way then never
+    /// brings it back. A record that can't be saved is removed, and the pairs are read again
+    /// or not compared yet.
+    fn keep_same_contents(&self, job: &Job, folded: bool, markers: &Markers, pairs: &Baseline) {
         let state = self.state();
         if !state.jobs.iter().any(|stored| stored.id == job.id && stored.setup.same_folders(&job.setup)) {
             return;
         }
-        if let Err(e) = self.inner.same_contents.save(&job.id, &job.setup, folded, pairs) {
+        if let Err(e) = self.inner.same_contents.save(&job.id, &job.setup, folded, markers, pairs) {
             log::warn!("couldn't keep the files found identical in {} for later looks: {e}", job.setup.name);
             let _ = self.inner.same_contents.forget(&job.id);
         }
@@ -1322,17 +1324,19 @@ mod tests {
         let file = Entry::file(4, 10_000).changed_at(7);
         let mut found = Baseline::new();
         found.insert("a.txt", Pair::new(file, file));
+        let marker = |side: Side| crate::run::Found::Marker(crate::run::Marker::new(&id, side, "token", 1));
+        let markers = Markers { source: marker(Side::Source), destination: marker(Side::Destination) };
 
-        engine.keep_same_contents(&job, false, &found);
+        engine.keep_same_contents(&job, false, &markers, &found);
         assert!(record.is_file(), "the job is as the look saw it");
         engine.update_job(&id, JobSetup { mode: crate::model::SyncMode::Mirror, ..setup }).unwrap();
         assert!(!record.exists(), "the edit forgot it");
-        engine.keep_same_contents(&job, false, &found);
+        engine.keep_same_contents(&job, false, &markers, &found);
         assert!(!record.exists(), "a look of the two-way job ended after the edit");
 
         let mirror = engine.stored_job(&id).unwrap();
         engine.remove_job(&id).unwrap();
-        engine.keep_same_contents(&mirror, false, &found);
+        engine.keep_same_contents(&mirror, false, &markers, &found);
         assert!(!record.exists(), "a look ended after the job was removed");
     }
 

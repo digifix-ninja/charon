@@ -11,7 +11,7 @@
 //   review-stale   {id, reviewId}: something changed in the folders after that list was made
 //   sync-all       the tray's "Sync All…"
 //   show-waiting   the tray's "Review waiting jobs…"
-//   confirm-quit   {jobs}: the tray's Quit while jobs wait for an OK
+//   confirm-quit   {jobs, toCompare}: the tray's Quit while jobs wait for an OK, or have files to compare
 //   update         news about a new version of Charon
 //
 // Opened in a plain browser (no Tauri), the window talks to a simulated backend with

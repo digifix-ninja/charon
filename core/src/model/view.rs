@@ -349,6 +349,14 @@ pub struct Waiting {
     pub counted: bool,
 }
 
+impl Waiting {
+    /// Whether all that waits is files the last look couldn't compare yet: the list compares
+    /// them, and may well find nothing to confirm.
+    pub fn only_to_compare(&self) -> bool {
+        self.held.is_none() && self.items == 0 && self.conflicts == 0 && self.uncompared > 0
+    }
+}
+
 /// A place the last look couldn't read or had to leave out: nothing there is synced.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -457,8 +465,11 @@ pub struct Overview {
     pub jobs: usize,
     pub syncing: usize,
     pub pending: usize,
-    /// Jobs with changes waiting for the person's OK.
+    /// Jobs with changes waiting for the person's OK, or held back for it.
     pub waiting: usize,
+    /// Jobs with nothing else waiting for the person but files the last look couldn't compare
+    /// yet (see `Waiting::only_to_compare`).
+    pub to_compare: usize,
     /// Jobs that need the person (see `JobView::needs_you`).
     pub attention: usize,
     pub offline: usize,
@@ -480,7 +491,8 @@ impl Overview {
             jobs: views.len(),
             syncing: count(&[JobStatus::Syncing]),
             pending: count(&[JobStatus::Pending]),
-            waiting: views.iter().filter(|v| v.waiting.is_some()).count(),
+            waiting: views.iter().filter(|v| v.waiting.as_ref().is_some_and(|w| !w.only_to_compare())).count(),
+            to_compare: views.iter().filter(|v| v.waiting.as_ref().is_some_and(Waiting::only_to_compare)).count(),
             attention: views.iter().filter(|v| v.needs_you()).count(),
             offline: count(&[JobStatus::Offline]),
             looking: count(&[JobStatus::Looking]),
@@ -488,6 +500,11 @@ impl Overview {
             paused_all,
             problem,
         }
+    }
+
+    /// Jobs whose lists wait for the person: changes to confirm, or files to compare.
+    pub fn lists_waiting(&self) -> usize {
+        self.waiting + self.to_compare
     }
 
     /// A short sentence, e.g. "Syncing 2 jobs" or "All in sync".
@@ -512,6 +529,8 @@ impl Overview {
             format!("{} need{} attention", plural(self.attention as u64, "job"), if self.attention == 1 { "s" } else { "" })
         } else if self.waiting > 0 {
             format!("{} wait{} for your OK", plural(self.waiting as u64, "job"), if self.waiting == 1 { "s" } else { "" })
+        } else if self.to_compare > 0 {
+            format!("{} {} files to compare", plural(self.to_compare as u64, "job"), if self.to_compare == 1 { "has" } else { "have" })
         } else if self.paused_all {
             "Everything paused".into()
         } else if self.pending > 0 {
@@ -673,6 +692,36 @@ mod tests {
         assert_eq!(headline(&[in_sync.clone(), conflict, failed], true), "2 jobs need attention");
         // Paused with nothing wrong: everything is paused, nothing needs the person.
         assert_eq!(headline(&[in_sync, row(JobStatus::Paused)], true), "Everything paused");
+    }
+
+    /// A job whose look left only files it couldn't compare yet doesn't wait for an OK: its
+    /// list may well find both copies identical, and have nothing to confirm.
+    #[test]
+    fn jobs_with_only_files_to_compare_are_not_said_to_wait_for_an_ok() {
+        let waiting = |items: u64, conflicts: u64, uncompared: u64, held: Option<&str>| Waiting {
+            items,
+            bytes: 0,
+            removals: PerSide::default(),
+            replacements: PerSide::default(),
+            conflicts,
+            held: held.map(str::to_string),
+            uncompared,
+            since: Utc::now(),
+            counted: true,
+        };
+        let row_waiting = |waiting: Waiting| JobView { waiting: Some(waiting), ..row(JobStatus::Review) };
+        let videos = row_waiting(waiting(0, 0, 1, None));
+        let overview = Overview::of(std::slice::from_ref(&videos), false, None);
+        assert_eq!((overview.waiting, overview.to_compare), (0, 1));
+        assert_eq!(overview.headline(), "1 job has files to compare");
+        assert_eq!(Overview::of(&[videos.clone(), videos.clone()], false, None).headline(), "2 jobs have files to compare");
+
+        // Changes, a conflict or a hold wait for an OK, whatever else waits too.
+        for other in [waiting(3, 0, 1, None), waiting(0, 1, 1, None), waiting(0, 0, 1, Some("Charon stopped the sync."))] {
+            let overview = Overview::of(&[videos.clone(), row_waiting(other)], false, None);
+            assert_eq!((overview.waiting, overview.to_compare), (1, 1));
+            assert_eq!(overview.headline(), "1 job waits for your OK");
+        }
     }
 
     #[test]
