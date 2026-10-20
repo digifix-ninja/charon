@@ -27,7 +27,7 @@ const LEFTOVER_AGE_MS: i64 = 60 * 60 * 1000;
 /// A list names at most this many of the files named like Charon 0.2's half-copied files.
 const LEFTOVERS_NAMED: usize = 5;
 /// A background look compares at most this much by contents; whatever is left counts as
-/// identical for that look only (a list the person sees, and every run, read it all).
+/// differing for that look only (a list the person sees, and every run, read it all).
 const CHECK_COMPARE_BYTES: u64 = 1 << 30;
 /// Comparison progress reaches the window at most this often.
 const COMPARE_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -196,7 +196,8 @@ impl Guide {
 struct Compared {
     /// Pairs found identical, now recorded as in sync.
     agreed: u64,
-    /// Pairs that both changed and look alike, but whose contents differ.
+    /// Pairs that look alike but whose contents differ, or that a background look left
+    /// unread.
     different: BTreeSet<String>,
 }
 
@@ -230,7 +231,7 @@ pub(crate) struct Survey {
     /// Pairs of files found identical by their contents, though their dates differ.
     pub agreed: u64,
     /// Pairs that look alike but were found to differ by their contents (see
-    /// `Memory::unsettled`).
+    /// `Memory::unsettled`), or that a background look left unread.
     pub different: BTreeSet<String>,
     /// Why this plan must not run at all.
     pub refusal: Option<String>,
@@ -818,8 +819,8 @@ impl Engine {
     /// * both sides changed since the record and still look alike: if their contents differ
     ///   after all, they're a conflict (`different`), never "already in sync".
     ///
-    /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as identical
-    /// for that look only.
+    /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as differing
+    /// for that look only, so it never shows as in sync what it didn't read.
     #[allow(clippy::too_many_arguments)]
     fn compare_contents(
         &self,
@@ -843,9 +844,9 @@ impl Engine {
                 .change_known_runtime(&job.id, |rt| rt.same_contents.get(&key).filter(|(cs, cd, _)| *cs == s && *cd == d).map(|(_, _, same)| *same))
                 .flatten();
             let same = match cached {
-                Some(same) => Some(same),
+                Some(same) => same,
                 // A background look that has read enough leaves the rest for the next list.
-                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => None,
+                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => false,
                 None => {
                     let a = job.setup.source.join(source.spelling(&key));
                     let b = job.setup.destination.join(destination.spelling(&key));
@@ -855,24 +856,20 @@ impl Engine {
                             self.change_known_runtime(&job.id, |rt| {
                                 rt.same_contents.insert(key.clone(), (s, d, same));
                             });
-                            Some(same)
+                            same
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(Error::Cancelled),
                         // Unreadable now: the plan decides as if they differ (never a removal),
                         // for this look only. The next one reads them again.
-                        Err(_) => Some(false),
+                        Err(_) => false,
                     }
                 }
             };
-            match same {
-                Some(true) | None => {
-                    baseline.insert(key, Pair::new(s, d));
-                    compared.agreed += 1;
-                }
-                Some(false) if alike => {
-                    compared.different.insert(key);
-                }
-                Some(false) => {}
+            if same {
+                baseline.insert(key, Pair::new(s, d));
+                compared.agreed += 1;
+            } else if alike {
+                compared.different.insert(key);
             }
             done_files += 1;
             done_bytes += s.size;

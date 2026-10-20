@@ -51,6 +51,16 @@ fn confirm(engine: &Engine, id: &String) -> charon_core::model::Review {
     review
 }
 
+/// A background look at the job, waited for.
+fn look(engine: &Engine, id: &String) {
+    engine.check(id);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while engine.job(id).unwrap().looking {
+        assert!(Instant::now() < deadline, "the look took too long");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
@@ -318,6 +328,44 @@ fn nothing_changes_by_itself_without_full_automation() {
     assert_eq!(view.status, JobStatus::Review);
     assert_eq!(view.waiting.as_ref().unwrap().items, 1);
     assert!(!b.join("doc.txt").exists());
+}
+
+/// A background look reads at most 1 GiB of files to compare them, and what it leaves
+/// unread never shows as in sync: a large file edited inside, its size the same and its
+/// time moved by a second only (an encrypted container may keep its time altogether),
+/// waits in the row for the person.
+#[test]
+fn a_large_file_a_background_look_leaves_unread_never_shows_as_in_sync() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    let at = |seconds: i64| filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0);
+    for side in [&a, &b] {
+        fs::create_dir_all(side).unwrap();
+        // More than a background look reads, taking no room.
+        let vault = fs::File::create(side.join("vault.hc")).unwrap();
+        if vault.set_len((1 << 30) + 4096).is_err() {
+            return;
+        }
+        filetime::set_file_mtime(side.join("vault.hc"), at(0)).unwrap();
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    look(&engine, &id);
+    assert_eq!(engine.job(&id).unwrap().status, JobStatus::InSync);
+
+    {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut vault = fs::OpenOptions::new().write(true).open(a.join("vault.hc")).unwrap();
+        vault.seek(SeekFrom::Start(4096)).unwrap();
+        vault.write_all(b"secret").unwrap();
+    }
+    filetime::set_file_mtime(a.join("vault.hc"), at(1)).unwrap();
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert!(matches!(view.status, JobStatus::Review | JobStatus::Pending), "{:?}", view.status);
+    let items = view.waiting.as_ref().map(|waiting| waiting.items).or(view.pending.as_ref().map(|pending| pending.items));
+    assert_eq!(items, Some(1));
 }
 
 #[test]
