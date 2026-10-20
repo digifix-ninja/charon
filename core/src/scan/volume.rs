@@ -9,7 +9,9 @@
 
 use crate::scan::MARKER_FOLDER;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
 use unicode_normalization::UnicodeNormalization;
 
 /// The family of file system a drive uses.
@@ -154,7 +156,7 @@ impl Volume {
             case_sensitive: false,
             refuses_links: false,
         });
-        let asked = system::case_sensitive(root).or_else(|| probe_case(root)).or_else(|| probe_case_with_own_file(root));
+        let asked = system::case_sensitive(root).or_else(|| ProbeTurn::of(root).ask(|| probe_case(root).or_else(|| probe_case_with_own_file(root))));
         volume.case_sensitive = asked.unwrap_or_else(|| volume.kind.usually_case_sensitive());
         volume
     }
@@ -325,16 +327,27 @@ pub(crate) fn windows_name_problem(name: &str) -> Option<&'static str> {
 /// `None` when no name in the folder can tell.
 fn probe_case(root: &Path) -> Option<bool> {
     let items = std::fs::read_dir(root).ok()?;
-    for item in items.take(64).flatten() {
-        let name = item.file_name();
-        let Some(name) = name.to_str() else { continue };
-        let swapped = swap_case(name);
+    let names = items.take(64).flatten().filter_map(|item| item.file_name().to_str().map(str::to_string));
+    case_told_by(names, |name| std::fs::symlink_metadata(root.join(name)))
+}
+
+/// What the first of `names` that can tell says about case (see `probe_case`), looking
+/// items up with `look`. A name that isn't found in other case only tells when its own
+/// item is still there afterwards: an item removed in between (a temporary file an app
+/// cleared, or another look's probe folder) would make any drive look case-sensitive.
+fn case_told_by(names: impl Iterator<Item = String>, look: impl Fn(&str) -> std::io::Result<std::fs::Metadata>) -> Option<bool> {
+    for name in names {
+        let swapped = swap_case(&name);
         if swapped == name {
             continue;
         }
-        let Ok(original) = std::fs::symlink_metadata(root.join(name)) else { continue };
-        match std::fs::symlink_metadata(root.join(&swapped)) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(true),
+        let Ok(original) = look(&name) else { continue };
+        match look(&swapped) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if look(&name).is_ok_and(|again| same_item(&original, &again)) {
+                    return Some(true);
+                }
+            }
             Err(_) => continue,
             Ok(other) => return Some(!same_item(&original, &other)),
         }
@@ -361,6 +374,45 @@ fn probe_case_with_own_file(root: &Path) -> Option<bool> {
     let _ = std::fs::remove_file(&probe);
     let _ = std::fs::remove_dir(&folder);
     answer
+}
+
+/// One look at a time asks a folder's drive about case. Two looks at once (a background look
+/// and a list the person asked for) would each see the other's probe folder come and go, and
+/// could answer differently: a drive that ignores case could look case-sensitive.
+struct ProbeTurn<'a> {
+    root: &'a Path,
+}
+
+impl<'a> ProbeTurn<'a> {
+    /// The folders being asked about right now, and the signal that one of them is free.
+    fn busy() -> &'static (Mutex<HashSet<PathBuf>>, Condvar) {
+        static BUSY: OnceLock<(Mutex<HashSet<PathBuf>>, Condvar)> = OnceLock::new();
+        BUSY.get_or_init(Default::default)
+    }
+
+    /// Waits until no other look is asking about `root`, then takes the turn.
+    fn of(root: &'a Path) -> Self {
+        let (busy, freed) = Self::busy();
+        let mut asking = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while asking.contains(root) {
+            asking = freed.wait(asking).unwrap_or_else(|e| e.into_inner());
+        }
+        asking.insert(root.to_path_buf());
+        Self { root }
+    }
+
+    /// Asks, then gives the turn back (also if the asking panics).
+    fn ask<T>(self, probe: impl FnOnce() -> T) -> T {
+        probe()
+    }
+}
+
+impl Drop for ProbeTurn<'_> {
+    fn drop(&mut self) {
+        let (busy, freed) = Self::busy();
+        busy.lock().unwrap_or_else(|e| e.into_inner()).remove(self.root);
+        freed.notify_all();
+    }
 }
 
 /// `name` with the upper and lower case of its ASCII letters swapped.
@@ -681,6 +733,42 @@ mod tests {
         std::fs::create_dir(tmp.path().join(MARKER_FOLDER)).unwrap();
         assert!(Volume::of(tmp.path()).case_sensitive);
         assert_eq!(std::fs::read_dir(tmp.path().join(MARKER_FOLDER)).unwrap().count(), 0);
+    }
+
+    /// Two looks at the same empty folder at once (a background look and a list the person
+    /// asked for) get the same answer, and leave nothing behind.
+    #[test]
+    fn looks_at_the_same_empty_folder_at_once_agree() {
+        let shared_memory = Path::new("/dev/shm");
+        let tmp = if shared_memory.is_dir() { tempfile::tempdir_in(shared_memory) } else { tempfile::tempdir() }.unwrap();
+        let expected = Volume::of(tmp.path()).case_sensitive;
+        for round in 0..40 {
+            let answers: Vec<bool> = std::thread::scope(|scope| {
+                let looks: Vec<_> = (0..6).map(|_| scope.spawn(|| Volume::of(tmp.path()).case_sensitive)).collect();
+                looks.into_iter().map(|look| look.join().unwrap()).collect()
+            });
+            assert!(answers.iter().all(|answer| *answer == expected), "round {round}: {answers:?}");
+            assert_eq!(std::fs::read_dir(tmp.path()).unwrap().count(), 0, "round {round}: nothing is left behind");
+        }
+    }
+
+    /// Another look's probe folder, or an app's temporary file, can go between the two looks
+    /// at a name: a name whose item went away tells nothing about case.
+    #[test]
+    fn an_item_that_goes_away_while_it_is_asked_about_tells_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("probe"), "x").unwrap();
+        let item = std::fs::symlink_metadata(tmp.path().join("probe")).unwrap();
+        let gone = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let names = || [".charon".to_string()].into_iter();
+        let looks = std::cell::Cell::new(0);
+        let vanishing = |_: &str| {
+            looks.set(looks.get() + 1);
+            if looks.get() == 1 { Ok(item.clone()) } else { gone() }
+        };
+        assert_eq!(case_told_by(names(), vanishing), None, "removed after the first look");
+        assert_eq!(case_told_by(names(), |name: &str| if name == ".charon" { Ok(item.clone()) } else { gone() }), Some(true));
+        assert_eq!(case_told_by(names(), |_: &str| Ok(item.clone())), Some(false));
     }
 
     #[test]
