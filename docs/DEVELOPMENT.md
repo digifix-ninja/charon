@@ -62,23 +62,38 @@ directories:
   again.
 - `slow_damage.rs`: full automation and damage that spreads slowly: the long count of what
   automatic runs removed or replaced, and a trash that only the person empties.
-- `batch_h.rs`: names, links and what a drive refuses.
-- `batch_i.rs`: the scanner, network shares and cloud folders.
+- `run_order.rs`: the order a run carries out its steps in, and the removals it holds back when
+  a copy fails or a file changes during the run.
+- `drive_comebacks.rs`: drives that come back during a run without its last changes, which must
+  never be recorded as done (see *The last look* below).
+- `batch_h.rs`, `long_paths.rs` and `drive_links.rs`: names, links, paths near a drive's limit,
+  and what a drive refuses.
+- `batch_i.rs` and `case_probes.rs`: the scanner, network shares, cloud folders, and asking a
+  drive how it treats upper and lower case.
+- `names_left_alone.rs`, `items_left_alone.rs` and `leftover_claims.rs`: names Charon leaves
+  alone stay alone on both sides, in any case, and its own leftovers are never taken for the
+  person's files.
+- `unreadable_files.rs`: files a scan can list but a copy can't read.
 
-Some tests in `safety_regressions.rs` need a folder Charon can't read. A process running as root
-with `CAP_DAC_OVERRIDE` can read a folder whose permissions are `000`, so there these tests would
-prove nothing: they skip, and write a line starting with `SKIPPED` straight to stderr, so a
-skipped safety test never looks like one that passed. With `CHARON_REQUIRE_PERMISSION_TESTS=1`
-they fail instead of skipping. As root, run them without those capabilities:
+Some tests in `safety_regressions.rs`, `unreadable_files.rs` and `drive_links.rs` need a file or
+folder Charon can't read or write. A process running as root with `CAP_DAC_OVERRIDE` can read
+and write whatever the permissions say, so there these tests would prove nothing: they skip,
+and write a line starting with `SKIPPED` straight to stderr, so a skipped safety test never
+looks like one that passed. With `CHARON_REQUIRE_PERMISSION_TESTS=1` they fail instead of
+skipping. As root, run them without those capabilities:
 
 ```sh
-capsh --drop=cap_dac_override,cap_dac_read_search -- -c \
-    "cargo test -p charon-core --test safety_regressions"
+capsh --drop=cap_dac_override,cap_dac_read_search -- -c "cargo test -p charon-core"
 ```
 
-`build.yml` doesn't set the variable. The tests that need folder permissions or symbolic links
-are Unix only (`#[cfg(unix)]`). One test waits for a list to expire (15 minutes) and is ignored
-by default: `cargo test -p charon-core --test safety_regressions -- --ignored`.
+The tests about upper and lower case in `names_left_alone.rs` need a folder on a drive that
+ignores case for every letter. The temporary folder is one on macOS and Windows; on Linux, set
+`CHARON_CASE_INSENSITIVE_FOLDER` to a folder on such a drive (a case-folding ext4 folder, say).
+Without one they skip the same way, and with `CHARON_REQUIRE_CASE_TESTS=1` they fail instead.
+
+`build.yml` sets none of these variables. The tests that need folder permissions or symbolic
+links are Unix only (`#[cfg(unix)]`). One test waits for a list to expire (15 minutes) and is
+ignored by default: `cargo test -p charon-core --test safety_regressions -- --ignored`.
 
 ### Working on the interface only
 
@@ -175,34 +190,51 @@ happened.
 `core/src/engine/survey.rs` makes a survey for one of three purposes: a background look
 (`Check`), a list the person will see (`Review`), or a run nobody looks at (`Automatic`). A
 survey never changes the person's files. (Where neither the system nor the names in a folder
-show whether its drive ignores case, and the folder has no `.charon` folder yet, the survey makes
-one with a single empty file of Charon's own and removes both at once.) It:
+show whether its drive ignores case, as in an empty folder, the survey creates an empty file of
+Charon's own under a fresh temporary name, `.charon-<16 hex digits>.part`, at the top of the
+folder and removes it at once. The name is unique, so looks at the same folder at the same time
+each get the drive's own answer, and every look passes over such names.) It:
 
 1. Checks that both folders are there (otherwise the job is *Offline*), reads the job's markers
    (`.charon/<job>.json`) at the top of both folders, and finds out what kind of drive each
    folder is on (`scan/volume.rs`): APFS, exFAT, an SMB share and so on, whether it ignores
-   upper and lower case, and what it can hold.
+   upper and lower case, and what it can hold. On Linux, a drive run by a program reports its
+   real kind from `/proc/self/mountinfo` (`fuse.sshfs`, `fuse.rclone`, `fuseblk`). Where a drive
+   can't be asked how it treats case this time, what it answered at the last sync holds while
+   it's the same drive (`Volume::case_guessed`, kept in the job's record of its drives), so a
+   guess never makes Charon distrust its memory. When the last sync could only guess and the
+   drive can now be asked and answers otherwise, the memory isn't trusted, and the list says
+   Charon couldn't ask that drive at the last sync.
 2. Scans both folders at once, each on its own thread (`scan/scanner.rs`). On macOS and Linux,
    symbolic links are recorded as links and never followed; on Windows, links and junctions are
    left out with a note, and so are names Windows can't handle. Also left out: the job's exclude
    patterns; Charon's own names at any depth (`.charon`, `.charon-trash`,
-   `.charon-<16 hex digits>.part` and Charon 0.2's `*.charon-partial`); on a Mac, every `._*`
-   file, whatever the patterns say (on drives that aren't Mac drives it holds another file's tags
-   and resource fork); names that aren't valid Unicode; sockets, pipes and devices; and, at the
-   top of the job's folder, items named like the folders drives keep for themselves
-   (`$RECYCLE.BIN`, `System Volume Information`, `.Trashes`, `.Spotlight-V100`, `lost+found`,
-   `.Trash-*` and the like), with a note when the job's folder isn't the top of its drive. A new
-   job starts with the exclude patterns `.DS_Store`, `._*`, `.Spotlight-V100`, `.Trashes`,
-   `.fseventsd`, `Thumbs.db`, `desktop.ini`, `$RECYCLE.BIN`, `~$*` and `*.tmp`, so files matching
-   `*.tmp` or `~$*` aren't synced until the pattern is removed. A place that can't be read is
-   recorded as *frozen*, never as empty, and nothing at or inside it is touched on either side.
-   Files and folders that are only in the cloud (recognised on macOS and Windows) and drives
-   mounted inside the folder are frozen too; on macOS the scan threads are also set never to
-   download a file that's only in the cloud.
+   `.charon-<16 hex digits>.part`, links under such names and Charon 0.2's `*.charon-partial`)
+   and, where either drive ignores case, an item of the person's named like one of Charon's
+   folders in other case (`.CHARON-TRASH`), which would be Charon's own folder on such a drive;
+   empty files dated 2 January 1980 00:00:00 UTC, which an interrupted rename left (see
+   *Renames* below); on a Mac, every `._*` file, whatever the patterns say (on drives that
+   aren't Mac drives it holds another file's tags and resource fork); names that aren't valid
+   Unicode; sockets, pipes and devices; and, at the top of the job's folder, items named like
+   the folders drives keep for themselves (`$RECYCLE.BIN`, `System Volume Information`,
+   `.Trashes`, `.Spotlight-V100`, `lost+found`, `.Trash-*` and the like), with a note when the
+   job's folder isn't the top of its drive. An item left out with a note keeps its name out of
+   the sync on both sides, under that one note: nothing is copied into its place, and a mirror
+   doesn't remove the other side's item of that name. When either drive ignores case, the
+   exclude patterns match the folded key (step 3), so they ignore the case of every letter,
+   `Entwürfe` and `ENTWÜRFE` alike; a pattern that only breaks once folded is refused when the
+   job is saved (`ExcludeFilter::check`). A new job starts with the exclude patterns
+   `.DS_Store`, `._*`, `.Spotlight-V100`, `.Trashes`, `.fseventsd`, `Thumbs.db`, `desktop.ini`,
+   `$RECYCLE.BIN`, `~$*` and `*.tmp`, so files matching `*.tmp` or `~$*` aren't synced until the
+   pattern is removed. A place that can't be read is recorded as *frozen*, never as empty, and
+   nothing at or inside it is touched on either side. Files and folders that are only in the
+   cloud (recognised on macOS and Windows) and drives mounted inside the folder are frozen too;
+   on macOS the scan threads are also set never to download a file that's only in the cloud.
 3. Turns every path into a *key* (`scan/keys.rs`): relative to the job's folder, `/`-separated
    and in Unicode NFC, and folded when either drive ignores case (each letter to the lower case
-   of its upper case, so ς and σ, or µ and μ, are one letter). Two names in one folder that end
-   up as the same key are a name clash, and are frozen too.
+   of its upper case, so ς and σ, or µ and μ, are one letter, and the dotless ı meets i, as it
+   does on NTFS, exFAT and FAT). Two names in one folder that end up as the same key are a name
+   clash, and are frozen too.
 4. Two-way: loads the memory of the last sync (`store/baselines.rs`) and decides whether to
    trust it. Mirror and Backup: loads the record of copies whose dates didn't stick
    (`store/landings.rs`).
@@ -236,8 +268,9 @@ again until one of them changes. A new or different file is copied, except:
 Mirror also removes, item by item, everything in the destination that isn't in the source,
 including files that were only ever put in the destination. Backup never removes anything.
 When an item of another kind is in the way (a file where the source has a folder), Mirror
-removes it first, unless it's a folder holding items Charon leaves alone; Backup leaves it alone
-with a note. A link in the source where the destination has a file or folder never removes it,
+removes it right before the new item takes its place, into `.charon-trash` whatever the
+setting, unless it's a folder holding items Charon leaves alone; Backup leaves it alone with a
+note. A link in the source where the destination has a file or folder never removes it,
 in either mode.
 
 Mirror and Backup check that they're looking at the folders of the last sync: the destination
@@ -280,8 +313,8 @@ exFAT, a whole-hour shift of a file of the same size doesn't count as a change.
   link taking the place of a file or folder is always a question. When only one side changed an
   item into another kind, that change crosses: a folder that became a file is replaced on the
   other side only when that folder holds nothing Charon leaves alone and nothing changed in it.
-  The item replaced by one of another kind is removed like any other removal, so with safe
-  deletes off it's gone for good.
+  What it replaces goes to `.charon-trash`, even with safe deletes off (see *Carrying out a
+  list*).
 - **Units** (`plan/units.rs`): an app's library or document package (a Photos or Final Cut
   library, a Logic project, a Pages document, a sparse bundle; the list is `PACKAGES`) and an
   SQLite database with its `-wal`, `-shm` or `-journal` file only work as a whole. When files of
@@ -295,8 +328,12 @@ wins*, which still replaces the older version when the times can be trusted (the
 to `.charon-trash`). That's the case for the first sync, and whenever the memory can't be read or
 is damaged, was saved by Charon 0.2 or earlier, the last sync didn't finish (`run_in_progress` is
 still set), a drive now treats case differently, or a folder's marker is missing, unreadable,
-carries another token, or has a lower or higher counter than the memory. The list then says why,
-and an automatic run is held.
+carries another token, or has a lower or higher counter than the memory. The list then says why
+and what happens to files that differ under the job's rule, and an automatic run is held. When a
+memory was there but can't be trusted, the list also counts the items only on one side that get
+copied to the other and, where an older record names them (the memory it distrusts, or 0.2's),
+how many of those were on both sides at the last sync and so were most likely removed since,
+naming them. That record never decides anything.
 
 ### Settling one conflict
 
@@ -350,7 +387,8 @@ The survey adds its own checks besides the guard:
 - **Hold an automatic run:** a two-way memory Charon doesn't trust, files changed inside
   `.charon-trash` after Charon put them there, and not enough room on a drive.
 - **Need the tick:** with safe deletes off, a list that removes files (or, in Mirror and Backup,
-  replaces them).
+  replaces them). Removals that make room for an item of another kind don't count: they go to
+  the trash anyway.
 
 Lists also warn about places that couldn't be read, items that can't be synced, conflicts
 settled by *Newest wins*, symbolic links, the trash growing large, and app libraries and
@@ -381,8 +419,9 @@ deliberately no way to confirm them all at once.
 - something that matters changed in the folders since it was made (the folder watcher marks it
   stale, and the window hears `review-stale`);
 - a folder isn't there, isn't the same folder anymore (`RootId`: its drive, its number on the
-  drive and, where the system keeps a believable one, its creation time), or carries another
-  marker;
+  drive, its creation time where the system keeps a believable one, and, on Linux 6.8 and later,
+  the mount it's seen through, so a drive unmounted and mounted again counts as another folder),
+  or carries another marker;
 - the job's settings changed, or the job synced in the meantime;
 - the guard refused the plan;
 - the list needs the tick and it isn't ticked.
@@ -392,32 +431,47 @@ prepared or waits for an OK, automatic runs of that job wait too.
 
 ### Carrying out a list
 
-`run/executor.rs` runs the steps in this order (`Plan::ordered`): removals that clear the way
-for an item of another kind (deepest first), new folders (from the top down), copies, and then
-every other removal (deepest first). Removing last means a run that stops halfway never leaves an
-item that was moved or renamed with only one copy. Conflicts left for the person are never
-touched.
+`run/executor.rs` runs the steps in this order (`Plan::ordered_steps`): new folders (from the
+top down) and copies; then each place where an item of another kind takes an item's place (a
+folder that became a file, a file where a new folder goes), one place after the other, first
+the item there with everything inside it (deepest first), then the new folders and copies that
+take its place; and last every other removal (deepest first). Removing last means a run that
+stops halfway never leaves an item that was moved or renamed with only one copy, and an item
+that makes room for another goes as late as it can for the same reason. Such a removal
+(`Step::makes_room`) waits like any other removal when copies to its side failed, always keeps
+what it removes in `.charon-trash`, even with safe deletes off, and nothing goes into a place
+whose item couldn't go first. Conflicts left for the person are never touched.
 
 Before every step, both folders must still be the folders the plan was made for, or the run
 stops. Right before a step acts it looks at the disk again, on both sides: the item it copies,
 replaces or removes must be exactly what the plan saw, and so must the other side's item the
 step relies on (a file restored on the other side stops its removal here). If anything changed,
 the step is skipped, never forced, and the next look picks it up. The folders above an item are
-checked one by one, so nothing is ever written or removed through a link. On macOS and Linux,
-what a step wrote must be on the folder's drive; if the drive went away, the run stops there.
+checked one by one, so nothing is ever written or removed through a link, and nothing is
+written into a folder Charon leaves alone (excluded, or one of its own), whatever its spelling
+on disk: a folder a step finds where the scan saw nothing is checked against the scan and the
+exclude patterns first (`not_left_alone`). On macOS and Linux, what a step wrote must be on the
+folder's drive; if the drive went away, the run stops there.
 
 - **Copies** (`run/copier.rs`) are written to a new file `.charon-<16 hex digits>.part` next to
-  the target (the first 8 digits are when the copy started), never through a link. The source is
-  checked before and after reading, and a copy of a file that changed meanwhile is thrown away.
-  When the source's drive keeps times in steps of a second or more, a file saved there in the
-  last 3 seconds waits for the next sync. The copy is flushed, takes the extended attributes
-  worth carrying (Finder tags, Finder info and resource forks on macOS, `user.` attributes on
-  Linux) and the original's modification time (and its creation time on macOS and Windows), and
-  is flushed again; then it takes the original's permissions (a drive that refuses them only
-  leaves a line in the app's log). A drive that can't keep extended attributes (FAT, exFAT)
-  gets the file without them, apart from a resource fork and the Finder info that goes with it,
-  and the run's summary says what stayed behind. On macOS, a file the cloud took back since the
-  scan is left alone, never downloaded.
+  the target (the first 8 digits are when the copy started), never through a link. Where that
+  path would be too long for the drive (a short name deep down has a longer temporary name), the
+  copy is written in the nearest folder above where it fits, never above the job's folder, and
+  renamed into place from there; moving an item aside does the same (`Copier::temporary`). The
+  source is checked before and after reading, and a copy of a file that changed meanwhile is
+  thrown away. When the source's drive keeps times in steps of a second or more, a file saved
+  there in the last 3 seconds waits for the next sync. The copy is flushed, takes the extended
+  attributes worth carrying (Finder tags, Finder info and resource forks on macOS, `user.`
+  attributes on Linux) and the original's modification time (and its creation time on macOS and
+  Windows), and is flushed again; then it takes the original's permissions (a drive that refuses
+  them only leaves a line in the app's log). A drive that can't keep extended attributes (FAT,
+  exFAT) gets the file without them, apart from a resource fork and the Finder info that goes
+  with it, and the run's summary says what stayed behind. On macOS and Windows, a file the cloud
+  took back since the scan is never downloaded: copies, the copies of old versions kept in the
+  trash and byte comparisons all open files through `Contents::open` (on macOS the reading
+  thread can't download, on Windows the file is opened with `FILE_FLAG_OPEN_NO_RECALL`, and on
+  both a file whose details say it's a placeholder is refused), and the step is skipped as only
+  in the cloud since the scan.
 
   Tags, permissions and extended attributes travel only with a copy of the file: a change to
   them alone, with the contents and the modification time as they were, isn't synced (two-way
@@ -425,13 +479,32 @@ what a step wrote must be on the folder's drive; if the drive went away, the run
   ACLs, owner and group, other extended attributes (such as the quarantine flag), or, on
   Windows, extended attributes and alternate data streams. Hard links arrive as separate files,
   and sparse files take their full size.
-- **Taking the real name** (`run/rename.rs`) uses a rename that never replaces anything
-  (`renameat2` with `RENAME_NOREPLACE` on Linux, `renamex_np` with `RENAME_EXCL` on macOS,
-  `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows). Where a drive can't do that,
-  the drive itself claims the name: a second name for the file (a hard link), or an empty
-  placeholder that the file is renamed over. Something that appeared under the name before
-  Charon claimed it is never overwritten. On drives that need the empty placeholder, only
-  something written into it in the instant before the rename could be.
+- **Links** are copied as links on macOS and Linux, under a temporary name like a file. A drive
+  counts as unable to hold links only when it says so outright, or when it refuses one at the
+  top of the job's folder where it takes a file (`Copier::drive_holds_links`, asked at most once
+  per run with a brief `.charon-<16 hex digits>.part` probe). Charon remembers that, also in the
+  job's record of its drives, and later lists leave links out for that drive with a note. A link
+  refused in one folder for another reason (a folder that can't be written to, say) is a failed
+  item.
+- **Renames** (`run/rename.rs`) never replace anything: `renameat2` with `RENAME_NOREPLACE` on
+  Linux, `renamex_np` with `RENAME_EXCL` on macOS, `MoveFileExW` without
+  `MOVEFILE_REPLACE_EXISTING` on Windows. Drives without such a rename (NFS, sshfs and other
+  drives run by a program, some macOS NFS mounts) get one of two fallbacks, by whose name moves.
+  `rename_new` gives one of Charon's own items (a finished copy, an item it moved aside) a name
+  the person may use: the item gets the new name as a hard link and then loses its temporary
+  one, which only Charon uses. `move_to_new_name` moves the person's item to a fresh name Charon
+  made for it (aside, into the trash, a conflict copy's name): the new name is claimed with an
+  empty file (or folder) the drive creates only if the name is free, and the item is renamed
+  onto the claim in one step. The person's name is never removed on its own, so a version an app
+  saved a moment before moves with the item, and the check after the move sees it. Where a drive
+  has no hard links either (and for a folder), `rename_new` claims its name the same way.
+  Something that appeared under a name before Charon claimed it is never overwritten; only
+  something written into an empty claim in the instant before the rename could be. A file's
+  claim that a failed rename leaves behind is an empty file dated 2 January 1980 00:00:00 UTC
+  (`scan::CLAIM_MODIFIED_MS`). The scan takes it for Charon's leftover, never for the person's
+  file: it isn't synced, it keeps its folder from being removed, and a list names it in a
+  housekeeping line of its own. A folder's claim is an empty folder, which nothing marks, so
+  one left behind looks like the person's own and is synced like one.
 - **Replacing** a file: where the drive can swap two names in one step (`RENAME_EXCHANGE` on
   Linux, `RENAME_SWAP` on macOS), the copy and the old file swap, and the file swapped out is
   checked; if an app saved a new version at that very moment, the two swap back. Elsewhere
@@ -444,16 +517,20 @@ what a step wrote must be on the folder's drive; if the drive went away, the run
   its name: had the old version been moved into the trash, the app could go on saving the
   person's work there. Replaced in place, the app finds the new version where the file was. On
   APFS that copy is a clone, which takes no time and no room. An item replaced by one of another
-  kind (a file by a folder) is removed first, as a removal (below).
+  kind (a file by a folder) is removed right before the new item lands, as a removal (below).
 - **Removals:** a file or link is renamed aside, checked once more, and then moved into
-  `.charon-trash` (with safe deletes) or removed for good. On APFS a file kept that way is cloned
-  into the trash and then removed. A folder is removed only when nothing but system clutter
-  (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*` files and the like) is left in it, and that
-  clutter always goes to the trash.
-- **Keep both:** the destination's version is renamed to its conflict name (numbered when taken,
-  and shortened to fit the drive's limit on name length by `run/names.rs`), the source's version
-  is copied to the destination under the original name, and the conflict copy is copied to the
-  source.
+  `.charon-trash` (with safe deletes, and always when it makes room for an item of another kind)
+  or removed for good. On APFS a file kept that way is cloned into the trash and then removed. A
+  folder is removed only when nothing but system clutter (`.DS_Store`, `Thumbs.db`,
+  `desktop.ini`, `._*` files and the like) is left in it, and that clutter always goes to the
+  trash.
+- **Keep both:** the destination's version is moved to its conflict name, the source's version is
+  copied to the destination under the original name, and the conflict copy is copied to the
+  source. The conflict name is numbered when taken on either side, and shortened to fit the
+  drive's limit on name length (`run/names.rs`) and, where the path to it would be too long, the
+  room the path leaves. When not even one letter of the original name fits, both versions stay as
+  they are with a note (`Refusal::ConflictCopy`), remembered like other refusals (below) while
+  both versions are there, so later runs go on with everything else.
 - **Databases:** the files of one SQLite database are carried together. Every new version is
   written next to its target, everything is checked again, and only then do the old journals go
   and the new files take their places, one right after the other. If a new version can't be
@@ -465,11 +542,27 @@ what a step wrote must be on the folder's drive; if the drive went away, the run
   the drive says how much room it has, so other apps can still save. A copy that would eat into
   that fails with a clear reason. On a Mac, room the system can free by itself counts as free.
 - **One failed item doesn't stop the run:** it's counted, written to the job's log (the first 50
-  failures, and the first 50 of the skipped and left-out items together) and shown. A side where
-  a copy failed, or where the drive refused an item, keeps everything the run would still remove
-  there. Charon remembers what a drive refused until it quits (or the job's folders or mode
-  change), while the item and the drive stay the same: later lists leave it out with the reason,
-  and after a restart it's tried again.
+  failures, and the first 50 of the skipped and left-out items together) and shown; the row names
+  the first two that failed. What a run holds back (`Holds`): on a side where a copy failed, a file
+  couldn't be read or the drive refused an item, every removal the run would still make there
+  waits. A copy left for the next sync because its file changed during the run holds back only
+  the removals there that could be its old copy (an item with the same name, or the same size and
+  time), so one file an app keeps writing to doesn't stop every removal. Charon remembers what a
+  drive refused until it quits (or the job's folders or mode change), while the item and the
+  drive stay the same: later lists leave it out with the reason, and after a restart it's tried
+  again. A name the drive found taken by another item (a short name like `REPORT~1.PDF`, or
+  another rule for upper and lower case) is tried again as soon as that item is gone.
+- **Files Charon can't read:** a file the scan listed but the copy couldn't read (no permission,
+  macOS's privacy settings, a mailbox another program holds open, a locked range:
+  `Error::ReadDenied`) isn't a failure, and the run isn't an error. The row lists it under
+  *Couldn't read*, with *Leave out*, and a notification says so once (with *Notifications* on).
+  Until Charon quits (or the job's folders or mode change), later looks keep it there for as long
+  as the part where reading stopped still can't be read (`Copier::read_refusal`), even while the
+  file keeps changing; then it's tried again. Meanwhile every removal of a file or link on the
+  side it should go to waits, with a note naming it, and so does every other step on a database
+  one of those removals belongs to (`Ground::hold_removals`): a removal there could take the last
+  copy of what it holds, a renamed mailbox say. Only a removal that makes room for an item of
+  another kind goes ahead, into `.charon-trash` as always.
 - **The trash** (`run/trash.rs`): each run puts what it removes or replaces into
   `.charon-trash/<YYYY-MM-DD_HH-MM-SS>_<6 hex digits>/` at the top of the folder, with a
   `.charon` list of every file's size and time. A file that no longer matches its list was
@@ -477,18 +570,43 @@ what a step wrote must be on the folder's drive; if the drive went away, the run
   is never emptied, lists say where it is, and automatic runs are held. Dated folders older than
   *Keep deleted files* (30 days by default; 0 keeps everything) are emptied only after a run the
   person confirmed, whose list named them, went all the way. Runs nobody looked at never empty
-  the trash. If `.charon-trash` is a link or a file, nothing is put into it.
-- **Leftovers:** `.part` files left by an interrupted sync are moved into the trash by a run that
-  went all the way, once nothing has written to them for an hour and their copy started more
-  than an hour ago. Files named like Charon 0.2's half-copied files (`*.charon-partial`) may be
+  the trash. If `.charon-trash` is a link or a file, nothing is put into it. An item whose path in
+  the trash would be too long for the drive goes in under its own name at the top of the run's
+  dated folder (numbered if needed), and the app's log says so.
+- **Leftovers:** what an interrupted sync left (`.part` files, link copies under a temporary
+  name, and the empty files a failed rename left as claims) is moved into the trash by a run
+  that went all the way, once nothing has written to it for an hour and, for a temporary name,
+  its copy started more than an hour ago. A claim's date is the marker's, so only its change
+  time can tell how old it is: where the drive keeps change times Charon trusts (most local Mac
+  and Linux drives), a claim goes an hour after it was made; on every other drive, the network
+  shares and drives run by a program where claims are made among them, it goes at the first
+  such run. The job's log says how many ("moved 2 leftover files of interrupted syncs into
+  .charon-trash"). Files named like Charon 0.2's half-copied files (`*.charon-partial`) may be
   the person's own, so only a list that names them moves them.
-- **Durability** (`run/durable.rs`): at the end, every folder the run changed (and the trash's
-  lists) is flushed to its drive, both folders are checked once more, and then each drive is
-  flushed. Until that succeeds, nothing about the run is recorded. Each file is flushed as it's
-  written; flushing folders and whole drives is as good as the system allows. On Windows there's
-  no drive flush, and folders are flushed where Windows lets Charon open them. Drives that can't
-  flush a folder (many network shares) are taken at their word and write it through in their
-  own time.
+- **Durability** (`run/durable.rs`, `Executor::flush`): at the end, every folder the run changed
+  (and the trash's lists) is flushed to its drive, both folders are checked once more, and then
+  each drive is flushed. Each file is flushed as it's written; flushing folders and whole drives
+  is as good as the system allows. On Windows there's no drive flush, and folders are flushed
+  where Windows lets Charon open them. Drives that can't flush a folder (many network shares) are
+  taken at their word and write it through in their own time.
+- **The last look** (`Executor::retrace`): once the drives are flushed, the executor looks again
+  at what every finished step left, reading only the items' details (on a network share or a
+  drive run by a program, a file a step finished less than a minute ago is opened, so the drive
+  answers rather than what its client kept). A drive pulled out and plugged back in during the
+  run, or a share whose server restarted, can come back under the same folder numbers without
+  the run's last changes. So a copy or new folder that's gone (or an item of another kind in its
+  place), a version a copy replaced that's back (told by its change time even when size and date
+  look alike, where the scan trusted the drive's change times) or an older one, or a removed
+  item that's back fails the whole run with `Error::Undone`: nothing of it is recorded, and its
+  next look compares both folders afresh and waits for an OK. Only what a lost change leaves
+  counts; an edit made after a step, a drive rounding a time or a rename moving a change time is
+  a change for the next look. In a two-way job, the original each copy was made from must still
+  be there and not older. One moved, removed or found older meanwhile doesn't fail the run: it's
+  only left out of the new memory (`Outcome::unrecorded`), so the next look compares that item
+  afresh. A copy whose original is gone is then copied back rather than removed, and an older
+  original meets the copy as two versions the job's conflict rule settles. Both folders are
+  checked once more after this look. Until all of it succeeds, nothing about the run is
+  recorded.
 
 ### What is recorded after a run
 
@@ -503,7 +621,9 @@ that can't be saved, the run changes nothing. Once the run is durable:
    holds what each finished step left behind, the items both sides already agreed on as the plan
    saw them, and the old record for everything else (a skipped or failed step, an open conflict,
    an unreadable place, a run that stopped early), so the next run decides again instead of
-   copying a removed file back. If a marker or the memory can't be written, the memory is
+   copying a removed file back. A copy whose original was gone or older by the end of the run
+   (see *The last look*) gets no record at all, so the next look compares it afresh and never
+   removes the copy because of it. If a marker or the memory can't be written, the memory is
    forgotten, and the next look compares both folders afresh and waits for an OK.
 3. Mirror and Backup: the destination's marker, the copies whose dates didn't stick, the
    source's marker where Charon can write there (its counter goes up with every sync), and then
@@ -519,8 +639,9 @@ that can't be saved, the run changes nothing. Once the run is durable:
    that ended on an error of Charon's own, the next sync waits for an OK and the row says why. A
    run stopped because Charon quit carries on as before next time.
 6. The job's activity log gets the summary, the items that failed, were skipped or were left
-   out, the conflicts *Newest wins* settled, and the files that arrived without details their
-   drive can't keep (up to 50 of each, skipped and left-out items sharing one 50).
+   out, the files the run couldn't read, the conflicts *Newest wins* settled, the copies left out
+   of the memory because their original was gone or older, and the files that arrived without
+   details their drive can't keep (up to 50 of each, skipped and left-out items sharing one 50).
 
 ### When jobs run by themselves
 
@@ -536,7 +657,8 @@ Charon scans and plans in the background, the row shows *Needs your OK* when cha
 (unless it shows *Syncing*, *Offline*, *Paused*, *Conflict* or *Error*, which come first), and
 nothing changes in its folders until the person confirms a list.
 
-For each job whose folders are reachable and that isn't syncing, in this order:
+For each job whose folders are reachable (a folder now on another drive than at the last sync
+doesn't count) and that isn't syncing, in this order:
 
 1. **Drive connected:** a *Drive connected* job whose folders just became reachable (at launch
    too) syncs, or is looked at.
@@ -550,7 +672,9 @@ For each job whose folders are reachable and that isn't syncing, in this order:
    local. On a day when a daylight-saving change skips the chosen time (02:30 on the night the
    clocks go forward, for example), the job doesn't run that day; the next run is at the same
    time the following day.
-4. **Regular look:** every *Look for changes* minutes (15 by default), in case the watcher missed
+4. **Removals left for later** (below) have come due: a job that runs by itself syncs once more,
+   whatever its trigger.
+5. **Regular look:** every *Look for changes* minutes (15 by default), in case the watcher missed
    something. An *On change* job that runs by itself and has changes found by a look syncs.
 
 *Sync now*, shown instead of *Review and sync* for a job that runs by itself, starts the same
@@ -560,10 +684,16 @@ notification) says why, and the job shows *Needs your OK* until the person confi
 
 Removals that only follow from an item missing for less than ten minutes on a drive that may
 show changes late (a network share, or a drive run by a program, like sshfs and cloud drives
-that mount as a FUSE drive) are left for a later automatic run; a list the person confirms
-shows them all. Cloud folders on the computer's own disk (where iCloud Drive, Dropbox and
-OneDrive usually keep them) count as local: this rule doesn't cover them, and *Newest wins*
-trusts their times.
+that mount as a FUSE drive) are left for a later automatic run (`engine::Missing`); a list the
+person confirms shows them all. A disk of the computer's own that a program reads (`fuseblk` on
+Linux: a USB disk through ntfs-3g or exfat-fuse) doesn't count as such a drive. When each item
+was first found missing is saved per job in `absences/<job>.json`, so the wait survives a
+restart; after a restart an item must also have been found missing by the looks since the
+launch for two minutes, and a clock set back never makes one due. Until they're carried out
+the row shows *Pending* with their count, never *In sync*, and the run's summary counts them
+("2 removals left for a later sync"), in the log and in the window's last-run line. Cloud
+folders on the computer's own disk (where iCloud Drive, Dropbox and OneDrive usually keep them)
+count as local: this rule doesn't cover them, and *Newest wins* trusts their times.
 
 When changes or conflicts wait for the person, Charon says so in one notification, reminds them
 after two hours, and then once a day (`Engine::remind`). Paused and offline jobs aren't
@@ -586,22 +716,30 @@ jobs found waiting come in one notification.
 - Copies are written under a temporary name and take the real name only when complete, with a
   rename that never replaces what appeared there before Charon claimed the name.
 - Replaced files and links always go to `.charon-trash` in two-way jobs and when a conflict is
-  settled; with safe deletes, removed and replaced items in every mode do too. An item replaced
-  by one of another kind (a file by a folder) counts as a removal: outside of settling one
-  conflict, with safe deletes off it's gone for good.
-- Removals come last, and a side where copies failed keeps the run's removals.
+  settled; with safe deletes, removed and replaced items in every mode do too. An item that makes
+  room for one of another kind (a file where a folder goes) goes there whatever the setting.
+- Removals come last, and an item that makes room for another right before that item lands. A
+  side where a copy failed, a file couldn't be read or a drive refused an item keeps the run's
+  removals, and a copy skipped because its file changed keeps those that could be its old copy.
 - A folder is removed only when everything in it is removed; folders holding unreadable items,
   or excluded items other than system clutter, are never removed (clutter such as `.DS_Store`
   goes to the trash with its folder).
-- Places that can't be read, names written two ways, and items the other drive can't hold are
-  left alone on both sides, with a note in the list.
-- Symbolic links are never followed. Never synced: Charon's own files (`.charon`,
-  `.charon-trash`, `.part` files) and anything named like them or like Charon 0.2's
-  `*.charon-partial` files, at any depth; `._*` files on a Mac, whatever the patterns say; names
-  that aren't valid Unicode; and sockets, pipes and devices.
+- Places that can't be read, files a run couldn't read, names written two ways, items a scan
+  leaves out with a note, and items the other drive can't hold are left alone on both sides, with
+  a note in the list. While a file can't be read, no file or link is removed on the side it
+  should go to, except one that makes room for an item of another kind, which goes to
+  `.charon-trash`.
+- Symbolic links are never followed, and nothing is written into a folder Charon leaves alone.
+  Never synced: Charon's own files (`.charon`, `.charon-trash`, `.part` files, claims an
+  interrupted rename left) and anything named like them or like Charon 0.2's `*.charon-partial`
+  files, at any depth (its folders' names in any case, where a drive ignores case); `._*` files
+  on a Mac, whatever the patterns say; names that aren't valid Unicode; and sockets, pipes and
+  devices.
+- Files that are only in the cloud are never downloaded (macOS and Windows).
 - A run stops as soon as a folder isn't the one the plan was made for.
 - Nothing about a run is recorded until its changes are flushed to the drives (as far as each
-  system and drive allows), and only while both markers are unchanged.
+  system and drive allows), a last look finds them still there, and only while both markers are
+  unchanged.
 - Runs nobody looked at never empty the trash.
 - Charon keeps 2% of every drive it writes to free, at most 2 GB, where the drive says how much
   room it has.
@@ -625,7 +763,8 @@ core/                         the sync engine (crate charon-core, no interface)
     scan/                     reading a folder into a snapshot
       mod.rs
       entry.rs                Entry, Snapshot, and what a scan learned besides the items
-      contents.rs             Contents: comparing two files byte for byte
+      contents.rs             Contents: opening files without downloading them, and comparing
+                              two files byte for byte
       filter.rs               ExcludeFilter, system clutter, Charon's own names
       keys.rs                 Keys: NFC, /-separated, folded when a drive ignores case
       root.rs                 RootId: which folder a path really is
@@ -634,7 +773,8 @@ core/                         the sync engine (crate charon-core, no interface)
     plan/                     deciding what crosses, and which way
       mod.rs                  plan_for: the planner for the job's mode
       action.rs               Action, Note, Plan, PlanSummary, the order steps run in
-      ground.rs               places a plan must not touch; the last look at folder removals
+      ground.rs               places a plan must not touch, removals that wait for unread files,
+                              and the last look at folder removals
       one_way.rs              OneWayPlanner: Mirror and Backup
       two_way.rs              TwoWayPlanner
       baseline.rs             Baseline and Pair: the two-way memory
@@ -643,9 +783,11 @@ core/                         the sync engine (crate charon-core, no interface)
       units.rs                Unit: app libraries and SQLite databases
     run/                      carrying out a plan
       mod.rs
-      executor.rs             Executor: checks each step against the disk, then runs it
+      executor.rs             Executor: checks each step against the disk, then runs it, and
+                              the last look before a run is recorded
       copier.rs               Copier: one file or link, through a temporary .part file
-      rename.rs               renames that never replace, and swaps
+      rename.rs               renames that never replace (rename_new, move_to_new_name), swaps
+      identity.rs             Identity: which file an item is, by its drive and file numbers
       durable.rs              flushing files, folders and drives
       room.rs                 Room: free space, and the room Charon leaves for other apps
       trash.rs                Trash: .charon-trash, its lists and its clean-up
@@ -658,6 +800,7 @@ core/                         the sync engine (crate charon-core, no interface)
       baselines.rs            Baselines: each job's two-way memory
       landings.rs             Landings: Mirror and Backup copies whose dates didn't stick
       unattended.rs           Unattended: the long count of automatic changes
+      absences.rs             Absences: items missing on a share or cloud drive, and since when
       journal.rs              Journal: one activity log per job
       lock.rs                 DataLock: one Charon per data folder
       atomic.rs               saving a file so a crash never leaves it half-written
@@ -669,7 +812,7 @@ core/                         the sync engine (crate charon-core, no interface)
       runs.rs                 starting, carrying out, recording and holding back runs
       checks.rs               background looks, folder changes, reminders
       status.rs               the row the window shows for a job
-      runtime.rs              each job's live state, which isn't saved
+      runtime.rs              each job's live state, and Missing: removals left for later
     autopilot/                looking at jobs and running them by themselves
       mod.rs                  Autopilot: the once-a-second loop
       schedule.rs             Schedule: when an Every… or Daily job is due
@@ -746,18 +889,19 @@ A development build uses `dev.stean.charon-dev` next to it instead.
 
 | File | What's in it |
 |---|---|
-| `charon-state.json` | settings and jobs, with each job's record: its last run, whether its next sync waits for an OK and why, the drives and Mirror/Backup markers of the last sync, and what automatic runs removed or replaced during the last day |
+| `charon-state.json` | settings and jobs, with each job's record: its last run, whether its next sync waits for an OK and why, the drives of the last sync (with whether one refused links, and `caseGuessed` where how it treats case was only a guess), the Mirror/Backup markers of the last sync, and what automatic runs removed or replaced during the last day |
 | `charon-state.json.damaged-<date>-<time>` | a state file that couldn't be read, put aside instead of overwritten (Charon then starts without jobs) |
 | `charon.json.moved-to-0.3` | Charon 0.2's settings and jobs, after they moved (see below) |
 | `charon.lock` | locked while a Charon works with this folder; a second one refuses to start |
 | `baselines/<job>.json` | two-way memory: the two folders it belongs to, the markers' tokens and counter, and how each side looked at the last sync |
 | `landings/<job>.json` | Mirror and Backup: copies whose dates didn't stick on the destination, with the folders and destination marker they belong to |
 | `unattended/<job>.json` | full automation: what automatic runs removed or replaced since the last confirmed list, within *Keep deleted files* days |
+| `absences/<job>.json` | items the job's looks found missing on a network share or a drive run by a program, since when, and whether a run left the removal that follows for later, with the folders they belong to (gone when the job's folders or mode change, or the job is removed) |
 | `logs/<job>.log` | each job's activity log, cut to its newest half when it grows past 512 KB |
 
-The state file, the memories, the landings and the counts are saved under a temporary name next
-to them (`.<name>.<process>-<n>.tmp`) and renamed into place, so a crash never leaves one
-half-written. The job logs are added to as they go.
+The state file, the memories, the landings, the counts and the absences are saved under a
+temporary name next to them (`.<name>.<process>-<n>.tmp`) and renamed into place, so a crash
+never leaves one half-written. The job logs are added to as they go.
 
 The app's own log is `charon.log` (`charon-dev.log` for a development build), started afresh at
 5 MB with a few older ones kept: in `~/Library/Logs/dev.stean.charon/` on macOS,
@@ -777,7 +921,9 @@ next sync waiting for the person's OK. Jobs that used to sync by themselves are 
 `charon.json.moved-to-0.3`, so an old copy of the app started by mistake finds no jobs to run. A
 `charon.json` that's damaged is left where it is, and Charon starts without jobs. Two-way
 memories saved by 0.2.0 and earlier don't say which folders they belong to, so they're never
-used: the first sync with 0.3 compares both folders afresh and removes nothing.
+used: the first sync with 0.3 compares both folders afresh and removes nothing. Their item names
+only tell that first list which of the items it copies back were on both sides at the last sync
+(see *Two-way*).
 
 In each synced folder, Charon keeps:
 
@@ -785,10 +931,16 @@ In each synced folder, Charon keeps:
   both folders; Mirror and Backup in the destination, and in the source where Charon can write
   there. Removing a job removes its marker.
 - `.charon-trash/<date>_<time>_<id>/`: what a run removed or replaced, with its `.charon` list.
-- `.charon-<16 hex digits>.part`: a copy on its way, or an original Charon renamed aside for a
-  moment while replacing or removing it. After an interrupted sync, such a file may be the only
-  copy of a version. A run that goes all the way moves it into `.charon-trash` once it's an hour
-  old (see *Leftovers* above), so don't delete these files by hand.
+- `.charon-<16 hex digits>.part`: a copy on its way (of a file or a link), an original Charon
+  renamed aside for a moment while replacing or removing it, or, for an instant, a probe that
+  asks the drive about case or links. Where the path next to an item would be too long, it's in
+  a folder above. After an interrupted sync, such a file may be the only copy of a version. A run
+  that goes all the way moves it into `.charon-trash` once it's an hour old (see *Leftovers*
+  above), so don't delete these files by hand.
+- An empty file dated 2 January 1980 00:00:00 UTC: a claim an interrupted rename left under the
+  name it was taking (see *Renames* above). It's never synced, and the next run that goes all
+  the way moves it into `.charon-trash` (after an hour where the drive keeps change times
+  Charon trusts; see *Leftovers* above).
 
 On Windows, Charon marks `.charon` and `.charon-trash` as hidden; elsewhere the dot hides them.
 
