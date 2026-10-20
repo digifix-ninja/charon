@@ -388,13 +388,16 @@ impl Job {
         self.setup.full_automation && !self.needs_review
     }
 
-    /// The time automatic schedules count from: the last run, the last time the schedule
-    /// came due, or the job's creation, whichever is latest.
-    pub fn schedule_reference(&self) -> DateTime<Utc> {
-        [self.last_run.as_ref().map(|run| run.finished_at), self.last_scheduled]
+    /// The time automatic schedules count from at `now`: the last run, the last time the
+    /// schedule came due, or the job's creation, whichever is latest. A time later than `now`
+    /// was taken while the clock was ahead, and has been set right since: it doesn't count.
+    /// None when none of them is earlier than `now`.
+    pub fn schedule_reference(&self, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        [Some(self.created_at), self.last_run.as_ref().map(|run| run.finished_at), self.last_scheduled]
             .into_iter()
             .flatten()
-            .fold(self.created_at, DateTime::max)
+            .filter(|time| *time <= now)
+            .max()
     }
 
     /// Files and links removed or replaced by automatic runs within the last day, per side.
@@ -595,7 +598,11 @@ mod tests {
         let mut job = Job::new(setup(SyncMode::Backup, "/a", "/b"));
         let later = job.created_at + chrono::Duration::hours(3);
         job.last_scheduled = Some(later);
-        assert_eq!(job.schedule_reference(), later);
+        assert_eq!(job.schedule_reference(later), Some(later));
+        // Seen an hour after the job was made, the later time was taken while the clock was ahead.
+        let an_hour_in = job.created_at + chrono::Duration::hours(1);
+        assert_eq!(job.schedule_reference(an_hour_in), Some(job.created_at));
+        assert_eq!(job.schedule_reference(job.created_at - chrono::Duration::hours(1)), None);
     }
 
     #[test]
