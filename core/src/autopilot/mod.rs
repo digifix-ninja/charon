@@ -22,7 +22,8 @@
 //!    cloud drive (see `Engine::take_follow_up`). Once they've been missing long enough →
 //!    sync, whatever the job's trigger.
 //! 5. **Regular look:** every few minutes, in case the watcher missed something (network
-//!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs.
+//!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs,
+//!    unless its folders are still changing: then step 2 syncs once they have settled.
 //!
 //! A sync that is due waits (it isn't dropped) while another sync uses the same folders, and
 //! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
@@ -231,8 +232,9 @@ impl Autopilot {
                 self.run(id, "to carry out removals left for later");
                 continue;
             }
-            // 5. Regular look.
-            if by_itself && job.setup.trigger.syncs_on_change() && self.engine.has_pending(id) {
+            // 5. Regular look. While the folders still change, step 2 waits for them to settle.
+            let settling = self.changed.contains_key(id);
+            if by_itself && job.setup.trigger.syncs_on_change() && !settling && self.engine.has_pending(id) {
                 self.run(id, "for changes found by a look");
             } else if self.engine.check_due(id, settings.check_minutes) {
                 self.engine.check(id);
@@ -305,6 +307,89 @@ impl Autopilot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ConflictRule, JobSetup, SyncMode};
+    use std::fs;
+    use std::path::Path;
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+
+    /// How long any wait may take before the test fails.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// An autopilot for `engine` that hears about changes in the folders from the sender it
+    /// comes with, instead of watching them.
+    fn pilot(engine: &Engine) -> (Autopilot, Sender<(JobId, PathBuf)>) {
+        let (sender, changes) = mpsc::channel();
+        let pilot = Autopilot {
+            engine: engine.clone(),
+            watcher: None,
+            changes,
+            changed: HashMap::new(),
+            reachable: HashMap::new(),
+            scheduled: HashMap::new(),
+            real_roots: HashMap::new(),
+            confirmed_tried: HashMap::new(),
+            last_tick: None,
+        };
+        (pilot, sender)
+    }
+
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + DEADLINE;
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} took too long");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A two-way job with full automation that syncs once changes have settled for
+    /// `settle_seconds`, after its first sync was confirmed.
+    fn on_change_job(tmp: &Path, settle_seconds: u32) -> (Engine, JobId, PathBuf, PathBuf) {
+        let (a, b) = (tmp.join("a"), tmp.join("b"));
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("first.txt"), "first").unwrap();
+        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
+        let setup = JobSetup {
+            name: "Notes".into(),
+            source: a.clone(),
+            destination: b.clone(),
+            mode: SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::OnChange { settle_seconds },
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: true,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        until("the first look", || !engine.job(&id).unwrap().looking);
+        let review = engine.prepare_review(&id).unwrap();
+        engine.approve(&id, &review.review_id, true).unwrap();
+        until("the first sync", || !engine.is_running(&id));
+        assert!(b.join("first.txt").exists());
+        (engine, id, a, b)
+    }
+
+    #[test]
+    fn an_on_change_job_waits_for_its_folders_to_settle_even_when_a_look_found_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, a, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, changes) = pilot(&engine);
+        // A look found an app's file, which the app is still saving.
+        fs::write(a.join("notes.txt"), "draft").unwrap();
+        engine.check(&id);
+        until("the look", || engine.has_pending(&id));
+        changes.send((id.clone(), a.join("notes.txt"))).unwrap();
+        pilot.tick();
+        until("the tick's sync, if any", || !engine.is_running(&id));
+        assert!(!b.join("notes.txt").exists(), "synced while the folder still changed");
+
+        // Quiet for the settle time: it syncs.
+        pilot.changed.insert(id.clone(), Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute"));
+        pilot.tick();
+        until("the sync", || !engine.is_running(&id));
+        assert!(b.join("notes.txt").exists());
+    }
 
     #[test]
     fn a_tick_long_after_the_one_before_by_either_clock_means_charon_was_away() {
