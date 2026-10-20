@@ -17,8 +17,9 @@
 //! (`.charon`). A file that no longer matches it was changed after it went into the trash:
 //! an app may still be saving someone's work into it. A folder holding such a file is never
 //! cleared out, and reviews say where the file is. The files the system scatters into folders
-//! (Finder's .DS_Store) never count, nor, on FAT and exFAT drives, does a time moved by whole
-//! hours (a daylight-saving change).
+//! (Finder's .DS_Store) never count, nor does the placeholder a cloud service leaves for a
+//! listed file it frees up, as long as it says the file was as listed. On FAT and exFAT
+//! drives, a time moved by whole hours (a daylight-saving change) doesn't count either.
 //!
 //! The trash folder must be a real folder: if `.charon-trash` is a link or a file, nothing
 //! is moved into it and nothing is cleared out of it.
@@ -34,7 +35,7 @@ use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_clutter, is_partial, Entry, Keys, Placeholder, Refusal, Scanner, TRASH_FOLDER};
+use crate::scan::{is_clutter, is_partial, CloudService, Entry, Keys, Placeholder, Refusal, Scanner, MTIME_TOLERANCE_MS, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -476,7 +477,7 @@ impl Trash {
             let revived = match list {
                 Some(list) => match list.get(&path) {
                     Some(listed) => !Self::as_listed(&meta, listed, shifting),
-                    None if Self::stands_in_for_listed(folder, &path, list) => false,
+                    None if Self::stands_in_for_listed(folder, &path, &meta, list, shifting) => false,
                     None => modified > made,
                 },
                 None => modified > made + UNLISTED_MARGIN_MS && modified <= now + 60_000,
@@ -494,18 +495,34 @@ impl Trash {
         (days > 0).then(|| Local::now() - chrono::Duration::days(days as i64))
     }
 
-    /// Whether the file at `path` in the dated `folder` is a cloud service's placeholder for
-    /// a file the folder's list names, and that file is no longer there: the service freed it
-    /// up and left its stand-in (iCloud Drive before macOS 14 turns `report.txt` into a new,
-    /// hidden `.report.txt.icloud`). That holds nobody's work, whatever its time, and goes
-    /// along with its dated folder.
-    fn stands_in_for_listed(folder: &Path, path: &str, list: &Listed) -> bool {
-        let Some(placeholder) = Placeholder::named(Keys::name(path)) else { return false };
+    /// Whether the file at `path` in the dated `folder`, with the details `meta`, is a cloud
+    /// service's placeholder for a file the folder's list names, left when the service freed
+    /// that file up as it was listed: the file is no longer there, and the placeholder says
+    /// what the list says about it. Nextcloud and ownCloud give a placeholder the file's own
+    /// time; iCloud Drive before macOS 14 turns `report.txt` into a new, hidden
+    /// `.report.txt.icloud` that holds the file's size. Such a stand-in holds nobody's work,
+    /// whatever its own time, and goes along with its dated folder. One that says otherwise
+    /// stands for work saved into the file after it went in, and is judged by its time like
+    /// any other file.
+    fn stands_in_for_listed(folder: &Path, path: &str, meta: &fs::Metadata, list: &Listed, shifting: bool) -> bool {
+        let Some(placeholder) = Placeholder::named(Keys::name(path)).filter(|_| meta.is_file()) else { return false };
         let item = match Keys::parent(path) {
             Some(parent) => format!("{parent}/{}", placeholder.item),
             None => placeholder.item.to_string(),
         };
-        list.contains_key(&item) && fs::symlink_metadata(folder.join(&item)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+        let Some(&(size, modified)) = list.get(&item) else { return false };
+        if !fs::symlink_metadata(folder.join(&item)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
+            return false;
+        }
+        match placeholder.service {
+            // The client's time is to the second; on FAT and exFAT it may have moved by whole
+            // hours since, as for any file there.
+            CloudService::SyncClient => {
+                let own = Scanner::modified_ms(meta);
+                (own - modified).abs() <= MTIME_TOLERANCE_MS || (shifting && Entry::whole_hours_apart(own, modified))
+            }
+            CloudService::ICloud => placeholder.recorded_size(&folder.join(path)) == Some(size),
+        }
     }
 
     /// Whether a file named `name` in the trash never holds someone's work, whatever its
@@ -643,6 +660,24 @@ mod tests {
 
     fn set_time(path: &Path, at: DateTime<Local>) {
         filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(at.timestamp(), 0)).unwrap();
+    }
+
+    /// Writes at `path` the placeholder iCloud Drive before macOS 14 leaves when it frees up a
+    /// file of `size` bytes: a property list about the file, written now.
+    fn icloud_placeholder(path: &Path, size: u64) {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut about = plist::Dictionary::new();
+        about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String("NSURLFileResourceTypeRegular".into()));
+        about.insert("NSURLFileSizeKey".into(), size.into());
+        about.insert("NSURLNameKey".into(), plist::Value::String(Placeholder::named(&name).unwrap().item.into()));
+        plist::Value::Dictionary(about).to_writer_binary(fs::File::create(path).unwrap()).unwrap();
+    }
+
+    /// Writes at `path` the placeholder Nextcloud leaves when it frees up a file: one space,
+    /// with the file's own time, `time`.
+    fn nextcloud_placeholder(path: &Path, time: DateTime<Local>) {
+        fs::write(path, " ").unwrap();
+        set_time(path, time);
     }
 
     #[test]
@@ -850,9 +885,10 @@ mod tests {
     }
 
     /// iCloud Drive before macOS 14 frees up the files nobody used for long, the trash's old
-    /// ones first: the file goes, and a new hidden `.report.txt.icloud` stands in for it.
-    /// That stand-in is nobody's work: the folder is still cleared out when its time comes,
-    /// with it. A placeholder for a file the list doesn't name, or for one that's still
+    /// ones first: the file goes, and a new hidden `.report.txt.icloud` stands in for it, which
+    /// holds the file's size. Nextcloud's `plans.odt.nextcloud` has the file's own time
+    /// instead. Such a stand-in is nobody's work: the folder is still cleared out when its time
+    /// comes, with it. A placeholder for a file the list doesn't name, or for one that's still
     /// there, is judged by its time like any other file.
     #[test]
     fn a_cloud_placeholder_for_a_listed_file_is_nobodys_work() {
@@ -860,31 +896,28 @@ mod tests {
         let trash = Trash::for_run(days_ago(40));
         fs::create_dir_all(tmp.path().join("Docs")).unwrap();
         let mut kept = Vec::new();
-        for name in ["report.txt", "Docs/plans.odt", "notes.txt"] {
+        // The plans were saved while the run was under way, after its folder's time.
+        for (name, time) in [("report.txt", days_ago(41)), ("Docs/plans.odt", days_ago(39)), ("notes.txt", days_ago(41))] {
             fs::write(tmp.path().join(name), "the old version").unwrap();
-            set_time(&tmp.path().join(name), days_ago(41));
+            set_time(&tmp.path().join(name), time);
             kept.push(trash.put(tmp.path(), name).unwrap());
         }
         trash.write_lists();
         let dated = kept[0].parent().unwrap().to_path_buf();
         let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
-        let stand_in = |placeholder: &str| {
-            fs::write(dated.join(placeholder), "the service's stand-in").unwrap();
-            set_time(&dated.join(placeholder), days_ago(2));
-        };
 
         // Freed up days later.
-        for (file, placeholder) in [("report.txt", ".report.txt.icloud"), ("Docs/plans.odt", "Docs/plans.odt.nextcloud")] {
-            fs::remove_file(dated.join(file)).unwrap();
-            stand_in(placeholder);
-        }
+        fs::remove_file(dated.join("report.txt")).unwrap();
+        icloud_placeholder(&dated.join(".report.txt.icloud"), "the old version".len() as u64);
+        fs::remove_file(dated.join("Docs/plans.odt")).unwrap();
+        nextcloud_placeholder(&dated.join("Docs/plans.odt.nextcloud"), days_ago(39));
         for thorough in [false, true] {
             let look = Trash::look(tmp.path(), 30, thorough, false);
             assert!(look.revived.is_empty(), "{:?}", look.revived);
             assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![folder.as_str()]);
         }
         for placeholder in [".notes.txt.icloud", ".other.txt.icloud"] {
-            stand_in(placeholder);
+            icloud_placeholder(&dated.join(placeholder), "the old version".len() as u64);
         }
         let look = Trash::look(tmp.path(), 30, false, false);
         assert!(look.expired.is_empty());
@@ -895,6 +928,47 @@ mod tests {
         }
         Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
         assert!(!dated.exists(), "cleared out, the stand-ins with it");
+    }
+
+    /// Someone's work saved into a trashed file holds its dated folder. When the cloud service
+    /// then frees that file up, its placeholder says the file changed after it went in:
+    /// Nextcloud's has the time of the work, iCloud Drive's its size. The folder stays held,
+    /// the work in the cloud with it, and so it does for a placeholder that can't be read and
+    /// came after the folder.
+    #[test]
+    fn a_file_changed_in_the_trash_still_holds_its_folder_once_its_service_frees_it_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let mut kept = Vec::new();
+        for name in ["plans.odt", "report.txt", "notes.txt"] {
+            fs::write(tmp.path().join(name), "the old version").unwrap();
+            set_time(&tmp.path().join(name), days_ago(41));
+            kept.push(trash.put(tmp.path(), name).unwrap());
+        }
+        trash.write_lists();
+        let dated = kept[0].parent().unwrap().to_path_buf();
+        let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
+        // Apps that had them open saved someone's work into them, ten days ago.
+        let work = "someone's work, saved into the trash";
+        for file in &kept {
+            fs::write(file, work).unwrap();
+            set_time(file, days_ago(10));
+        }
+        assert_eq!(Trash::look(tmp.path(), 30, true, false).revived.len(), 3, "held while the work is on disk");
+
+        // The services free them up.
+        for file in &kept {
+            fs::remove_file(file).unwrap();
+        }
+        nextcloud_placeholder(&dated.join("plans.odt.nextcloud"), days_ago(10));
+        icloud_placeholder(&dated.join(".report.txt.icloud"), work.len() as u64);
+        fs::write(dated.join(".notes.txt.icloud"), "not a property list").unwrap();
+        let look = Trash::look(tmp.path(), 30, true, false);
+        assert!(look.expired.is_empty(), "{look:?}");
+        let held = [".notes.txt.icloud", ".report.txt.icloud", "plans.odt.nextcloud"];
+        assert_eq!(look.revived, held.map(|placeholder| format!("{TRASH_FOLDER}/{folder}/{placeholder}")));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
+        assert!(held.iter().all(|placeholder| dated.join(placeholder).exists()), "never cleared out");
     }
 
     #[test]

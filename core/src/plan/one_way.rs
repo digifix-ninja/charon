@@ -1,5 +1,6 @@
 //! Mirror and Backup: the destination follows the source.
 
+use crate::plan::action::LEFT_ALONE;
 use crate::plan::ground::Ground;
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::scan::{Entry, EntryKind, Snapshot};
@@ -99,7 +100,7 @@ impl OneWayPlanner {
                             NoteKind::KeptFolder,
                             Some(Side::Destination),
                             destination.spelling(path),
-                            "kept: the source has a file here, but this folder holds items Charon leaves alone",
+                            format!("kept: the source has a file here, but this folder holds {LEFT_ALONE}"),
                         );
                         ground.block(path);
                         continue;
@@ -129,7 +130,7 @@ impl OneWayPlanner {
     }
 
     /// Mirror: whatever the source no longer has, listed item by item. A folder that holds
-    /// things Charon leaves alone (excluded or unreadable items) stays.
+    /// things Charon leaves alone (see `LEFT_ALONE`) stays.
     fn plan_removals(source: &Snapshot, destination: &Snapshot, ground: &Ground, plan: &mut Plan) {
         for (path, entry) in destination.iter() {
             if source.contains(path) || ground.is_off_limits(path) {
@@ -140,7 +141,7 @@ impl OneWayPlanner {
                     NoteKind::KeptFolder,
                     Some(Side::Destination),
                     destination.spelling(path),
-                    "kept: the source no longer has it, but it holds items Charon leaves alone (excluded or unreadable)",
+                    format!("kept: the source no longer has it, but it holds {LEFT_ALONE}"),
                 );
                 continue;
             }
@@ -209,6 +210,7 @@ mod tests {
         let ordered: Vec<&str> = plan.ordered().iter().map(|a| a.path()).collect();
         assert_eq!(ordered, vec!["old/a.txt"]);
         assert_eq!(plan.notes[0].kind, NoteKind::KeptFolder);
+        assert_eq!(plan.notes[0].reason, "kept: the source no longer has it, but it holds items Charon leaves alone (excluded, left out or unreadable items, or what Charon or a cloud service keeps for its own use)");
     }
 
     #[test]

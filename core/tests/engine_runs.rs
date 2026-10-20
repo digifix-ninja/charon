@@ -1069,9 +1069,10 @@ fn what_finder_writes_into_the_trash_holds_nothing_up() {
 }
 
 /// iCloud Drive before macOS 14 frees up the files nobody used for long, the trash's old ones
-/// first: a trashed file goes, and a new hidden `.report.txt.icloud` stands in for it. That's
-/// the service's stand-in for a file Charon put there, not someone's work: nothing is held
-/// up, nothing warns, and the folder is emptied with it when its time comes.
+/// first: a trashed file goes, and a new hidden `.report.txt.icloud` stands in for it, which
+/// holds the file's size. That's the service's stand-in for a file Charon put there as it
+/// was, not someone's work: nothing is held up, nothing warns, and the folder is emptied with
+/// it when its time comes.
 #[test]
 fn what_icloud_leaves_for_a_trashed_file_holds_nothing_up() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1096,7 +1097,11 @@ fn what_icloud_leaves_for_a_trashed_file_holds_nothing_up() {
     let old = trash.join(format!("{}_0a0b0c", (chrono::Local::now() - chrono::Duration::days(40)).format("%Y-%m-%d_%H-%M-%S")));
     fs::rename(kept.parent().unwrap(), &old).unwrap();
     fs::remove_file(old.join("report.txt")).unwrap();
-    write(&old.join(".report.txt.icloud"), "bplist00 the service's stand-in");
+    let mut about = plist::Dictionary::new();
+    about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String("NSURLFileResourceTypeRegular".into()));
+    about.insert("NSURLFileSizeKey".into(), ("the report".len() as u64).into());
+    about.insert("NSURLNameKey".into(), plist::Value::String("report.txt".into()));
+    plist::Value::Dictionary(about).to_writer_binary(fs::File::create(old.join(".report.txt.icloud")).unwrap()).unwrap();
     write(&a.join("f0.txt"), "edited");
     assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
     wait(&engine, &id);

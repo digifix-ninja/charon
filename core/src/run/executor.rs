@@ -335,6 +335,18 @@ enum Wait {
     NotMixed,
 }
 
+/// What became of an item Charon set out to remove, or to move into the trash.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// It's no longer in its place: removed, or kept in the trash.
+    Removed,
+    /// It was gone already. For a removal that's what the plan wanted; for an item to be
+    /// replaced, it was removed a moment ago, after the plan.
+    Gone,
+    /// It isn't the item the plan saw anymore, so it stays.
+    Changed,
+}
+
 /// What the folders above an item are.
 enum Parents {
     Real,
@@ -998,11 +1010,13 @@ impl<'a> Executor<'a> {
                 continue;
             }
             match self.move_to_trash(side, relative, &path, seen) {
-                Ok(true) => {
+                Ok(Removal::Removed) => {
                     self.touch(&path);
                     moved += 1;
                 }
-                Ok(false) => log::info!("left the leftover {}: it changed as it went into the trash", path.display()),
+                // Gone already: nothing was moved.
+                Ok(Removal::Gone) => {}
+                Ok(Removal::Changed) => log::info!("left the leftover {}: it changed as it went into the trash", path.display()),
                 Err(e) => log::warn!("couldn't move the leftover {} into the trash: {e}", path.display()),
             }
         }
@@ -1328,10 +1342,11 @@ impl<'a> Executor<'a> {
                 }
             }
             Some(old) if keep_old => {
-                // A link: into the trash as it is, if it's still the one the plan saw.
+                // A link: into the trash as it is, if it's still the one the plan saw. One
+                // that's gone was removed a moment ago, and the new one doesn't take its place.
                 match self.move_to_trash(to, &relative, &target, &old) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                    Ok(Removal::Removed) => {}
+                    Ok(Removal::Gone | Removal::Changed) => {
                         Copier::discard(&partial);
                         return Ok(None);
                     }
@@ -1684,32 +1699,33 @@ impl<'a> Executor<'a> {
     /// name, so a moved file would take the person's next saves into the trash with it.
     /// Removed, the app saves again where the file was, and the next sync sees it.
     fn remove(&self, side: Side, relative: &str, target: &Path, keep: bool, planned: &Entry) -> Result<bool> {
-        if keep && planned.is_file() && self.clones(side) {
-            return self.remove_after_copying(side, relative, target, planned);
-        }
-        if keep {
-            return self.move_to_trash(side, relative, target, planned);
-        }
-        self.remove_checked(side, relative, target, planned)
+        let removal = if keep && planned.is_file() && self.clones(side) {
+            self.remove_after_copying(side, relative, target, planned)
+        } else if keep {
+            self.move_to_trash(side, relative, target, planned)
+        } else {
+            self.remove_checked(side, relative, target, planned)
+        };
+        // Gone already: what the plan wanted.
+        removal.map(|removal| removal != Removal::Changed)
     }
 
     /// Moves the file or link at `target` into the trash in one step, if it's still
-    /// `planned`, and checks it there: one that isn't goes back, and this returns `false`.
-    /// When the trash can't take it, nothing was touched: an item renamed and put back would
-    /// carry a new change time, which the next look would take for an edit on its side. Where
-    /// the trash is on another drive than the item (a folder mounted inside the job's), the
-    /// item is copied into the trash instead, and then removed. Whatever goes into the trash
-    /// at its own name goes through here: a removed or replaced link, the system's files left
-    /// in a removed folder, a leftover of an interrupted sync.
-    fn move_to_trash(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+    /// `planned`, and checks it there: one that isn't goes back (`Changed`). When the trash
+    /// can't take it, nothing was touched: an item renamed and put back would carry a new
+    /// change time, which the next look would take for an edit on its side. Where the trash is
+    /// on another drive than the item (a folder mounted inside the job's), the item is copied
+    /// into the trash instead, and then removed. Whatever goes into the trash at its own name
+    /// goes through here: a removed or replaced link, the system's files left in a removed
+    /// folder, a leftover of an interrupted sync.
+    fn move_to_trash(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<Removal> {
         let kept = match self.trash.put(self.shores.root(side), relative) {
             Ok(kept) => kept,
             Err(Error::File { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices => {
                 return self.remove_after_copying(side, relative, target, planned);
             }
-            // Gone already: what the plan wanted.
             Err(Error::File { source, .. }) if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) && Self::look(target)?.is_none() => {
-                return Ok(true);
+                return Ok(Removal::Gone);
             }
             Err(e) => return Err(e),
         };
@@ -1721,39 +1737,38 @@ impl<'a> Executor<'a> {
             if let Err(e) = rename_new(&kept, target) {
                 log::info!("couldn't put {} back ({e}); it stays in the trash", target.display());
             }
-            return moved.map(|_| false);
+            return moved.map(|_| Removal::Changed);
         }
-        Ok(true)
+        Ok(Removal::Removed)
     }
 
     /// Keeps a copy of the file or link at `target` in the trash, then removes it for good if
     /// it's still `planned` (see `remove_checked`). A file's copy is a clone on APFS (instant,
     /// and it takes no room); elsewhere it needs room on the drive.
-    fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+    fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<Removal> {
         let what = if planned.is_link() { "the removed link" } else { "the removed file" };
         self.room_for_kept_copy(side, planned.size, what)?;
         let kept = self.trash.preserve(self.shores.root(side), relative)?;
         self.touch(&kept);
         let removed = self.remove_checked(side, relative, target, planned);
-        if !matches!(removed, Ok(true)) {
+        if matches!(removed, Ok(Removal::Changed) | Err(_)) {
             Copier::discard(&kept);
         }
         removed
     }
 
     /// Removes the file or link at `target` for good, if it's still `planned`: renamed aside,
-    /// checked, then removed. `false` when it isn't (it's put back).
-    fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+    /// checked, then removed. `Changed` when it isn't (it's put back).
+    fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<Removal> {
         Copier::make_writable(target);
-        // Gone already: what the plan wanted.
-        let Some(aside) = Self::move_aside(target, self.shores.root(side))? else { return Ok(true) };
+        let Some(aside) = Self::move_aside(target, self.shores.root(side))? else { return Ok(Removal::Gone) };
         let moved = self.look_fresh(side, &aside);
         if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
             self.put_back(side, &aside, target, relative, None);
-            return moved.map(|_| false);
+            return moved.map(|_| Removal::Changed);
         }
         match Self::remove_item(&aside) {
-            Ok(()) => Ok(true),
+            Ok(()) => Ok(Removal::Removed),
             Err(e) => {
                 self.put_back(side, &aside, target, relative, Some(planned));
                 Err(Error::file(target, e))
@@ -2513,6 +2528,40 @@ mod tests {
         assert!(executor.commit(staged).unwrap().is_some());
         assert_eq!(fs::read_link(&target).unwrap(), Path::new("2020/y.jpg"));
         assert_eq!(trashed(&shores.destination), vec![("photos/newest".to_string(), "link to 2019/x.jpg".to_string())]);
+    }
+
+    /// The person removes a link a moment before the newer one from the other side takes its
+    /// place: the newer one doesn't take it, and the step says the link changed since the
+    /// plan. The next look finds the removal, and asks about it.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_removed_just_before_its_replacement_stays_removed() {
+        let (_tmp, shores) = shores();
+        std::os::unix::fs::symlink("2020/y.jpg", shores.source.join("newest")).unwrap();
+        let target = shores.destination.join("newest");
+        std::os::unix::fs::symlink("2019/x.jpg", &target).unwrap();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let partial = Copier::partial_path(&target);
+        std::os::unix::fs::symlink("2020/y.jpg", &partial).unwrap();
+        let (key, from, old) = ("newest".to_string(), seen(&shores.source.join("newest")), seen(&target));
+        // Removed by the person after the last look, before the commit.
+        fs::remove_file(&target).unwrap();
+        let staged = Staged {
+            to: Side::Destination,
+            relative: key.clone(),
+            key,
+            from,
+            existing: Some(old),
+            settles: false,
+            target: target.clone(),
+            partial: partial.clone(),
+            unkept: BTreeSet::new(),
+        };
+        assert!(executor.commit(staged).unwrap().is_none(), "the link changed since the plan");
+        assert!(fs::symlink_metadata(&target).is_err(), "it stays removed");
+        assert!(fs::symlink_metadata(&partial).is_err(), "the newer one is thrown away");
     }
 
     /// A sync client's journal that turned up in a folder after the list was made keeps the

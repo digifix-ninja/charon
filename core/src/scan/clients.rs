@@ -4,10 +4,11 @@
 //! own folder in `~/.var/app` when it's a Flatpak), `~/Library/Preferences` on macOS, and
 //! `%APPDATA%` or `%LOCALAPPDATA%` on Windows.
 //!
-//! A client also keeps a journal at the top of each folder it syncs. But a copy of that
-//! folder (a backup made by a tool that copied it as it was) holds a copy of the journal
-//! too, so the journal alone tells where a client syncs only when no client's settings can
-//! be read (see `scan::cloud`).
+//! A client also keeps a journal at the top of each folder it syncs, so a folder holding one
+//! counts as synced by a client too, though the settings here don't list it: a client on
+//! another computer may sync it. A copy of a synced folder (a backup made by a tool that
+//! copied it as it was) holds a copy of the journal as well, which Charon can't tell apart,
+//! so the notes say when only a journal makes a folder count (see `scan::cloud`).
 
 use std::fs;
 use std::io;
