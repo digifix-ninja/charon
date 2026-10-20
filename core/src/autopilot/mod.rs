@@ -142,7 +142,7 @@ impl Autopilot {
         }
         self.last_tick = Some(moment);
         // A sync dated later than now: the clock was ahead then, or is behind now.
-        self.engine.note_syncs_dated_ahead();
+        self.engine.note_syncs_dated_ahead(moment);
         // Notices an older Charon at work, so the window says so before anything tries to sync.
         self.engine.older_charon_running();
         // While Charon's state can't be saved, tries again now and then (at most once a
@@ -685,10 +685,12 @@ mod tests {
         let (kept, saved, shown) = last_synced(&engine, &id, &data);
         assert_eq!((kept, saved), (ahead, ahead), "the date Charon keeps changed");
         assert!(set_right <= shown && shown <= Utc::now(), "the row shows {shown}");
-        // A week later, the row says it hasn't synced since.
-        let job = engine.job(&id).unwrap().job;
-        let later = shown + chrono::Duration::days(7) + chrono::Duration::hours(1);
-        assert_eq!(Engine::stale(&job, None, true, later).as_deref(), Some("Not synced for 7 days"));
+        // A week later, with the clock past the date by then, the row says the job hasn't
+        // synced since.
+        let later = Moment::now().after(Duration::from_secs((7 * 24 + 1) * 60 * 60));
+        engine.note_syncs_dated_ahead(later);
+        let job = Job { last_synced: engine.last_synced_at(&id, later), ..engine.job(&id).unwrap().job };
+        assert_eq!(Engine::stale(&job, None, true, later.wall).as_deref(), Some("Not synced for 7 days"));
     }
 
     #[test]
@@ -711,10 +713,11 @@ mod tests {
 
         // Once the system sets the clock right, the row says when the job really synced, and
         // that's not long ago.
-        let job = engine.job_list().into_iter().find(|job| job.id == id).unwrap();
-        let found = Some((synced, Instant::now()));
         let set_right = Moment { wall: Utc::now() + behind, own: Instant::now() };
-        assert_eq!(Engine::last_synced(&job, found, set_right), Some(synced));
+        engine.note_syncs_dated_ahead(set_right);
+        let shown = engine.last_synced_at(&id, set_right);
+        assert_eq!(shown, Some(synced));
+        let job = Job { last_synced: shown, ..engine.job(&id).unwrap().job };
         assert_eq!(Engine::stale(&job, None, true, set_right.wall), None);
     }
 }

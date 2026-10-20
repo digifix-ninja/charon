@@ -41,7 +41,7 @@ use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings,
 pub(crate) use reach::{Presence, Whereabouts};
 use reach::Reach;
 pub(crate) use runtime::Moment;
-use runtime::{JobRuntime, Look, Missing};
+use runtime::{FoundAhead, JobRuntime, Look, Missing};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -137,14 +137,18 @@ impl Engine {
         let state_file = StateFile::new(folder.state_file(), folder.legacy_state_file());
         let state = state_file.load()?;
         let absences = Absences::new(folder.absences());
-        // What looks found missing before this launch, and for how long.
+        // What looks found missing before this launch, and for how long; and the last syncs
+        // found dated later than now, and for how long Charon has known so.
         let launch = Moment::now();
         let runtime = state
             .jobs
             .iter()
-            .map(|job| (job.id.clone(), absences.load(&job.id, &job.setup)))
-            .filter(|(_, kept)| !kept.is_empty())
-            .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept, launch), ..JobRuntime::default() }))
+            .filter_map(|job| {
+                let kept = absences.load(&job.id, &job.setup);
+                let dated_ahead = FoundAhead::restored(job, launch.own);
+                (!kept.is_empty() || dated_ahead.is_some())
+                    .then(|| (job.id.clone(), JobRuntime { missing: Missing::restored(kept, launch), dated_ahead, ..JobRuntime::default() }))
+            })
             .collect();
         let legacy_seen = state_file.legacy_changed_at();
         let engine = Self {

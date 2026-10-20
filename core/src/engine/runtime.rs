@@ -1,7 +1,7 @@
 //! The live state of a job: everything that isn't saved to disk.
 
 use crate::engine::review::StoredReview;
-use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
+use crate::model::{ConflictItem, DatedAhead, Job, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side, Unit};
 use crate::run::{Refused, Unread};
 use crate::scan::{Entry, ExcludeFilter, Keys, Snapshot, Volume};
@@ -84,10 +84,9 @@ pub(crate) struct JobRuntime {
     /// that couldn't be saved). Changes found by that look aren't tried again until a newer
     /// look finds them: a run that fails every time mustn't start every second.
     pub tried: Option<DateTime<Utc>>,
-    /// The job's last sync as Charon found it dated later than now, and when it found it so,
-    /// by its own clock (see `Engine::note_syncs_dated_ahead`). Only while Charon runs: the
-    /// date Charon keeps stays as it is.
-    pub dated_ahead: Option<(DateTime<Utc>, Instant)>,
+    /// The job's last sync, once Charon found it dated later than now, and for how long it
+    /// has known so (see `Engine::note_syncs_dated_ahead`).
+    pub dated_ahead: Option<FoundAhead>,
 }
 
 impl JobRuntime {
@@ -272,6 +271,60 @@ pub(crate) struct Moment {
 impl Moment {
     pub fn now() -> Self {
         Self { wall: Utc::now(), own: Instant::now() }
+    }
+}
+
+/// A job's last sync that Charon found dated later than now: the clock on the wall was ahead
+/// when the job synced, or is behind now. Which of the two can't be told, so the date stays as
+/// Charon keeps it, and Charon counts for how long it has known so, by its own clock, until the
+/// job syncs again. The sync was made before Charon found its date later than now, so it was
+/// made at least that long ago, whatever the clock on the wall did since. The count is kept
+/// with the job (`model::DatedAhead`), and the next launch counts on from there: the time while
+/// Charon wasn't running doesn't count, as its own clock can't tell how long that was.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FoundAhead {
+    /// The last sync's date, as Charon keeps it.
+    pub at: DateTime<Utc>,
+    /// Since when Charon has counted, by its own clock: when it found the date later than now,
+    /// or, for a date found so before Charon started, when Charon started.
+    counted_from: Instant,
+    /// How long Charon had known so before `counted_from`: nothing for a date found since
+    /// Charon started, and what the launches before had counted for one kept from before.
+    before: Duration,
+}
+
+impl FoundAhead {
+    /// A last sync dated `at`, found later than now at `now`.
+    pub fn found(at: DateTime<Utc>, now: Instant) -> Self {
+        Self { at, counted_from: now, before: Duration::ZERO }
+    }
+
+    /// The one kept with `job` before Charon started, at `now`, if it's still about the job's
+    /// last sync: its count goes on from what the launches before had counted.
+    pub fn restored(job: &Job, now: Instant) -> Option<Self> {
+        let kept = job.dated_ahead.as_ref().filter(|kept| job.last_synced == Some(kept.last_synced))?;
+        Some(Self { at: kept.last_synced, counted_from: now, before: Duration::from_secs(kept.counted_seconds) })
+    }
+
+    /// For how long Charon has known so at `now`, by its own clock.
+    pub fn known_for(&self, now: Instant) -> Duration {
+        self.before.saturating_add(now.saturating_duration_since(self.counted_from))
+    }
+
+    /// What's kept with the job for the next launch, at `now`.
+    pub fn kept(&self, now: Instant) -> DatedAhead {
+        DatedAhead { last_synced: self.at, counted_seconds: self.known_for(now).as_secs() }
+    }
+
+    /// When the job synced at the latest, as seen at `now`: the date Charon keeps, or when
+    /// Charon found that date later than now (as long before `now` by the clock on the wall as
+    /// Charon has known so by its own), whichever is earlier. Once the clock on the wall is
+    /// right, the sync was made no later than either, so the earlier one is the closer to it:
+    /// the date kept if the clock was right at the sync, when Charon found it so if the clock
+    /// was ahead then.
+    pub fn latest(&self, now: Moment) -> DateTime<Utc> {
+        let found = chrono::Duration::from_std(self.known_for(now.own)).ok().and_then(|known| now.wall.checked_sub_signed(known));
+        found.map_or(self.at, |found| found.min(self.at))
     }
 }
 
