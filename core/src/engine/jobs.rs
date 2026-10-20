@@ -49,46 +49,55 @@ impl Engine {
 
         // The setup it replaces is read where it's replaced, so two quick edits in a row
         // each compare with the one saved before. A confirmed list that waits for another
-        // sync was made for the old setup: the edit calls it off, and says so.
-        let (old, called_off) = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing, then edit it."), |state, rt| {
-            let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-            let old = job.setup.clone();
-            let folders_changed = !old.same_folders(&setup);
-            // An overlap that was there before (from an older Charon) doesn't block an edit
-            // that keeps the folders and the mode, such as a new name; every look still warns
-            // about it. New folders or a new mode must not overlap at all.
-            if folders_changed {
-                if let Some(other) = overlap.clash(&state.jobs)? {
-                    return Err(Error::Invalid(JobSetup::clash_message(other)));
+        // sync was made for the old setup: the edit calls it off once it's saved, and says so.
+        let (old, called_off) = self.with_job_at_rest(
+            id,
+            &format!("Wait until “{name}” finishes syncing, then edit it."),
+            |state| {
+                let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+                let old = job.setup.clone();
+                let folders_changed = !old.same_folders(&setup);
+                // An overlap that was there before (from an older Charon) doesn't block an edit
+                // that keeps the folders and the mode, such as a new name; every look still warns
+                // about it. New folders or a new mode must not overlap at all.
+                if folders_changed {
+                    if let Some(other) = overlap.clash(&state.jobs)? {
+                        return Err(Error::Invalid(JobSetup::clash_message(other)));
+                    }
                 }
-            }
-            let review_next = setup.changes_what_syncs(&old) || (setup.full_automation && !old.full_automation);
-            let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-            if job.setup != setup {
-                job.waiting_since = None;
-            }
-            job.setup = setup.clone();
-            if review_next {
-                job.needs_review = true;
-            }
-            let called_off = rt.confirmed.is_some();
-            if folders_changed {
-                job.drives = None;
-                job.destination_token = None;
-                job.source_mark = None;
-                job.run_in_progress = false;
-                job.held = None;
-                job.automatic_changes.clear();
-                rt.forget_folders();
-            } else {
-                rt.forget_review();
-            }
-            // Whatever a look in progress finds is for the old setup: the new one is looked
-            // at as soon as nothing else is looking.
-            rt.outdate_looks();
-            rt.last_checked = None;
-            Ok((old, called_off))
-        })?;
+                let review_next = setup.changes_what_syncs(&old) || (setup.full_automation && !old.full_automation);
+                let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+                if job.setup != setup {
+                    job.waiting_since = None;
+                }
+                job.setup = setup.clone();
+                if review_next {
+                    job.needs_review = true;
+                }
+                if folders_changed {
+                    job.drives = None;
+                    job.destination_token = None;
+                    job.source_mark = None;
+                    job.run_in_progress = false;
+                    job.held = None;
+                    job.automatic_changes.clear();
+                }
+                Ok(old)
+            },
+            |rt, old| {
+                let called_off = rt.confirmed.is_some();
+                if old.same_folders(&setup) {
+                    rt.forget_review();
+                } else {
+                    rt.forget_folders();
+                }
+                // Whatever a look in progress finds is for the old setup: the new one is looked
+                // at as soon as nothing else is looking.
+                rt.outdate_looks();
+                rt.last_checked = None;
+                (old, called_off)
+            },
+        )?;
         let folders_changed = !old.same_folders(&setup);
         let automation_on = setup.full_automation && !old.full_automation;
         let automation_off = !setup.full_automation && old.full_automation;
@@ -179,11 +188,15 @@ impl Engine {
             let name = job.setup.name.clone();
             (job, name)
         };
-        self.with_job_at_rest(id, &format!("Stop “{name}” first, then remove it."), |state, rt| {
-            rt.outdate_looks();
-            state.jobs.retain(|job| &job.id != id);
-            Ok(())
-        })?;
+        self.with_job_at_rest(
+            id,
+            &format!("Stop “{name}” first, then remove it."),
+            |state| {
+                state.jobs.retain(|job| &job.id != id);
+                Ok(())
+            },
+            |rt, ()| rt.outdate_looks(),
+        )?;
         self.runtime().remove(id);
         if let Err(e) = self.inner.baselines.forget(id) {
             log::warn!("couldn't forget the two-way memory of job {id}: {e}");
@@ -231,19 +244,26 @@ impl Engine {
         ExcludeFilter::check(std::slice::from_ref(&pattern))?;
         let name = self.stored_job(id)?.setup.name;
         // A confirmed list that waits for another sync didn't leave the place out: it's called
-        // off, and the log says so.
-        let called_off = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing."), |state, rt| {
-            let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-            if !job.setup.excludes.contains(&pattern) {
-                job.setup.excludes.push(pattern.clone());
-            }
-            job.needs_review = true;
-            let called_off = rt.confirmed.is_some();
-            rt.outdate_looks();
-            rt.forget_review();
-            rt.last_checked = None;
-            Ok(called_off)
-        })?;
+        // off once the change is saved, and the log says so.
+        let called_off = self.with_job_at_rest(
+            id,
+            &format!("Wait until “{name}” finishes syncing."),
+            |state| {
+                let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+                if !job.setup.excludes.contains(&pattern) {
+                    job.setup.excludes.push(pattern.clone());
+                }
+                job.needs_review = true;
+                Ok(())
+            },
+            |rt, ()| {
+                let called_off = rt.confirmed.is_some();
+                rt.outdate_looks();
+                rt.forget_review();
+                rt.last_checked = None;
+                called_off
+            },
+        )?;
         self.inner.journal.info(id, &format!("left out {path} (on the {})", side.word()));
         if called_off {
             self.note_called_off(id, " (a place was left out)");

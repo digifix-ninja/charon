@@ -140,9 +140,10 @@ pub async fn sync_now(state: State<'_, AppState>, id: JobId) -> Answer<SyncStart
 }
 
 /// Starts every job that runs by itself and returns the jobs whose lists need an OK.
+/// It says so if the person paused everything while it was starting them.
 #[tauri::command]
 pub async fn sync_all(state: State<'_, AppState>) -> Answer<Vec<JobId>> {
-    in_background(state, |engine| Ok(engine.sync_all())).await
+    in_background(state, |engine| engine.sync_all()).await
 }
 
 /// Stops a running sync, or calls off a confirmed one that waits. Off the window's thread:

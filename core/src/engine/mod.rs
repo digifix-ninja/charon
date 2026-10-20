@@ -101,6 +101,10 @@ struct Inner {
     rev: AtomicU64,
     /// Charon is quitting: nothing new starts.
     quitting: AtomicBool,
+    /// How many times everything was paused while Charon runs. It goes up only while the live
+    /// state is locked, together with what the pause stops and calls off (see
+    /// `pause_everything`), so what was decided before a pause can tell that one came since.
+    pauses: AtomicU64,
     /// When this engine opened (reminders wait for the first looks after a start).
     opened: Instant,
     /// The busy notes of syncs at work in the folders, this Charon's own and others' (see
@@ -164,6 +168,7 @@ impl Engine {
                 emit,
                 rev: AtomicU64::new(0),
                 quitting: AtomicBool::new(false),
+                pauses: AtomicU64::new(0),
                 opened: Instant::now(),
                 busy: Arc::new(BusyWatch::open(&folder.instances())),
                 reach: Reach::new(reach::LIMIT),
@@ -323,8 +328,7 @@ impl Engine {
         // Even when the setting couldn't be saved: nothing goes on, or starts later, without
         // the person.
         if paused {
-            self.stop_unattended();
-            self.call_off_all_confirmed(" (Pause everything)");
+            self.pause_everything();
         }
         saved?;
         self.emit(EngineEvent::Settings(self.settings()));
@@ -361,6 +365,11 @@ impl Engine {
     /// Whether Charon is quitting.
     pub fn is_shutting_down(&self) -> bool {
         self.inner.quitting.load(Ordering::SeqCst)
+    }
+
+    /// How many times everything was paused while Charon runs (see `pause_everything`).
+    pub(crate) fn pauses(&self) -> u64 {
+        self.inner.pauses.load(Ordering::SeqCst)
     }
 
     /// The jobs syncing right now.
@@ -440,19 +449,27 @@ impl Engine {
     }
 
     /// Changes the stored state and the job's live state together, but only while the job
-    /// isn't syncing (refused with `busy`). The stored change is saved before it counts.
-    fn with_job_at_rest<R>(&self, id: &JobId, busy: &str, change: impl FnOnce(&mut StoredState, &mut JobRuntime) -> Result<R>) -> Result<R> {
+    /// isn't syncing (refused with `busy`). `change` changes a copy of the stored state, which
+    /// is saved first: only once that worked does the copy become the state Charon works with,
+    /// and does `apply` change the job's live state, with what `change` returned. A change
+    /// that can't be saved changes neither, and says so.
+    fn with_job_at_rest<T, R>(
+        &self,
+        id: &JobId,
+        busy: &str,
+        change: impl FnOnce(&mut StoredState) -> Result<T>,
+        apply: impl FnOnce(&mut JobRuntime, T) -> R,
+    ) -> Result<R> {
         let mut state = self.state();
         let mut runtime = self.runtime();
-        let rt = runtime.entry(id.clone()).or_default();
-        if rt.is_running() {
+        if runtime.get(id).is_some_and(|rt| rt.is_running()) {
             return Err(Error::Invalid(busy.to_string()));
         }
         let mut next = state.clone();
-        let result = change(&mut next, rt)?;
-        self.save(&next)?;
+        let changed = change(&mut next)?;
+        self.save(&next).map_err(|e| Error::Invalid(format!("Charon couldn't save this change ({e}), so nothing changed.")))?;
         *state = next;
-        Ok(result)
+        Ok(apply(runtime.entry(id.clone()).or_default(), changed))
     }
 
     /// Changes one job's live state.

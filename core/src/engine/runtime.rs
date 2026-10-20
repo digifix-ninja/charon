@@ -191,6 +191,9 @@ pub(crate) struct Confirmed {
     pub review_id: String,
     /// The person ticked "I've looked at the removals and replacements".
     pub acknowledged: bool,
+    /// How many times everything had been paused when the person confirmed it (see
+    /// `Engine::pauses`): pausing everything since calls it off.
+    pub pauses: u64,
 }
 
 /// The items a sync writes, by key: its plan's steps, and the items its steps make under new

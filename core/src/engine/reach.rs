@@ -368,7 +368,7 @@ mod tests {
         let overview = engine.overview();
         let row = engine.job(&shared).unwrap();
         // "Sync all" offers the job whose folders are there, not the one waiting for the share.
-        assert_eq!(engine.sync_all(), vec![local.clone()]);
+        assert_eq!(engine.sync_all().unwrap(), vec![local.clone()]);
         assert!(asked.elapsed() < LIMIT, "waited {:?}", asked.elapsed());
         assert_eq!(row.status, JobStatus::Offline);
         assert_eq!(row.problem.as_deref(), Some(SOURCE_SILENT));

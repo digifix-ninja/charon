@@ -30,32 +30,41 @@ const DEADLINE: Duration = Duration::from_secs(60);
 type Hook = Box<dyn FnOnce() + Send>;
 
 /// An engine that can run a one-shot hook on its sync thread right before the first step
-/// of a run acts (after the list was made and the run began).
+/// of a run acts (after the list was made and the run began), and one on the thread that
+/// sends the first row saying a job is syncing.
 struct Rig {
     engine: Engine,
     hook: Arc<Mutex<Option<Hook>>>,
     fired: Arc<AtomicBool>,
+    /// The hook for the first row that says the job of this name is syncing.
+    syncing: Arc<Mutex<Option<(String, Hook)>>>,
 }
 
 impl Rig {
     fn open(data: &Path) -> Rig {
         let hook: Arc<Mutex<Option<Hook>>> = Arc::default();
         let fired = Arc::new(AtomicBool::new(false));
-        let (slot, flag) = (hook.clone(), fired.clone());
-        let emitter = Arc::new(move |event: EngineEvent| {
-            if let EngineEvent::Progress { progress, .. } = &event {
-                // The first step is about to act: nothing of this run has been carried yet.
-                if progress.phase == Phase::Copying && progress.done_items == 0 && progress.current.is_some() {
-                    let armed = slot.lock().unwrap().take();
-                    if let Some(hook) = armed {
-                        hook();
-                        flag.store(true, Ordering::SeqCst);
-                    }
+        let syncing: Arc<Mutex<Option<(String, Hook)>>> = Arc::default();
+        let (slot, flag, syncing_slot) = (hook.clone(), fired.clone(), syncing.clone());
+        let emitter = Arc::new(move |event: EngineEvent| match &event {
+            // The first step is about to act: nothing of this run has been carried yet.
+            EngineEvent::Progress { progress, .. } if progress.phase == Phase::Copying && progress.done_items == 0 && progress.current.is_some() => {
+                let armed = slot.lock().unwrap().take();
+                if let Some(hook) = armed {
+                    hook();
+                    flag.store(true, Ordering::SeqCst);
                 }
             }
+            EngineEvent::Job(view) if view.status == JobStatus::Syncing => {
+                let armed = syncing_slot.lock().unwrap().take_if(|(name, _)| *name == view.job.setup.name);
+                if let Some((_, hook)) = armed {
+                    hook();
+                }
+            }
+            _ => {}
         });
         let engine = Engine::open(data, emitter).expect("the engine opens");
-        Rig { engine, hook, fired }
+        Rig { engine, hook, fired, syncing }
     }
 
     /// Runs `hook` on the sync thread right before the next run's first step acts.
@@ -66,6 +75,17 @@ impl Rig {
 
     fn hook_fired(&self) -> bool {
         self.fired.load(Ordering::SeqCst)
+    }
+
+    /// Runs `hook` on the thread that sends the first row saying the job named `name` is
+    /// syncing: for a run nobody looks at, the thread that started it, right after it began
+    /// (for Sync all, before it goes on to the next job).
+    fn when_syncing(&self, name: &str, hook: impl FnOnce() + Send + 'static) {
+        *self.syncing.lock().unwrap() = Some((name.to_string(), Box::new(hook)));
+    }
+
+    fn syncing_hook_fired(&self) -> bool {
+        self.syncing.lock().unwrap().is_none()
     }
 }
 
@@ -636,7 +656,7 @@ fn sync_all_leaves_out_a_job_whose_confirmed_list_waits() {
     assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
 
     // It needs no OK: it's on its way.
-    assert!(engine.sync_all().is_empty());
+    assert!(engine.sync_all().unwrap().is_empty());
     assert!(view(&engine, &id).confirmed);
     fs::remove_file(note).unwrap();
     assert!(engine.start_confirmed(&id));
@@ -695,6 +715,52 @@ fn every_way_a_waiting_confirmed_sync_is_called_off_says_so_in_the_log() {
     engine.shut_down(Duration::from_secs(10));
     called_off("Charon quit");
     assert!(!engine.start_confirmed(&id) && !dst.join("a.txt").exists(), "nothing ran");
+}
+
+#[test]
+fn a_change_that_cant_be_saved_leaves_a_waiting_confirmed_sync_as_it_was() {
+    use charon_core::plan::Side;
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data");
+    let engine = plain_engine(&data);
+    let (src, dst, elsewhere) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("elsewhere"));
+    write(&src.join("a.txt"), "a");
+    write(&src.join("Drafts/b.txt"), "b");
+    fs::create_dir_all(&elsewhere).unwrap();
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Backup));
+    let review = engine.prepare_review(&id).unwrap();
+    let note = another_charons_note(&dst, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Waiting { .. }));
+
+    // The state file can't be replaced anymore (a full disk would do the same).
+    let state = data.join("charon-state.json");
+    fs::remove_file(&state).unwrap();
+    write(&state.join("in the way"), "x");
+
+    // A new name, new folders, a place left out: none of them can be saved, so none happens,
+    // and the window is told so.
+    let mut renamed = view(&engine, &id).job.setup;
+    renamed.name = "Pictures".into();
+    let refused = engine.update_job(&id, renamed).expect_err("the new name can't be saved");
+    let mut moved = view(&engine, &id).job.setup;
+    moved.destination = elsewhere.clone();
+    engine.update_job(&id, moved).expect_err("the new folder can't be saved");
+    engine.leave_out(&id, Side::Source, "Drafts").expect_err("the place left out can't be saved");
+    let row = view(&engine, &id);
+    assert_eq!((row.job.setup.name.as_str(), &row.job.setup.destination), ("Photos", &dst));
+    assert!(!row.job.setup.excludes.iter().any(|pattern| pattern.contains("Drafts")));
+    assert!(row.confirmed && row.waiting_for.as_deref() == Some("Charon on studio-mac"), "the confirmed sync still waits");
+    assert!(!engine.log(&id, 20).iter().any(|line| line.text.contains("called off")), "{:?}", engine.log(&id, 3));
+    let said = refused.to_string();
+    assert!(said.starts_with("Charon couldn't save this change (") && said.ends_with("), so nothing changed."), "{said}");
+
+    // Saving works again, and the other sync ends: the list the person confirmed is carried out.
+    fs::remove_dir_all(&state).unwrap();
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id), "the confirmed sync starts");
+    wait_idle(&engine, &id);
+    assert!(dst.join("a.txt").exists() && dst.join("Drafts/b.txt").exists());
+    assert!(fs::read_dir(&elsewhere).unwrap().next().is_none(), "nothing went to the folder the failed edit named");
 }
 
 #[test]
@@ -757,7 +823,7 @@ fn sync_all_under_pause_everything_starts_a_job_that_waited_for_its_neighbour() 
         let _ = released.recv_timeout(DEADLINE);
     });
     let_progress_throttle_pass();
-    assert!(engine.sync_all().is_empty(), "both run by themselves");
+    assert!(engine.sync_all().unwrap().is_empty(), "both run by themselves");
     at_first_step.recv_timeout(DEADLINE).expect("the first job's sync reached its first step");
     assert_eq!(view(engine, &two).waiting_for.as_deref(), Some("One"));
 
@@ -772,6 +838,102 @@ fn sync_all_under_pause_everything_starts_a_job_that_waited_for_its_neighbour() 
     assert!(engine.log(&two, 20).iter().any(|line| line.text.starts_with("sync started with Sync all")));
     assert!(!engine.is_running(&one));
     engine.shut_down(Duration::from_secs(10));
+}
+
+/// Backup jobs with full automation, one for each name, from `source` (or from a folder of
+/// their own when it's `None`) to a destination of their own, each synced once, with a new
+/// file waiting. Returns each job's id and destination.
+fn automatic_backups(engine: &Engine, root: &Path, source: Option<&Path>, names: &[&str]) -> Vec<(String, PathBuf)> {
+    let jobs: Vec<(String, PathBuf, PathBuf)> = names
+        .iter()
+        .map(|name| {
+            let src = source.map_or_else(|| root.join(name).join("src"), Path::to_path_buf);
+            let dst = root.join(name).join("dst");
+            write(&src.join("a.txt"), "a");
+            let mut setup = job_setup(name, &src, &dst, SyncMode::Backup);
+            setup.full_automation = true;
+            let id = add(engine, setup);
+            confirm(engine, &id);
+            (id, src, dst)
+        })
+        .collect();
+    for (_, src, _) in &jobs {
+        write(&src.join("new.txt"), "new");
+    }
+    jobs.into_iter().map(|(id, _, dst)| (id, dst)).collect()
+}
+
+/// Asserts that Sync all didn't start the job: nothing copied, nothing said, nothing wanted.
+fn not_started_by_sync_all(engine: &Engine, id: &String, dst: &Path) {
+    assert!(!engine.is_running(id));
+    assert!(!dst.join("new.txt").exists(), "it synced: {:?}", engine.log(id, 5).iter().map(|line| &line.text).collect::<Vec<_>>());
+    assert!(!engine.log(id, 20).iter().any(|line| line.text.starts_with("sync started with Sync all")));
+    assert_eq!(view(engine, id).waiting_for, None, "it doesn't wait to start either");
+}
+
+#[test]
+fn pausing_a_job_while_sync_all_is_at_work_holds_it_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let jobs = automatic_backups(engine, tmp.path(), None, &["One", "Two"]);
+    let ((one, one_dst), (two, two_dst)) = (&jobs[0], &jobs[1]);
+
+    // Sync all starts "One", and just then the person pauses "Two".
+    let (pausing, paused) = (engine.clone(), two.clone());
+    rig.when_syncing("One", move || pausing.set_paused(&paused, true).unwrap());
+    assert!(engine.sync_all().unwrap().is_empty());
+    assert!(rig.syncing_hook_fired(), "the pause came while Sync all was at work");
+    wait_idle(engine, one);
+    assert!(one_dst.join("new.txt").exists(), "“One” synced");
+    not_started_by_sync_all(engine, two, two_dst);
+    assert!(view(engine, two).job.paused);
+}
+
+#[test]
+fn pausing_everything_while_sync_all_is_at_work_holds_back_the_jobs_it_had_not_started() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let jobs = automatic_backups(engine, tmp.path(), None, &["One", "Two", "Three"]);
+    let one = &jobs[0].0;
+
+    // Sync all starts "One", and just then the person pauses everything: "One" stops, and Sync
+    // all starts nothing more, and says so.
+    let pausing = engine.clone();
+    rig.when_syncing("One", move || pausing.set_all_paused(true).unwrap());
+    let started = engine.sync_all();
+    assert!(rig.syncing_hook_fired(), "the pause came while Sync all was at work");
+    wait_idle(engine, one);
+    assert!(engine.log(one, 20).iter().any(|line| line.text.starts_with("everything paused: this sync stops")));
+    for (id, dst) in &jobs[1..] {
+        not_started_by_sync_all(engine, id, dst);
+    }
+    let refused = started.expect_err("Sync all says it stopped");
+    assert_eq!(refused.to_string(), "You paused everything while Sync all was starting the jobs, so it started no more of them.");
+}
+
+#[test]
+fn a_job_paused_while_sync_all_is_at_work_doesnt_start_once_its_neighbour_is_done() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let photos = tmp.path().join("Photos");
+    let jobs = automatic_backups(engine, tmp.path(), Some(&photos), &["One", "Two"]);
+    let ((one, _), (two, two_dst)) = (&jobs[0], &jobs[1]);
+
+    // Both back up the same folder. Sync all starts "One", and just then the person pauses
+    // "Two", which would have waited for "One".
+    let (pausing, paused) = (engine.clone(), two.clone());
+    rig.when_syncing("One", move || pausing.set_paused(&paused, true).unwrap());
+    assert!(engine.sync_all().unwrap().is_empty());
+    assert!(rig.syncing_hook_fired(), "the pause came while Sync all was at work");
+    wait_idle(engine, one);
+
+    // What the autopilot does once "One" is done: nothing is wanted, so nothing starts.
+    engine.start_wanted(two);
+    wait_idle(engine, two);
+    not_started_by_sync_all(engine, two, two_dst);
 }
 
 #[cfg(target_os = "linux")]
@@ -921,7 +1083,7 @@ fn a_sync_by_itself_waits_while_another_charon_is_at_work() {
 
     write(&src.join("b.txt"), "b");
     let note = another_charons_note(&dst, None);
-    assert!(engine.sync_all().is_empty());
+    assert!(engine.sync_all().unwrap().is_empty());
     assert!(!engine.is_running(&id));
     assert_eq!(view(&engine, &id).waiting_for.as_deref(), Some("another Charon"));
     assert!(!dst.join("b.txt").exists());
