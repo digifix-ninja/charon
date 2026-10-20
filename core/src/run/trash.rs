@@ -887,7 +887,7 @@ mod tests {
         }
         let look = Trash::look(tmp.path(), 30, false, false);
         assert_eq!(look.expired.len(), 1);
-        Trash::sweep(tmp.path(), &[look.expired[0].name.clone()], false);
+        Trash::sweep(tmp.path(), &[look.expired[0].name.clone()], 30, false);
         assert!(!tmp.path().join(TRASH_FOLDER).exists());
     }
 
