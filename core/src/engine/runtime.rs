@@ -3,7 +3,7 @@
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side, Unit};
-use crate::run::{Refused, Unread};
+use crate::run::{Markers, Refused, Unread};
 use crate::scan::{Entry, ExcludeFilter, Keys, Snapshot, Volume};
 use crate::store::Absence;
 use chrono::{DateTime, Utc};
@@ -54,9 +54,8 @@ pub(crate) struct JobRuntime {
     pub finished_at: Option<Instant>,
     pub last_progress_sent: Option<Instant>,
     pub reminder: Reminder,
-    /// Pairs of files compared byte for byte: key → both items as compared, and whether
-    /// they were identical. Reused while neither file changes.
-    pub same_contents: HashMap<String, (Entry, Entry, bool)>,
+    /// Pairs of files compared byte for byte in this session (see `Reads`).
+    pub reads: Reads,
     /// The drive of the source / destination turned out not to hold symbolic links.
     pub no_links: (bool, bool),
     /// Items a drive refused in a sync (by the side they were to go to, and key), with that
@@ -150,7 +149,7 @@ impl JobRuntime {
         self.forget_review();
         self.look = None;
         self.problem = None;
-        self.same_contents.clear();
+        self.reads = Reads::default();
         self.no_links = (false, false);
         self.refused.clear();
         self.unread.clear();
@@ -252,6 +251,55 @@ impl OwnWrites {
             Keys::fold(key)
         } else {
             key.to_string()
+        }
+    }
+}
+
+/// Pairs of files compared byte for byte in this session: key → both items as compared, and
+/// whether they were identical. A verdict is reused while neither file changes and both
+/// folders carry the markers they carried when it was read (see `run::Marker`): another
+/// drive under the same name, or a folder restored from an older copy, may hold other files
+/// that look the same.
+#[derive(Debug, Default)]
+pub(crate) struct Reads {
+    /// The markers both folders carried when the pairs were read.
+    markers: Option<Markers>,
+    pairs: HashMap<String, (Entry, Entry, bool)>,
+}
+
+impl Reads {
+    /// What the read of the pair at `key` found, while its items are still `source` and
+    /// `destination` and both folders carry `markers` (as a look found them before its scans).
+    pub fn verdict(&self, key: &str, source: &Entry, destination: &Entry, markers: &Markers) -> Option<bool> {
+        if self.markers.as_ref() != Some(markers) {
+            return None;
+        }
+        self.pairs.get(key).filter(|(s, d, _)| s == source && d == destination).map(|(_, _, same)| *same)
+    }
+
+    /// Notes what the read of the pair at `key` found in folders that carry `markers`. What
+    /// was read while they carried other markers goes.
+    pub fn note(&mut self, key: &str, source: Entry, destination: Entry, same: bool, markers: &Markers) {
+        if self.markers.as_ref() != Some(markers) {
+            self.pairs.clear();
+            self.markers = Some(markers.clone());
+        }
+        self.pairs.insert(key.to_string(), (source, destination, same));
+    }
+
+    /// Forgets what was read in folders that carried `markers`: one of them was replaced
+    /// while a look read it, and may have been read in part.
+    pub fn forget(&mut self, markers: &Markers) {
+        if self.markers.as_ref() == Some(markers) {
+            *self = Self::default();
+        }
+    }
+
+    /// A sync of Charon's own moved both folders' markers on from `before` to `after`, and
+    /// nothing replaced the folders meanwhile: what was read in them still holds.
+    pub fn carry(&mut self, before: &Markers, after: Markers) {
+        if self.markers.as_ref() == Some(before) {
+            self.markers = Some(after);
         }
     }
 }
@@ -834,5 +882,50 @@ mod tests {
         let held = missing.hold_back_recent(&mut run, &share, &mine, due);
         assert!(run.actions.is_empty());
         assert_eq!(held.len() as u64, missing.waiting(due), "what waits is what a run leaves for later");
+    }
+
+    /// The markers of the job's folders after `generation` syncs.
+    fn markers(generation: u64) -> Markers {
+        let marker = |side: Side| crate::run::Found::Marker(crate::run::Marker::new(&"job".to_string(), side, "token", generation));
+        Markers { source: marker(Side::Source), destination: marker(Side::Destination) }
+    }
+
+    /// What this session read holds while both files are as they were read, and only for the
+    /// folders that carry the markers they carried then: a folder restored from a copy, or
+    /// another drive under the same name, may hold other files that look the same.
+    #[test]
+    fn what_was_read_holds_only_while_the_folders_carry_the_same_markers() {
+        let (s, d) = (Entry::file(4, 10_000), Entry::file(4, 20_000));
+        let mut reads = Reads::default();
+        reads.note("a.txt", s, d, true, &markers(3));
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(3)), Some(true));
+        assert_eq!(reads.verdict("a.txt", &s, &Entry::file(4, 30_000), &markers(3)), None, "a file changed since");
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(2)), None, "restored from a copy");
+
+        // What is read in the restored folder replaces what was read before.
+        reads.note("b.txt", s, d, false, &markers(2));
+        assert_eq!(reads.verdict("b.txt", &s, &d, &markers(2)), Some(false));
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(3)), None, "read in another folder");
+
+        // A folder replaced while a look read it: what was read while the folders carried the
+        // look's markers goes, and only that.
+        reads.forget(&markers(3));
+        assert_eq!(reads.verdict("b.txt", &s, &d, &markers(2)), Some(false), "read while the folders carried other markers");
+        reads.forget(&markers(2));
+        assert_eq!(reads.verdict("b.txt", &s, &d, &markers(2)), None);
+    }
+
+    /// A sync of Charon's own moves the folders' markers on: what was read in the same
+    /// folders still holds, and isn't read again.
+    #[test]
+    fn what_was_read_holds_after_a_sync_of_charons_own() {
+        let (s, d) = (Entry::file(4, 10_000), Entry::file(4, 20_000));
+        let mut reads = Reads::default();
+        reads.note("a.txt", s, d, false, &markers(3));
+        reads.carry(&markers(2), markers(4));
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(4)), None, "read in folders that carried other markers");
+        reads.carry(&markers(3), markers(4));
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(4)), Some(false));
+        assert_eq!(reads.verdict("a.txt", &s, &d, &markers(3)), None);
     }
 }

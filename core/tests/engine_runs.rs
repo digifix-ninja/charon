@@ -566,6 +566,46 @@ fn what_a_list_found_identical_holds_only_while_the_folders_carry_the_same_marke
     assert_eq!(last.job(&id).unwrap().status, JobStatus::Conflict);
 }
 
+/// The same while Charon runs: what this session read in one folder never stands for
+/// another. The destination becomes an older copy of itself after a list found both sides
+/// identical. The next look neither goes by that read nor keeps it for the restored folder:
+/// the file is not compared yet, in this session and after a restart, and the list reads it
+/// and finds the conflict.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_this_session_read_holds_only_while_the_folders_carry_the_same_markers() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(far) = untimed_folder() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), far.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+
+    // While Charon runs, the destination becomes an older copy of itself, holding another
+    // version of the file with the same size and time.
+    set_marker_generation(&b, &id, 0);
+    edit_vault(&b, 0);
+    let not_compared = |engine: &Engine| {
+        look(engine, &id);
+        let view = engine.job(&id).unwrap();
+        assert_eq!(view.status, JobStatus::Review);
+        let waiting = view.waiting.unwrap();
+        assert_eq!((waiting.items, waiting.uncompared), (0, 1), "not compared yet");
+    };
+    not_compared(&first);
+    assert_eq!(first.prepare_review(&id).unwrap().tally.conflicts, 1, "the list reads it: the sides differ");
+    drop(first);
+
+    let again = engine(&data);
+    not_compared(&again);
+}
+
 /// What a list found about a large file holds only while neither side changes: an edit that
 /// keeps the file's size and time (an encrypted container does) is never taken for in sync,
 /// before or after a restart, and the list carries it.

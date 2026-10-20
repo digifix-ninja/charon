@@ -1,5 +1,7 @@
 // Turning data into the words and numbers the window shows.
 
+import { onlyToCompare } from "./store.js";
+
 const MODE_NAMES = { mirror: "Mirror", backup: "Backup", "two-way": "Two-way" };
 const STATUS_NAMES = {
   "in-sync": "In sync",
@@ -138,7 +140,14 @@ export class Format {
   }
 
   static modeName(mode) { return MODE_NAMES[mode] ?? mode; }
-  static statusName(status) { return STATUS_NAMES[status] ?? status; }
+  /**
+   * The name of a row's status. A job whose look left only files to compare waits for no OK
+   * yet: its list compares them, and may well find nothing to confirm.
+   */
+  static statusName(status, waiting = null) {
+    if (status === "review" && waiting && onlyToCompare(waiting)) return "Files to compare";
+    return STATUS_NAMES[status] ?? status;
+  }
   static ruleName(rule) { return RULE_NAMES[rule] ?? rule; }
   static modeSentence(mode, safeDelete = true) {
     return MODE_SENTENCES[mode === "backup" && !safeDelete ? "backup-unsafe" : mode] ?? "";

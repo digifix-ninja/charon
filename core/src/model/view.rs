@@ -516,21 +516,8 @@ impl Overview {
             "No sync jobs yet".into()
         } else if self.syncing > 0 {
             format!("Syncing {}", plural(self.syncing as u64, "job"))
-        } else if self.attention > 0 && self.waiting > 0 {
-            // Changes that wait for an OK are never hidden behind a job that needs attention.
-            format!(
-                "{} need{} attention, {} wait{} for your OK",
-                plural(self.attention as u64, "job"),
-                if self.attention == 1 { "s" } else { "" },
-                human_count(self.waiting as u64),
-                if self.waiting == 1 { "s" } else { "" }
-            )
-        } else if self.attention > 0 {
-            format!("{} need{} attention", plural(self.attention as u64, "job"), if self.attention == 1 { "s" } else { "" })
-        } else if self.waiting > 0 {
-            format!("{} wait{} for your OK", plural(self.waiting as u64, "job"), if self.waiting == 1 { "s" } else { "" })
-        } else if self.to_compare > 0 {
-            format!("{} {} files to compare", plural(self.to_compare as u64, "job"), if self.to_compare == 1 { "has" } else { "have" })
+        } else if let Some(asks) = self.asks() {
+            asks
         } else if self.paused_all {
             "Everything paused".into()
         } else if self.pending > 0 {
@@ -545,6 +532,28 @@ impl Overview {
         } else {
             "All in sync".into()
         }
+    }
+
+    /// What the jobs that wait for the person wait for, each kind named, so that none is
+    /// hidden behind another: "1 job needs attention, 2 wait for your OK, 1 has files to
+    /// compare". `None` when no job waits for the person.
+    fn asks(&self) -> Option<String> {
+        let kinds = [
+            (self.attention, "needs attention", "need attention"),
+            (self.waiting, "waits for your OK", "wait for your OK"),
+            (self.to_compare, "has files to compare", "have files to compare"),
+        ];
+        let asks: Vec<String> = kinds
+            .into_iter()
+            .filter(|(jobs, ..)| *jobs > 0)
+            .enumerate()
+            .map(|(i, (jobs, one, more))| {
+                // The first one names what is counted.
+                let count = if i == 0 { plural(jobs as u64, "job") } else { human_count(jobs as u64) };
+                format!("{count} {}", if jobs == 1 { one } else { more })
+            })
+            .collect();
+        (!asks.is_empty()).then(|| asks.join(", "))
     }
 }
 
@@ -720,7 +729,7 @@ mod tests {
         for other in [waiting(3, 0, 1, None), waiting(0, 1, 1, None), waiting(0, 0, 1, Some("Charon stopped the sync."))] {
             let overview = Overview::of(&[videos.clone(), row_waiting(other)], false, None);
             assert_eq!((overview.waiting, overview.to_compare), (1, 1));
-            assert_eq!(overview.headline(), "1 job waits for your OK");
+            assert_eq!(overview.headline(), "1 job waits for your OK, 1 has files to compare");
         }
     }
 
@@ -729,6 +738,9 @@ mod tests {
         let overview = Overview { jobs: 4, attention: 1, waiting: 2, ..Default::default() };
         assert_eq!(overview.headline(), "1 job needs attention, 2 wait for your OK");
         assert_eq!(Overview { waiting: 0, ..overview.clone() }.headline(), "1 job needs attention");
-        assert_eq!(Overview { attention: 0, ..overview }.headline(), "2 jobs wait for your OK");
+        assert_eq!(Overview { attention: 0, ..overview.clone() }.headline(), "2 jobs wait for your OK");
+        // Nor are files to compare, which wait for the person too.
+        assert_eq!(Overview { waiting: 0, to_compare: 1, ..overview.clone() }.headline(), "1 job needs attention, 1 has files to compare");
+        assert_eq!(Overview { jobs: 6, attention: 2, to_compare: 3, ..overview }.headline(), "2 jobs need attention, 2 wait for your OK, 3 have files to compare");
     }
 }

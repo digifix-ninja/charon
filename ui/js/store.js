@@ -20,7 +20,8 @@ export const GROUPS = [
   { key: "all", label: "Jobs", tone: "var(--text-dim)", match: () => true },
   { key: "in-sync", label: "In sync", tone: "var(--in-sync)", match: isAny("in-sync") },
   { key: "syncing", label: "Crossing", tone: "var(--syncing)", match: isAny("syncing") },
-  { key: "your-ok", label: "Your OK", tone: "var(--review)", match: job => Boolean(job.waiting) },
+  // Jobs whose list waits for the person: changes to confirm, a run held back, or files to compare.
+  { key: "to-review", label: "To review", tone: "var(--review)", match: job => Boolean(job.waiting) },
   { key: "queued", label: "Queued", tone: "var(--pending)", match: isAny("pending", "new", "paused", "offline", "looking") },
   { key: "attention", label: "Need you", tone: "var(--error)", match: needsYou },
 ];
