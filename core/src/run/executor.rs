@@ -20,8 +20,8 @@ use crate::run::durable;
 use crate::run::identity::Identity;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new, swap};
-use crate::run::{Copier, ProgressMeter, Room, Trash};
-use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
+use crate::run::{Copier, KeptCopies, ProgressMeter, Room, Trash};
+use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -139,6 +139,9 @@ enum Done {
     /// Nothing was needed (the item was already gone).
     Nothing,
     Skipped(String),
+    /// Left for the next sync because the item of another kind in its place couldn't go
+    /// first (counted with the skipped ones).
+    Blocked(String),
     /// Left for the next sync with the rest of its app library or database, which only goes
     /// whole (see `Outcome::waited`).
     Waits(String),
@@ -266,38 +269,62 @@ impl Trace {
 struct Holds {
     /// Sides where a copy failed or a drive refused an item: every removal there waits.
     sides: HashSet<Side>,
-    /// Copies left for the next sync because their item changed during the run (or their
-    /// place couldn't be cleared, or their app library or database waits): the side each
-    /// was going to, its key and the item as planned. Only the removals there that could be
-    /// an old copy of one of them wait: an item with the same name, or with the same size and
-    /// time. Holding every removal there would keep a job from ever removing anything while
-    /// an app keeps writing to one file.
-    changed: Vec<(Side, String, Entry)>,
+    /// Copies left for the next sync because their item changed since the scan, their place
+    /// couldn't be cleared, or their app library or database waits: the side each was going
+    /// to, its key, the item as planned and why it didn't land. Only the removals there that
+    /// could be an old copy of one of them wait: an item with the same name, or with the same
+    /// size and time. Holding every removal there would keep a job from ever removing
+    /// anything while an app keeps writing to one file.
+    unlanded: Vec<(Side, String, Entry, Unlanded)>,
+}
+
+/// Why a copy was left for the next sync (see `Holds`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unlanded {
+    /// Its item changed since the scan.
+    Changed,
+    /// The item of another kind in its place couldn't go first.
+    Blocked,
+    /// It waits with the rest of its app library or database.
+    Waits,
+}
+
+impl Unlanded {
+    /// Why a copy whose step had `result` was left for the next sync, if it was.
+    fn of(result: &Result<Done>) -> Option<Unlanded> {
+        match result {
+            Ok(Done::Skipped(_)) | Err(Error::Changed(_)) => Some(Unlanded::Changed),
+            Ok(Done::Blocked(_)) => Some(Unlanded::Blocked),
+            Ok(Done::Waits(_)) => Some(Unlanded::Waits),
+            _ => None,
+        }
+    }
 }
 
 /// Why a removal waits (see `Holds`).
 enum Held<'h> {
     /// Copies to its side failed.
     Failed,
-    /// It may be an old copy of the item at this key, which changed during the run.
-    OldCopyOf(&'h str),
+    /// It may be an old copy of the item at this key, which was left for the next sync for
+    /// this reason.
+    OldCopyOf(&'h str, Unlanded),
 }
 
 impl Holds {
     /// Notes what a step's result holds back: a copy that didn't land, the removals on its
     /// side.
     fn note(&mut self, action: &Action, result: &Result<Done>) {
-        match (action, result) {
-            (_, Ok(Done::Copied(..))) => {}
+        match (action, result, Unlanded::of(result)) {
+            (_, Ok(Done::Copied(..)), _) => {}
             // The person sees what a drive refused left out in the next list before anything
             // goes.
-            (_, Err(Error::Refused { .. })) => self.sides.extend(Executor::receiving(action)),
-            (Action::Copy { to, path, from, .. }, Ok(Done::Skipped(_) | Done::Waits(_)) | Err(Error::Changed(_))) => self.changed.push((*to, path.clone(), *from)),
-            (Action::KeepBoth { path, source, destination, .. }, Ok(Done::Skipped(_) | Done::Waits(_)) | Err(Error::Changed(_))) => {
-                self.changed.push((Side::Destination, path.clone(), *source));
-                self.changed.push((Side::Source, path.clone(), *destination));
+            (_, Err(Error::Refused { .. }), _) => self.sides.extend(Executor::receiving(action)),
+            (Action::Copy { to, path, from, .. }, _, Some(why)) => self.unlanded.push((*to, path.clone(), *from, why)),
+            (Action::KeepBoth { path, source, destination, .. }, _, Some(why)) => {
+                self.unlanded.push((Side::Destination, path.clone(), *source, why));
+                self.unlanded.push((Side::Source, path.clone(), *destination, why));
             }
-            (Action::Copy { .. } | Action::KeepBoth { .. }, _) => self.sides.extend(Executor::receiving(action)),
+            (Action::Copy { .. } | Action::KeepBoth { .. }, _, None) => self.sides.extend(Executor::receiving(action)),
             _ => {}
         }
     }
@@ -308,10 +335,10 @@ impl Holds {
         if self.sides.contains(side) {
             return Some(Held::Failed);
         }
-        self.changed
+        self.unlanded
             .iter()
-            .find(|(to, key, item)| to == side && (Keys::name(key) == Keys::name(path) || item.same_as(entry)))
-            .map(|(_, key, _)| Held::OldCopyOf(key))
+            .find(|(to, key, item, _)| to == side && (Keys::name(key) == Keys::name(path) || item.same_as(entry)))
+            .map(|(_, key, _, why)| Held::OldCopyOf(key, *why))
     }
 }
 
@@ -380,7 +407,8 @@ impl Leftover<'_> {
 enum Wait {
     /// A removal among them waits (see `Holds`).
     Held,
-    /// Something of it changed while its files were being copied.
+    /// Something of it changed since the scan: found once its new versions were written next
+    /// to their targets (see `still_ready`).
     Changed,
     /// Another of its steps couldn't be carried out.
     NotMixed,
@@ -579,7 +607,7 @@ impl<'a> Executor<'a> {
             meter.start(&self.spellings.disk(Self::shown_side(action), action.path()));
             let result = match (action, waits, still_taken, holds.of(action)) {
                 (_, Some(why), _, _) => Ok(Done::Waits(why)),
-                (_, None, Some(clearing), _) => Ok(Done::Skipped(format!(
+                (_, None, Some(clearing), _) => Ok(Done::Blocked(format!(
                     "left for the next sync: the item of another kind in its place on the {} couldn't go first",
                     clearing.side.word()
                 ))),
@@ -633,7 +661,7 @@ impl<'a> Executor<'a> {
             }
             Ok(Done::Deleted) => outcome.deleted += 1,
             Ok(Done::Created | Done::Nothing) => {}
-            Ok(Done::Skipped(reason)) => {
+            Ok(Done::Skipped(reason) | Done::Blocked(reason)) => {
                 log::info!("skipped {}: {reason}", action.path());
                 outcome.skipped.push((action.path().to_string(), reason));
             }
@@ -709,13 +737,16 @@ impl<'a> Executor<'a> {
 
     /// What the person reads about a removal from `side` that waits (see `Holds`).
     fn why_held(&self, held: Held, side: Side) -> String {
-        match held {
-            Held::Failed => format!("kept for now: some items couldn't be copied to the {} in this run", side.word()),
-            Held::OldCopyOf(key) => format!(
-                "kept for now: it may be the old copy of “{}”, which changed during the sync and wasn't copied to the {} yet",
-                self.spellings.disk(side.opposite(), key),
-                side.word()
-            ),
+        let Held::OldCopyOf(key, why) = held else {
+            return format!("kept for now: some items couldn't be copied to the {} in this run", side.word());
+        };
+        let (copy, side) = (self.spellings.disk(side.opposite(), key), side.word());
+        match why {
+            Unlanded::Changed => format!("kept for now: it may be the old copy of “{copy}”, which changed since the scan and wasn't copied to the {side} yet"),
+            Unlanded::Blocked => {
+                format!("kept for now: it may be the old copy of “{copy}”, which wasn't copied to the {side} yet: the item of another kind in its place there couldn't go first")
+            }
+            Unlanded::Waits => format!("kept for now: it may be the old copy of “{copy}”, which waits for the next sync with the rest of its app library or database"),
         }
     }
 
@@ -1137,8 +1168,8 @@ impl<'a> Executor<'a> {
     }
 
     /// The second half of carrying a unit (see `carry`): its new versions take their places,
-    /// one right after the other, once the trash has room for every version they replace
-    /// (see `room_for_replaced`), so that one almost never fails halfway. Nothing of it is
+    /// one right after the other, once the trash has room for the versions they replace (see
+    /// `room_for_replaced`), so that one almost never fails halfway. Nothing of it is
     /// removed before then, but the old journals of its databases are renamed aside first:
     /// they only fit the version they were written with (see `set_aside`). When one can't be
     /// renamed aside, nothing of the unit moves but what only adds to it (see
@@ -1218,21 +1249,28 @@ impl<'a> Executor<'a> {
         ((results, None), Leftover { asides: behind, removals })
     }
 
-    /// Why the trash on a side has no room for every version the new versions in `staged`
-    /// replace there, if it hasn't: the index of the first new version that replaces one
-    /// there, and the error. Each version replaced is kept until the trash is cleared out (see
-    /// `commit`), so all of them must fit, leaving the room Charon keeps for other apps. On a
-    /// drive where those copies are clones, they take no room.
+    /// Why the trash on a side has no room for the versions the new versions in `staged`
+    /// replace there, if it hasn't: the index of the new version that replaces the largest of
+    /// them, and the error. Each is copied into the trash right before its new version takes
+    /// its place (see `commit`), leaving the room Charon keeps for other apps. Where the old
+    /// version gives its room back once removed, the largest copy is all that needs room at
+    /// a time, with those of files that have other names (hard links) on top; where the
+    /// drive may hold on to a removed file's data, every copy does; where the copies are
+    /// clones, none does (see `KeptCopies`).
     fn room_for_replaced(&self, unit: &Unit, staged: &[(&Action, Staged)]) -> Option<(usize, Error)> {
         for side in [Side::Source, Side::Destination] {
-            let replaced = |ready: &Staged| ready.existing.filter(|old| ready.to == side && old.is_file() && self.keeps_replaced(ready.settles));
-            let bytes = staged.iter().filter_map(|(_, ready)| replaced(ready)).map(|old| old.size).fold(0u64, u64::saturating_add);
-            if bytes == 0 {
-                continue;
-            }
+            let copies = self.kept_copies(side);
+            let gives_back = |target: &Path| copies == KeptCopies::OneAtATime && Identity::names(target) == Some(1);
+            let kept = |ready: &Staged| {
+                let old = ready.existing.filter(|old| ready.to == side && old.is_file() && self.keeps_replaced(ready.settles))?;
+                Some((old.size, gives_back(&ready.target)))
+            };
+            let replaced: Vec<(usize, (u64, bool))> = staged.iter().enumerate().filter_map(|(at, (_, ready))| Some((at, kept(ready)?))).collect();
+            let bytes = copies.room(replaced.iter().map(|(_, old)| *old));
+            let Some(&(largest, _)) = replaced.iter().max_by_key(|(_, (size, _))| *size).filter(|_| bytes > 0) else { continue };
             let what = format!("the replaced versions of “{}”", self.spellings.disk(side, unit.key()));
             if let Err(e) = self.room_for_kept_copy(side, bytes, &what) {
-                return staged.iter().position(|(_, ready)| replaced(ready).is_some()).map(|first| (first, e));
+                return Some((largest, e));
             }
         }
         None
@@ -1508,7 +1546,7 @@ impl<'a> Executor<'a> {
         match unit {
             Unit::Database(_) => match why {
                 Wait::Held => "kept for now: other copies didn't land in this run, and a database's files are only synced together".into(),
-                Wait::Changed => "left for the next sync: a file of its database changed while its files were being copied".into(),
+                Wait::Changed => "left for the next sync: a file of its database changed since the scan".into(),
                 Wait::NotMixed => "left for the next sync: another file of its database couldn't be synced, and a database's files only go together".into(),
             },
             Unit::Package(library) => {
@@ -1518,7 +1556,7 @@ impl<'a> Executor<'a> {
                     Wait::Held => {
                         format!("kept for now: other copies didn't land in this run, and the files of “{library}”, an app library or document, are only synced together")
                     }
-                    Wait::Changed => format!("left for the next sync: something in “{library}”, an app library or document, changed while its files were being copied"),
+                    Wait::Changed => format!("left for the next sync: something in “{library}”, an app library or document, changed since the scan"),
                     Wait::NotMixed => {
                         format!("left for the next sync: another item of “{library}”, an app library or document, couldn't be synced, and its files only go together")
                     }
@@ -2112,7 +2150,12 @@ impl<'a> Executor<'a> {
 
     /// Whether copies on `side`'s drive are clones, instant and taking no room (APFS).
     fn clones(&self, side: Side) -> bool {
-        self.spellings.snapshot(side).volume().is_some_and(|v| v.kind == FsKind::Apfs)
+        self.kept_copies(side) == KeptCopies::Clones
+    }
+
+    /// How the copies of replaced versions kept in the trash take room on `side`'s drive.
+    fn kept_copies(&self, side: Side) -> KeptCopies {
+        KeptCopies::on(self.spellings.snapshot(side).volume())
     }
 
     /// What a step just wrote must be on the drive the folder was on at the scan. When a
@@ -2734,6 +2777,7 @@ enum Spot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::FsKind;
 
     #[test]
     fn conflict_names_keep_the_extension() {
@@ -2782,6 +2826,30 @@ mod tests {
 
     fn seen(path: &Path) -> Entry {
         Executor::look(path).unwrap().unwrap()
+    }
+
+    /// The copies among `steps`, each as if its new version were written next to its target
+    /// in `root`'s folder (see `Executor::stage`).
+    fn staged_in<'p>(root: &Path, steps: &'p [Action]) -> Vec<(&'p Action, Staged)> {
+        steps
+            .iter()
+            .map(|step| {
+                let Action::Copy { to, path, from, existing, .. } = step else { unreachable!("only copies") };
+                let target = root.join(path);
+                let ready = Staged {
+                    to: *to,
+                    key: path.clone(),
+                    from: *from,
+                    existing: *existing,
+                    settles: false,
+                    relative: path.clone(),
+                    partial: Copier::partial_path(&target),
+                    target,
+                    unkept: BTreeSet::new(),
+                };
+                (step, ready)
+            })
+            .collect()
     }
 
     /// The names in a folder, Charon's own trash left out.
@@ -2945,25 +3013,7 @@ mod tests {
         }
         let cancel = AtomicBool::new(false);
         let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel);
-        let staged: Vec<(&Action, Staged)> = copies
-            .iter()
-            .map(|step| {
-                let Action::Copy { to, path, from, existing, .. } = step else { unreachable!("only copies") };
-                let target = shores.destination.join(path);
-                let ready = Staged {
-                    to: *to,
-                    key: path.clone(),
-                    from: *from,
-                    existing: *existing,
-                    settles: false,
-                    relative: path.clone(),
-                    partial: Copier::partial_path(&target),
-                    target,
-                    unkept: BTreeSet::new(),
-                };
-                (step, ready)
-            })
-            .collect();
+        let staged = staged_in(&shores.destination, &copies);
         let mut removals: Vec<&Action> = removed.iter().collect();
         let started = Instant::now();
         let journals = executor.journals_of(&staged, &mut removals);
@@ -3219,8 +3269,8 @@ mod tests {
         let edited = Action::copy(Side::Destination, "Photos 2025/d.jpg", photo, None);
         holds.note(&edited, &Ok(Done::Skipped("changed on the destination side since the scan".into())));
         holds.note(&Action::copy(Side::Destination, "app/activity.log", Entry::file(7, 1), None), &Err(Error::Changed("changed".into())));
-        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/d.jpg", Entry::file(1, 1))), Some(Held::OldCopyOf("Photos 2025/d.jpg"))));
-        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/renamed.jpg", photo)), Some(Held::OldCopyOf("Photos 2025/d.jpg"))));
+        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/d.jpg", Entry::file(1, 1))), Some(Held::OldCopyOf("Photos 2025/d.jpg", Unlanded::Changed))));
+        assert!(matches!(holds.of(&removal(Side::Destination, "Photos/renamed.jpg", photo)), Some(Held::OldCopyOf("Photos 2025/d.jpg", Unlanded::Changed))));
         assert!(holds.of(&removal(Side::Destination, "old-project/big.mov", Entry::file(9_000, 5))).is_none());
         assert!(holds.of(&removal(Side::Destination, "old-project", Entry::dir())).is_none());
         assert!(holds.of(&removal(Side::Source, "Photos/d.jpg", photo)).is_none(), "the other side");
@@ -3229,6 +3279,118 @@ mod tests {
         holds.note(&Action::copy(Side::Destination, "a.jpg", photo, None), &Err(Error::Invalid("the drive failed".into())));
         assert!(matches!(holds.of(&removal(Side::Destination, "old-project/big.mov", Entry::file(9_000, 5))), Some(Held::Failed)));
         assert!(holds.of(&removal(Side::Source, "old-project/big.mov", Entry::file(9_000, 5))).is_none());
+    }
+
+    /// A removal held back because it may be the old copy of something that didn't land says
+    /// why that didn't land, truthfully: it changed, the item of another kind in its place
+    /// couldn't go first, or it only waits with the rest of its app library or database (a
+    /// database whose journal changed, say), which doesn't mean it changed.
+    #[test]
+    fn a_held_removal_says_why_what_it_may_be_the_old_copy_of_didnt_land() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let mut holds = Holds::default();
+        let copy = |path: &str, size: u64| Action::copy(Side::Destination, path, Entry::file(size, 1_600_000_000_000), None);
+        holds.note(&copy("app/data.db", 10), &Ok(Done::Waits("left for the next sync: another file of its database couldn't be synced".into())));
+        holds.note(&copy("app/data.db-wal", 20), &Ok(Done::Skipped("changed on the source side since the scan".into())));
+        holds.note(&copy("notes", 30), &Ok(Done::Blocked("left for the next sync: the item of another kind in its place couldn't go first".into())));
+        holds.note(&copy("report.txt", 40), &Err(Error::Changed("changed on the destination side since the scan".into())));
+        let why = |path: &str| {
+            let removal = Action::delete(Side::Destination, path, Entry::file(1, 1), None);
+            holds.of(&removal).map(|held| executor.why_held(held, Side::Destination))
+        };
+        assert_eq!(
+            why("old/data.db").as_deref(),
+            Some("kept for now: it may be the old copy of “app/data.db”, which waits for the next sync with the rest of its app library or database")
+        );
+        assert_eq!(
+            why("old/data.db-wal").as_deref(),
+            Some("kept for now: it may be the old copy of “app/data.db-wal”, which changed since the scan and wasn't copied to the destination yet")
+        );
+        assert_eq!(
+            why("Notes/notes").as_deref(),
+            Some("kept for now: it may be the old copy of “notes”, which wasn't copied to the destination yet: the item of another kind in its place there couldn't go first")
+        );
+        assert_eq!(
+            why("old/report.txt").as_deref(),
+            Some("kept for now: it may be the old copy of “report.txt”, which changed since the scan and wasn't copied to the destination yet")
+        );
+        assert_eq!(why("old/other.txt"), None);
+    }
+
+    /// The room a library's new versions need in the trash, once all are written next to
+    /// their targets (in a two-way job, which keeps every version it replaces). Each version
+    /// replaced is copied into the trash right before its new version takes its place. On a
+    /// local drive the old version's room is free again once it's removed: a Logic project
+    /// whose two takes, each taking 60% of the drive's spare room, were both recorded again
+    /// lands. One whose take is bigger than the whole drive can't: it waits, and the take is
+    /// named. A take with another name (a hard link, as backup apps make) keeps its room once
+    /// removed, and so may every take on a network share, whose server may keep a removed
+    /// file's data in a snapshot: each of those needs room of its own.
+    #[test]
+    fn a_library_needs_room_for_its_replaced_versions_as_the_drive_gives_it_back() {
+        let (tmp, shores) = shores();
+        let Some(room) = Room::of(&shores.destination) else {
+            eprintln!("SKIPPED a_library_needs_room_for_its_replaced_versions_as_the_drive_gives_it_back: the temporary folder's drive can't say how much room it has");
+            return;
+        };
+        let take = room.free.saturating_sub(room.reserve()) / 10 * 6;
+        if take == 0 {
+            eprintln!("SKIPPED a_library_needs_room_for_its_replaced_versions_as_the_drive_gives_it_back: the temporary folder's drive has no room to spare");
+            return;
+        }
+        let source = Snapshot::new();
+        let on = |kind: FsKind, network: bool| {
+            let mut destination = Snapshot::new();
+            destination.facts_mut().volume = Some(Volume {
+                kind,
+                fs: String::new(),
+                mount: "/x".into(),
+                name: "x".into(),
+                network,
+                case_sensitive: false,
+                case_guessed: false,
+                refuses_links: false,
+            });
+            destination
+        };
+        let (local, share) = (on(FsKind::Ext, false), on(FsKind::Smb, true));
+        let cancel = AtomicBool::new(false);
+        let unit = Unit::Package("Song.logicx".into());
+        let takes = |sizes: &[u64]| -> Vec<Action> {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(n, size)| Action::copy(Side::Destination, &format!("Song.logicx/take{n}.wav"), Entry::file(*size, 2_000), Some(Entry::file(*size, 1_000))))
+                .collect()
+        };
+        fs::create_dir_all(shores.destination.join("Song.logicx")).unwrap();
+        for n in 0..3 {
+            write(&shores.destination.join(format!("Song.logicx/take{n}.wav")), "the take as it was", 1_000);
+        }
+        let recorded_again = takes(&[take, take]);
+        let executor = Executor::new(&shores, &source, &local, KEEP, &cancel);
+        assert!(executor.room_for_replaced(&unit, &staged_in(&shores.destination, &recorded_again)).is_none(), "each take of {take} bytes fits on its own");
+        let too_big = takes(&[1_000, room.total, 2_000]);
+        let (at, e) = executor.room_for_replaced(&unit, &staged_in(&shores.destination, &too_big)).expect("the take bigger than the drive doesn't fit");
+        assert_eq!(at, 1, "the take that doesn't fit");
+        assert!(e.to_string().contains("to keep the replaced versions of “Song.logicx” in .charon-trash"), "{e}");
+
+        let executor = Executor::new(&shores, &source, &share, KEEP, &cancel);
+        let both = Room::shortage(&shores.destination, take * 2, "the destination's drive").is_some();
+        assert_eq!(executor.room_for_replaced(&unit, &staged_in(&shores.destination, &recorded_again)).is_some(), both, "both takes kept need room together");
+
+        if fs::hard_link(shores.destination.join("Song.logicx/take0.wav"), tmp.path().join("take0 in an older backup.wav")).is_err() {
+            eprintln!("SKIPPED a_library_needs_room_for_its_replaced_versions_as_the_drive_gives_it_back, hard links: the temporary folder's drive holds none");
+            return;
+        }
+        let executor = Executor::new(&shores, &source, &local, KEEP, &cancel);
+        assert!(
+            executor.room_for_replaced(&unit, &staged_in(&shores.destination, &recorded_again)).is_some(),
+            "the take with another name keeps its room: both takes kept need it together"
+        );
     }
 
     /// The last look opens a file only where its drive may still answer from what its

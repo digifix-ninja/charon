@@ -8,9 +8,9 @@ use crate::engine::{runs, Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
-use crate::run::{Copier, Found, Markers, Refused, Room, Trash, TrashLook, Unread};
+use crate::run::{Copier, Found, KeptCopies, Markers, Refused, Room, Trash, TrashLook, Unread};
 use crate::scan::{
-    is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, Scanner, Snapshot,
+    is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, Keys, Refusal, Scanner, Snapshot,
     Volume,
 };
 use crate::store::Memory;
@@ -554,13 +554,12 @@ impl Engine {
             }
         }
         for &side in Survey::written_sides(&setup) {
-            let clones = match side {
+            let volume = match side {
                 Side::Source => &source,
                 Side::Destination => &destination,
             }
-            .volume()
-            .is_some_and(|v| v.kind == FsKind::Apfs);
-            let bytes = Self::bytes_onto(&setup, &plan, side, clones);
+            .volume();
+            let bytes = Self::bytes_onto(&setup, &plan, side, volume);
             if bytes == 0 {
                 continue;
             }
@@ -1072,26 +1071,31 @@ impl Engine {
         ))
     }
 
-    /// What a sync writes onto `side`'s drive: its copies there, and the copies of the
-    /// versions they replace that go into .charon-trash (none where those are clones).
-    fn bytes_onto(setup: &JobSetup, plan: &Plan, side: Side, clones: bool) -> u64 {
+    /// The room a sync needs on `side`'s drive (`volume`): its copies there, and the room the
+    /// copies of the versions they replace that go into .charon-trash take there at one time
+    /// (see `KeptCopies`). Each of those is copied into the trash right before its new version
+    /// takes its place. Whether a replaced file has other names (hard links), which keep its
+    /// room, isn't in the scan: the run asks the drive before an app library or database lands.
+    fn bytes_onto(setup: &JobSetup, plan: &Plan, side: Side, volume: Option<&Volume>) -> u64 {
         let keeps_replaced = setup.safe_delete || setup.mode.is_two_way();
-        plan.work()
-            .map(|action| match action {
+        let mut copies = 0u64;
+        let mut replaced = Vec::new();
+        for action in plan.work() {
+            match action {
                 Action::Copy { to, bytes, existing, settles_conflict, .. } if *to == side => {
-                    let kept = match existing {
-                        Some(old) if old.is_file() && !clones && (keeps_replaced || *settles_conflict) => old.size,
-                        _ => 0,
-                    };
-                    bytes + kept
+                    copies = copies.saturating_add(*bytes);
+                    replaced.extend(existing.filter(|old| old.is_file() && (keeps_replaced || *settles_conflict)).map(|old| (old.size, true)));
                 }
-                Action::KeepBoth { source_bytes, destination_bytes, .. } => match side {
-                    Side::Destination => *source_bytes,
-                    Side::Source => *destination_bytes,
-                },
-                _ => 0,
-            })
-            .fold(0u64, u64::saturating_add)
+                Action::KeepBoth { source_bytes, destination_bytes, .. } => {
+                    copies = copies.saturating_add(match side {
+                        Side::Destination => *source_bytes,
+                        Side::Source => *destination_bytes,
+                    });
+                }
+                _ => {}
+            }
+        }
+        copies.saturating_add(KeptCopies::on(volume).room(replaced))
     }
 
     /// The drive of the job's `side` folder. Where the drive can't be asked how it treats
@@ -1292,6 +1296,54 @@ mod tests {
         plan.push(Action::copy(Side::Destination, "Talk.key/Index.zip", file, None));
         let warning = Engine::units_warning(&setup, &plan, &source, &Snapshot::new()).unwrap();
         assert!(warning.starts_with("“Talk.key” is an app library or document."), "{warning}");
+    }
+
+    /// The room a sync needs on a drive, as the list says when it won't fit: its copies, and
+    /// the versions they replace that are kept in .charon-trash. Each of those is copied into
+    /// the trash right before its new version takes its place: on a local drive the old
+    /// version gives its room back once removed, so the largest of them needs room, and on a
+    /// network share, whose server may keep a removed file's data in a snapshot, all of them
+    /// do. Where kept copies are clones (APFS), or none are kept, only the copies count.
+    #[test]
+    fn a_sync_needs_room_for_its_copies_and_the_versions_it_keeps_as_the_drive_takes_them() {
+        use crate::model::{SyncMode, Trigger};
+        use crate::scan::FsKind;
+        let drive = |kind: FsKind, network: bool| Volume {
+            kind,
+            fs: String::new(),
+            mount: "/x".into(),
+            name: "x".into(),
+            network,
+            case_sensitive: false,
+            case_guessed: false,
+            refuses_links: false,
+        };
+        let (local, share, mac) = (drive(FsKind::Ntfs, false), drive(FsKind::Smb, true), drive(FsKind::Apfs, false));
+        let setup = |mode: SyncMode, safe_delete: bool| JobSetup {
+            name: String::new(),
+            source: "/a".into(),
+            destination: "/b".into(),
+            mode,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete,
+            full_automation: false,
+        };
+        let mut plan = Plan::default();
+        plan.push(Action::copy(Side::Destination, "Song.logicx/a.wav", Entry::file(4_000, 2_000), Some(Entry::file(3_000, 1_000))));
+        plan.push(Action::copy(Side::Destination, "Song.logicx/b.wav", Entry::file(5_000, 2_000), Some(Entry::file(6_000, 1_000))));
+        plan.push(Action::copy(Side::Destination, "notes.txt", Entry::file(100, 2_000), None));
+        plan.push(Action::copy(Side::Source, "todo.txt", Entry::file(7, 2_000), None));
+        let two_way = setup(SyncMode::TwoWay, false);
+        let bytes = |setup: &JobSetup, side: Side, volume: &Volume| Engine::bytes_onto(setup, &plan, side, Some(volume));
+        assert_eq!(bytes(&two_way, Side::Destination, &local), 9_100 + 6_000, "the copies, and the larger take kept");
+        assert_eq!(bytes(&two_way, Side::Destination, &share), 9_100 + 3_000 + 6_000, "the copies, and both takes kept");
+        assert_eq!(Engine::bytes_onto(&two_way, &plan, Side::Destination, None), 9_100 + 3_000 + 6_000, "a drive that couldn't be asked");
+        assert_eq!(bytes(&two_way, Side::Destination, &mac), 9_100, "clones take no room");
+        assert_eq!(bytes(&two_way, Side::Source, &share), 7);
+        assert_eq!(bytes(&setup(SyncMode::Mirror, false), Side::Destination, &share), 9_100, "nothing replaced is kept");
+        assert_eq!(bytes(&setup(SyncMode::Mirror, true), Side::Destination, &local), 9_100 + 6_000);
     }
 
     #[test]

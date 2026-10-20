@@ -237,6 +237,16 @@ impl Volume {
         !self.network && (self.kind != FsKind::Other || matches!(self.fs.as_str(), "tmpfs" | "overlay"))
     }
 
+    /// Whether a file removed from this drive gives its room back at once. A file system that
+    /// may keep snapshots (APFS, Btrfs, ZFS, ReFS) can go on holding a removed file's data,
+    /// and so can a network share's server, an overlay whose file came from a layer below, or
+    /// a drive Charon doesn't know.
+    pub fn frees_removed_files(&self) -> bool {
+        !self.network
+            && (matches!(self.kind, FsKind::Hfs | FsKind::Fat | FsKind::Exfat | FsKind::Ntfs | FsKind::Ext | FsKind::Xfs)
+                || matches!(self.fs.as_str(), "tmpfs" | "fuseblk"))
+    }
+
     /// Whether symbolic links can be created here.
     pub fn holds_links(&self) -> bool {
         !self.refuses_links && !matches!(self.kind, FsKind::Fat | FsKind::Exfat)
@@ -738,6 +748,23 @@ mod tests {
         assert_eq!(Refusal::of_writing(&error(libc::EFBIG)), Some(Refusal::TooBig));
         assert_eq!(Refusal::of_writing(&error(libc::EINVAL)), None);
         assert!(Refusal::Name.reason("Stick (exFAT)").contains("Stick (exFAT)"));
+    }
+
+    /// A removed file's room comes back at once only on drives that keep no snapshots and
+    /// that Charon sees itself: a network share's server may keep one, whatever its kind.
+    #[test]
+    fn only_drives_without_snapshots_give_a_removed_files_room_back() {
+        for kind in [FsKind::Hfs, FsKind::Fat, FsKind::Exfat, FsKind::Ntfs, FsKind::Ext, FsKind::Xfs] {
+            assert!(volume(kind).frees_removed_files(), "{kind:?}");
+            assert!(!Volume { network: true, ..volume(kind) }.frees_removed_files(), "{kind:?} on a network share");
+        }
+        for kind in [FsKind::Apfs, FsKind::Btrfs, FsKind::Zfs, FsKind::Refs, FsKind::Smb, FsKind::Nfs, FsKind::Afp, FsKind::Other] {
+            assert!(!volume(kind).frees_removed_files(), "{kind:?}");
+        }
+        assert!(Volume { fs: "tmpfs".into(), ..volume(FsKind::Other) }.frees_removed_files());
+        assert!(Volume { fs: "fuseblk".into(), ..volume(FsKind::Other) }.frees_removed_files(), "NTFS or exFAT through a program");
+        assert!(!Volume { fs: "overlay".into(), ..volume(FsKind::Other) }.frees_removed_files());
+        assert!(!Volume { fs: "fuse.sshfs".into(), ..volume(FsKind::Other) }.frees_removed_files());
     }
 
     #[test]

@@ -7,8 +7,13 @@
 //!
 //! On a Mac, the drive's room that the system can free by itself (caches, local Time
 //! Machine snapshots, iCloud files kept online only) counts as free too: Finder counts it.
+//!
+//! A sync that replaces several files on a drive keeps a copy of each replaced version in
+//! .charon-trash, made right before its new version takes its place. How much room those
+//! copies need at one time depends on the drive (see `KeptCopies`).
 
 use crate::model::human_bytes;
+use crate::scan::{FsKind, Volume};
 use std::path::Path;
 
 /// The room on one drive, in bytes.
@@ -57,6 +62,53 @@ impl Room {
                 human_bytes(room.reserve())
             )
         })
+    }
+}
+
+/// How the copies of replaced versions that a sync keeps in .charon-trash take room on a
+/// drive, where it replaces one file after the other: each copy is made right before its new
+/// version takes the old version's place, and the old version is removed then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeptCopies {
+    /// The copies are clones (APFS): they take no room.
+    Clones,
+    /// Each old version gives its room back once it's removed: only the largest copy needs
+    /// room at one time, but for those of files with hard links, which keep theirs.
+    OneAtATime,
+    /// A removed file's data may stay on the drive (in a snapshot, or on a network share's
+    /// server), or Charon doesn't know the drive: every copy needs room of its own.
+    All,
+}
+
+impl KeptCopies {
+    /// How kept copies take room on `volume` (`None`: a drive that couldn't be asked).
+    pub fn on(volume: Option<&Volume>) -> KeptCopies {
+        match volume {
+            Some(volume) if volume.kind == FsKind::Apfs => KeptCopies::Clones,
+            Some(volume) if volume.frees_removed_files() => KeptCopies::OneAtATime,
+            _ => KeptCopies::All,
+        }
+    }
+
+    /// The most room that keeping copies of the `replaced` versions, one after the other,
+    /// takes at one time. Each is given by its size and whether removing it gives its room
+    /// back: a file with hard links doesn't, its data stays under its other names.
+    pub fn room(self, replaced: impl IntoIterator<Item = (u64, bool)>) -> u64 {
+        match self {
+            KeptCopies::Clones => 0,
+            KeptCopies::OneAtATime => {
+                let (mut held, mut largest) = (0u64, 0u64);
+                for (size, gives_back) in replaced {
+                    if gives_back {
+                        largest = largest.max(size);
+                    } else {
+                        held = held.saturating_add(size);
+                    }
+                }
+                held.saturating_add(largest)
+            }
+            KeptCopies::All => replaced.into_iter().fold(0, |room, (size, _)| room.saturating_add(size)),
+        }
     }
 }
 
@@ -199,6 +251,43 @@ mod tests {
         let big = Room { free: 100 << 30, total: 2 << 40 };
         assert_eq!(big.reserve(), 2_000_000_000, "at most 2 GB");
         assert!(!Room { free: 10, total: 100 }.fits(u64::MAX), "never overflows");
+    }
+
+    /// Keeping the replaced versions of a sync takes the room of the largest of them where
+    /// each gives its room back once removed (with those of files with hard links on top),
+    /// of all of them where the drive may hold on to a removed file's data, and none where
+    /// the copies are clones.
+    #[test]
+    fn kept_copies_take_room_as_their_drive_gives_it_back() {
+        let drive = |kind: FsKind, fs: &str, network: bool| Volume {
+            kind,
+            fs: fs.into(),
+            mount: "/x".into(),
+            name: "x".into(),
+            network,
+            case_sensitive: false,
+            case_guessed: false,
+            refuses_links: false,
+        };
+        let on = |volume: Volume| KeptCopies::on(Some(&volume));
+        assert_eq!(on(drive(FsKind::Apfs, "apfs", false)), KeptCopies::Clones);
+        assert_eq!(on(drive(FsKind::Ntfs, "NTFS", false)), KeptCopies::OneAtATime);
+        assert_eq!(on(drive(FsKind::Ext, "ext4", false)), KeptCopies::OneAtATime);
+        assert_eq!(on(drive(FsKind::Exfat, "exfat", false)), KeptCopies::OneAtATime);
+        assert_eq!(on(drive(FsKind::Btrfs, "btrfs", false)), KeptCopies::All, "a snapshot may hold on to it");
+        assert_eq!(on(drive(FsKind::Smb, "smbfs", true)), KeptCopies::All, "so may a network share's server");
+        assert_eq!(KeptCopies::on(None), KeptCopies::All);
+        let given_back = [(3_000, true), (6_000, true), (4_000, true)];
+        assert_eq!(KeptCopies::Clones.room(given_back), 0);
+        assert_eq!(KeptCopies::OneAtATime.room(given_back), 6_000);
+        assert_eq!(KeptCopies::All.room(given_back), 13_000);
+        let one_hard_linked = [(3_000, true), (6_000, true), (4_000, false)];
+        assert_eq!(KeptCopies::OneAtATime.room(one_hard_linked), 6_000 + 4_000, "the hard-linked file keeps its room");
+        assert_eq!(KeptCopies::All.room(one_hard_linked), 13_000);
+        assert_eq!(KeptCopies::Clones.room(one_hard_linked), 0);
+        assert_eq!(KeptCopies::OneAtATime.room([]), 0);
+        assert_eq!(KeptCopies::All.room([(u64::MAX, true), (1, true)]), u64::MAX, "never overflows");
+        assert_eq!(KeptCopies::OneAtATime.room([(u64::MAX, false), (1, true)]), u64::MAX);
     }
 
     #[test]
