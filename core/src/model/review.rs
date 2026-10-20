@@ -249,7 +249,8 @@ pub struct UpgradedJob {
     pub trigger: Trigger,
 }
 
-/// A job whose changes wait for the person's OK, for a notification.
+/// A job whose changes wait for the person's OK, or whose files wait to be compared, for a
+/// notification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WaitingJob {
@@ -259,6 +260,18 @@ pub struct WaitingJob {
     pub removals: u64,
     /// Items changed on both sides, waiting for the person to choose.
     pub conflicts: u64,
+    /// Files the last look couldn't compare by their contents yet: the list reads them.
+    pub uncompared: u64,
+    /// A run nobody looked at was held back: the job waits for the person's OK.
+    pub held: bool,
     /// The job looks when its drive is connected: the person may be about to eject it.
     pub drive_connected: bool,
+}
+
+impl WaitingJob {
+    /// Whether all that waits is files the last look couldn't compare yet (see
+    /// `Waiting::only_to_compare`).
+    pub fn only_to_compare(&self) -> bool {
+        !self.held && self.items == 0 && self.conflicts == 0 && self.uncompared > 0
+    }
 }

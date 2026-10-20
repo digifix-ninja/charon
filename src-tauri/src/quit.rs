@@ -1,8 +1,9 @@
-//! Quitting: asks first when changes still wait for the person's OK, and always lets running
-//! syncs stop between two steps, so what they carried is recorded and the two-way memory
-//! stays trustworthy.
+//! Quitting: asks first when changes still wait for the person's OK or files wait to be
+//! compared, and always lets running syncs stop between two steps, so what they carried is
+//! recorded and the two-way memory stays trustworthy.
 
 use crate::state::AppState;
+use charon_core::Overview;
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -14,8 +15,20 @@ const STOP_WAIT: Duration = Duration::from_secs(30);
 
 /// Payload of the "confirm-quit" event.
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ConfirmQuit {
+    /// Jobs whose changes wait for the person's OK.
     jobs: usize,
+    /// Jobs with nothing else waiting but files the last look couldn't compare yet: they
+    /// may differ, and may as well be identical.
+    to_compare: usize,
+}
+
+impl ConfirmQuit {
+    /// What the window asks before Charon quits, when any job's list waits for the person.
+    fn of(overview: &Overview) -> Option<Self> {
+        (overview.lists_waiting() > 0).then_some(Self { jobs: overview.waiting, to_compare: overview.to_compare })
+    }
 }
 
 /// Payload of the "quitting" event: the syncs Charon stops before it goes.
@@ -34,17 +47,17 @@ impl Quit {
         Self { ready: AtomicBool::new(false) }
     }
 
-    /// The tray's Quit: when jobs have changes waiting for an OK, the window asks first
-    /// (it answers with `quit_app`); otherwise Charon quits. The rows it counts ask the disk
-    /// (a network share that doesn't answer takes a while), so not on the thread that draws
-    /// the menu bar and the window.
+    /// The tray's Quit: when jobs have changes waiting for an OK, or files to compare, the
+    /// window asks first (it answers with `quit_app`); otherwise Charon quits. The rows it
+    /// counts ask the disk (a network share that doesn't answer takes a while), so not on the
+    /// thread that draws the menu bar and the window.
     pub fn ask(app: &AppHandle) {
         let app = app.clone();
         std::thread::spawn(move || {
-            let waiting = app.try_state::<AppState>().map(|state| state.engine.overview().waiting).unwrap_or(0);
-            if waiting > 0 {
+            let question = app.try_state::<AppState>().and_then(|state| ConfirmQuit::of(&state.engine.overview()));
+            if let Some(question) = question {
                 crate::show_main_window(&app);
-                let _ = app.emit("confirm-quit", ConfirmQuit { jobs: waiting });
+                let _ = app.emit("confirm-quit", question);
             } else {
                 Self::now(&app);
             }
@@ -92,5 +105,21 @@ impl Quit {
         if let Some(quit) = app.try_state::<Quit>() {
             quit.ready.store(true, Ordering::SeqCst);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Files a look couldn't compare yet are no changes that haven't crossed: the window asks
+    /// about them in their own words.
+    #[test]
+    fn quitting_tells_files_to_compare_from_changes_waiting_for_an_ok() {
+        let asked = |overview: Overview| ConfirmQuit::of(&overview).map(|question| (question.jobs, question.to_compare));
+        assert_eq!(asked(Overview { jobs: 2, ..Overview::default() }), None);
+        assert_eq!(asked(Overview { jobs: 2, to_compare: 1, ..Overview::default() }), Some((0, 1)));
+        assert_eq!(asked(Overview { jobs: 2, waiting: 1, to_compare: 1, ..Overview::default() }), Some((1, 1)));
+        assert_eq!(asked(Overview { jobs: 2, waiting: 2, ..Overview::default() }), Some((2, 0)));
     }
 }

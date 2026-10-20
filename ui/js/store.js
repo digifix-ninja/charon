@@ -9,12 +9,19 @@ const isAny = (...statuses) => job => statuses.includes(job.status);
 export const needsYou = job => job.status === "error" || job.status === "conflict" || job.conflicts?.length > 0
   || (job.status !== "offline" && job.status !== "syncing" && Boolean(job.problem || job.lastRun?.error));
 
+/**
+ * Whether all that waits is files the last look couldn't compare yet, as Rust's
+ * `Waiting::only_to_compare` says: the list compares them, and may well find nothing to confirm.
+ */
+export const onlyToCompare = waiting => !waiting.held && !waiting.items && !waiting.conflicts && waiting.uncompared > 0;
+
 /** The overview tiles and which jobs each one counts. */
 export const GROUPS = [
   { key: "all", label: "Jobs", tone: "var(--text-dim)", match: () => true },
   { key: "in-sync", label: "In sync", tone: "var(--in-sync)", match: isAny("in-sync") },
   { key: "syncing", label: "Crossing", tone: "var(--syncing)", match: isAny("syncing") },
-  { key: "your-ok", label: "Your OK", tone: "var(--review)", match: job => Boolean(job.waiting) },
+  // Jobs whose list waits for the person: changes to confirm, a run held back, or files to compare.
+  { key: "to-review", label: "To review", tone: "var(--review)", match: job => Boolean(job.waiting) },
   { key: "queued", label: "Queued", tone: "var(--pending)", match: isAny("pending", "new", "paused", "offline", "looking") },
   { key: "attention", label: "Need you", tone: "var(--error)", match: needsYou },
 ];
@@ -159,7 +166,7 @@ export class JobStore {
     return this.order.map(id => this.jobs.get(id)).filter(Boolean);
   }
 
-  /** The jobs whose changes wait for the person's OK. */
+  /** The jobs whose lists wait for the person: changes to confirm, or files to compare. */
   waiting() {
     return this.all().filter(job => job.waiting);
   }

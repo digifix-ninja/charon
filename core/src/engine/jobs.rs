@@ -111,6 +111,10 @@ impl Engine {
                 // The record names its folders and the destination's marker, so it isn't used.
                 log::warn!("couldn't forget the copies whose dates didn't stick for job {id}: {e}");
             }
+            if let Err(e) = self.inner.same_contents.forget(id) {
+                // The record names its folders, so it isn't used.
+                log::warn!("couldn't forget the files found identical for job {id}: {e}");
+            }
             if let Err(e) = self.inner.unattended.forget(id) {
                 // A count for other folders only makes the guard more careful.
                 log::warn!("couldn't start the count of automatic changes of job {id} again: {e}");
@@ -203,6 +207,9 @@ impl Engine {
         }
         if let Err(e) = self.inner.landings.forget(id) {
             log::warn!("couldn't forget the copies whose dates didn't stick for job {id}: {e}");
+        }
+        if let Err(e) = self.inner.same_contents.forget(id) {
+            log::warn!("couldn't forget the files found identical for job {id}: {e}");
         }
         if let Err(e) = self.inner.unattended.forget(id) {
             log::warn!("couldn't forget the count of automatic changes of job {id}: {e}");

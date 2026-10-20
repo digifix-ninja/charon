@@ -5,7 +5,7 @@ import { Dom } from "./dom.js";
 import { paintIcons } from "./icons.js";
 import { Platform } from "./platform.js";
 import { Theme } from "./theme.js";
-import { JobStore } from "./store.js";
+import { JobStore, onlyToCompare } from "./store.js";
 import { Toast } from "./toast.js";
 import { River } from "./effects/river.js";
 import { Header } from "./views/header.js";
@@ -174,12 +174,22 @@ class App {
     work();
   }
 
-  /** The tray's Quit while jobs wait: review them, or quit anyway. */
-  async confirmQuit({ jobs } = {}) {
-    const count = jobs ?? this.store.waiting().length;
+  /**
+   * The tray's Quit while jobs wait: review them, or quit anyway. Files a look couldn't
+   * compare yet are no changes that haven't crossed: they're told apart.
+   */
+  async confirmQuit({ jobs, toCompare } = {}) {
+    const waiting = this.store.waiting();
+    const changes = jobs ?? waiting.filter(job => !onlyToCompare(job.waiting)).length;
+    const compare = toCompare ?? waiting.length - changes;
+    const more = compare === 1 ? "1 more job has" : `${compare} more jobs have`;
     const answer = await Modal.ask({
-      title: count === 1 ? "1 job has changes that haven't crossed yet." : `${count} jobs have changes that haven't crossed yet.`,
-      body: "Nothing crosses while Charon is closed. The changes stay where they are until you confirm them.",
+      title: changes
+        ? (changes === 1 ? "1 job has changes that haven't crossed yet." : `${changes} jobs have changes that haven't crossed yet.`)
+        : (compare === 1 ? "1 job has files that aren't compared yet." : `${compare} jobs have files that aren't compared yet.`),
+      body: changes
+        ? `Nothing crosses while Charon is closed. The changes stay where they are until you confirm them.${compare ? ` ${more} files that aren't compared yet: their copies on the two sides may differ.` : ""}`
+        : "Their copies on the two sides may differ. Charon compares them when you look at the list, and nothing crosses while it's closed.",
       buttons: [
         { label: "Quit anyway", value: "quit" },
         { label: "Review now", value: "review", kind: "primary", focus: true },

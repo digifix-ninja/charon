@@ -1,7 +1,7 @@
 // The title bar's status line, the "Pause all" button and the overview tiles.
 
 import { Dom } from "../dom.js";
-import { GROUPS, needsYou } from "../store.js";
+import { GROUPS, needsYou, onlyToCompare } from "../store.js";
 import { Counter } from "../effects/counter.js";
 import { Icons } from "../icons.js";
 
@@ -72,7 +72,8 @@ export class Header {
     return {
       ...overview,
       jobs: Math.max(overview.jobs ?? 0, jobs.length),
-      waiting: most("waiting", job => job.waiting),
+      waiting: most("waiting", job => job.waiting && !onlyToCompare(job.waiting)),
+      toCompare: most("toCompare", job => job.waiting && onlyToCompare(job.waiting)),
       attention: most("attention", needsYou),
       looking: most("looking", job => job.status === "looking"),
       incomplete: most("incomplete", job => job.unreadable?.length || job.notSyncedCount || job.notSynced?.length),
@@ -85,7 +86,7 @@ export class Header {
     if (o.jobs === 0) return "empty";
     if (o.syncing) return "syncing";
     if (o.attention) return "attention";
-    if (o.waiting) return "review";
+    if (o.waiting || o.toCompare) return "review";
     if (o.pausedAll) return "paused";
     if (o.pending || o.incomplete) return "pending";
     if (o.looking) return "looking";
@@ -95,13 +96,16 @@ export class Header {
   /** One line about everything. Never calm while anything waits, needs you, or isn't known yet. */
   describe(o) {
     const waits = o.waiting === 1 ? "1 job waits for your OK" : `${o.waiting} jobs wait for your OK`;
+    const compare = o.toCompare === 1 ? "1 job has files to compare" : `${o.toCompare} jobs have files to compare`;
+    // What waits for the person: changes to confirm, files to compare, or both.
+    const asks = [o.waiting && waits, o.toCompare && compare].filter(Boolean).join(" · ");
     const need = `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
     if (o.problem) return "Charon needs your attention";
     if (o.jobs === 0) return "No crossings yet. Create your first sync job.";
-    if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing${o.waiting ? ` · ${waits}` : ""}`;
-    if (o.attention) return o.waiting ? `${need} · ${waits}` : need;
-    if (o.pausedAll) return o.waiting ? `Everything is paused · ${waits}` : "Everything is paused";
-    if (o.waiting) return waits;
+    if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing${asks ? ` · ${asks}` : ""}`;
+    if (o.attention) return asks ? `${need} · ${asks}` : need;
+    if (o.pausedAll) return asks ? `Everything is paused · ${asks}` : "Everything is paused";
+    if (asks) return asks;
     if (o.pending) return `${o.pending} ${o.pending === 1 ? "job has" : "jobs have"} changes queued`;
     if (o.incomplete) return `${o.incomplete} ${o.incomplete === 1 ? "job doesn't" : "jobs don't"} sync everything`;
     if (o.looking) return "Looking for changes…";

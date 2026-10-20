@@ -76,6 +76,9 @@ impl Progress {
 pub struct Pending {
     pub items: u64,
     pub bytes: u64,
+    /// Files the check couldn't compare by their contents yet (they may differ): the next
+    /// sync reads them. Not among `items`.
+    pub uncompared: u64,
     pub checked_at: DateTime<Utc>,
 }
 
@@ -344,12 +347,23 @@ pub struct Waiting {
     pub conflicts: u64,
     /// Why a run nobody looked at was held back for a look, if one was.
     pub held: Option<String>,
+    /// Files the last look couldn't compare by their contents yet (they may differ): the list
+    /// reads them. Not among `items`.
+    pub uncompared: u64,
     /// Since when changes have been waiting.
     pub since: DateTime<Utc>,
     /// False when the numbers above aren't known yet: changes waited for an OK when Charon
     /// last looked, before it was closed (or before a folder went away), and it hasn't
     /// looked again since.
     pub counted: bool,
+}
+
+impl Waiting {
+    /// Whether all that waits is files the last look couldn't compare yet: the list compares
+    /// them, and may well find nothing to confirm.
+    pub fn only_to_compare(&self) -> bool {
+        self.held.is_none() && self.items == 0 && self.conflicts == 0 && self.uncompared > 0
+    }
 }
 
 /// A place the last look couldn't read or had to leave out: nothing there is synced.
@@ -460,8 +474,11 @@ pub struct Overview {
     pub jobs: usize,
     pub syncing: usize,
     pub pending: usize,
-    /// Jobs with changes waiting for the person's OK.
+    /// Jobs with changes waiting for the person's OK, or held back for it.
     pub waiting: usize,
+    /// Jobs with nothing else waiting for the person but files the last look couldn't compare
+    /// yet (see `Waiting::only_to_compare`).
+    pub to_compare: usize,
     /// Jobs that need the person (see `JobView::needs_you`).
     pub attention: usize,
     pub offline: usize,
@@ -483,7 +500,8 @@ impl Overview {
             jobs: views.len(),
             syncing: count(&[JobStatus::Syncing]),
             pending: count(&[JobStatus::Pending]),
-            waiting: views.iter().filter(|v| v.waiting.is_some()).count(),
+            waiting: views.iter().filter(|v| v.waiting.as_ref().is_some_and(|w| !w.only_to_compare())).count(),
+            to_compare: views.iter().filter(|v| v.waiting.as_ref().is_some_and(Waiting::only_to_compare)).count(),
             attention: views.iter().filter(|v| v.needs_you()).count(),
             offline: count(&[JobStatus::Offline]),
             looking: count(&[JobStatus::Looking]),
@@ -491,6 +509,11 @@ impl Overview {
             paused_all,
             problem,
         }
+    }
+
+    /// Jobs whose lists wait for the person: changes to confirm, or files to compare.
+    pub fn lists_waiting(&self) -> usize {
+        self.waiting + self.to_compare
     }
 
     /// A short sentence, e.g. "Syncing 2 jobs" or "All in sync".
@@ -502,19 +525,8 @@ impl Overview {
             "No sync jobs yet".into()
         } else if self.syncing > 0 {
             format!("Syncing {}", plural(self.syncing as u64, "job"))
-        } else if self.attention > 0 && self.waiting > 0 {
-            // Changes that wait for an OK are never hidden behind a job that needs attention.
-            format!(
-                "{} need{} attention, {} wait{} for your OK",
-                plural(self.attention as u64, "job"),
-                if self.attention == 1 { "s" } else { "" },
-                human_count(self.waiting as u64),
-                if self.waiting == 1 { "s" } else { "" }
-            )
-        } else if self.attention > 0 {
-            format!("{} need{} attention", plural(self.attention as u64, "job"), if self.attention == 1 { "s" } else { "" })
-        } else if self.waiting > 0 {
-            format!("{} wait{} for your OK", plural(self.waiting as u64, "job"), if self.waiting == 1 { "s" } else { "" })
+        } else if let Some(asks) = self.asks() {
+            asks
         } else if self.paused_all {
             "Everything paused".into()
         } else if self.pending > 0 {
@@ -529,6 +541,28 @@ impl Overview {
         } else {
             "All in sync".into()
         }
+    }
+
+    /// What the jobs that wait for the person wait for, each kind named, so that none is
+    /// hidden behind another: "1 job needs attention, 2 wait for your OK, 1 has files to
+    /// compare". `None` when no job waits for the person.
+    fn asks(&self) -> Option<String> {
+        let kinds = [
+            (self.attention, "needs attention", "need attention"),
+            (self.waiting, "waits for your OK", "wait for your OK"),
+            (self.to_compare, "has files to compare", "have files to compare"),
+        ];
+        let asks: Vec<String> = kinds
+            .into_iter()
+            .filter(|(jobs, ..)| *jobs > 0)
+            .enumerate()
+            .map(|(i, (jobs, one, more))| {
+                // The first one names what is counted.
+                let count = if i == 0 { plural(jobs as u64, "job") } else { human_count(jobs as u64) };
+                format!("{count} {}", if jobs == 1 { one } else { more })
+            })
+            .collect();
+        (!asks.is_empty()).then(|| asks.join(", "))
     }
 }
 
@@ -678,11 +712,44 @@ mod tests {
         assert_eq!(headline(&[in_sync, row(JobStatus::Paused)], true), "Everything paused");
     }
 
+    /// A job whose look left only files it couldn't compare yet doesn't wait for an OK: its
+    /// list may well find both copies identical, and have nothing to confirm.
+    #[test]
+    fn jobs_with_only_files_to_compare_are_not_said_to_wait_for_an_ok() {
+        let waiting = |items: u64, conflicts: u64, uncompared: u64, held: Option<&str>| Waiting {
+            items,
+            bytes: 0,
+            removals: PerSide::default(),
+            replacements: PerSide::default(),
+            conflicts,
+            held: held.map(str::to_string),
+            uncompared,
+            since: Utc::now(),
+            counted: true,
+        };
+        let row_waiting = |waiting: Waiting| JobView { waiting: Some(waiting), ..row(JobStatus::Review) };
+        let videos = row_waiting(waiting(0, 0, 1, None));
+        let overview = Overview::of(std::slice::from_ref(&videos), false, None);
+        assert_eq!((overview.waiting, overview.to_compare), (0, 1));
+        assert_eq!(overview.headline(), "1 job has files to compare");
+        assert_eq!(Overview::of(&[videos.clone(), videos.clone()], false, None).headline(), "2 jobs have files to compare");
+
+        // Changes, a conflict or a hold wait for an OK, whatever else waits too.
+        for other in [waiting(3, 0, 1, None), waiting(0, 1, 1, None), waiting(0, 0, 1, Some("Charon stopped the sync."))] {
+            let overview = Overview::of(&[videos.clone(), row_waiting(other)], false, None);
+            assert_eq!((overview.waiting, overview.to_compare), (1, 1));
+            assert_eq!(overview.headline(), "1 job waits for your OK, 1 has files to compare");
+        }
+    }
+
     #[test]
     fn changes_waiting_for_an_ok_are_never_hidden_behind_jobs_that_need_attention() {
         let overview = Overview { jobs: 4, attention: 1, waiting: 2, ..Default::default() };
         assert_eq!(overview.headline(), "1 job needs attention, 2 wait for your OK");
         assert_eq!(Overview { waiting: 0, ..overview.clone() }.headline(), "1 job needs attention");
-        assert_eq!(Overview { attention: 0, ..overview }.headline(), "2 jobs wait for your OK");
+        assert_eq!(Overview { attention: 0, ..overview.clone() }.headline(), "2 jobs wait for your OK");
+        // Nor are files to compare, which wait for the person too.
+        assert_eq!(Overview { waiting: 0, to_compare: 1, ..overview.clone() }.headline(), "1 job needs attention, 1 has files to compare");
+        assert_eq!(Overview { jobs: 6, attention: 2, to_compare: 3, ..overview }.headline(), "2 jobs need attention, 2 wait for your OK, 3 have files to compare");
     }
 }

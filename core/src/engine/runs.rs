@@ -971,7 +971,7 @@ impl Engine {
         let setup = &survey.setup;
         let now = Markers::read(&setup.source, &setup.destination, id);
         if let Some(side) = now.changed_since(&survey.markers) {
-            let _ = self.inner.baselines.forget(id);
+            self.forget_memory(id);
             return Err(format!(
                 "Charon's marker in the {} folder changed during the sync, so it may be another drive under the same name. \
                  Charon recorded nothing of this sync: its next look compares both folders afresh and waits for your OK.",
@@ -1009,7 +1009,7 @@ impl Engine {
         };
         let fail = |what: String| {
             // Without both markers and the memory, the next look starts afresh (it removes nothing).
-            let _ = self.inner.baselines.forget(id);
+            self.forget_memory(id);
             format!("The changes were synced, but Charon {what}, so it won't remember this sync: its next look compares both folders afresh and waits for your OK.")
         };
         for (side, token) in [(Side::Source, &tokens.0), (Side::Destination, &tokens.1)] {
@@ -1017,6 +1017,11 @@ impl Engine {
                 return Err(fail(format!("couldn't leave its marker in the {} ({e})", side.word())));
             }
         }
+        // The folders are the ones the sync's look read (their markers didn't change during
+        // the sync), and now carry the new markers: what this session read in them still holds.
+        let marker = |side: Side, token: &str| Found::Marker(Marker::new(id, side, token, generation));
+        let written = Markers { source: marker(Side::Source, &tokens.0), destination: marker(Side::Destination, &tokens.1) };
+        self.change_known_runtime(id, |rt| rt.reads.carry(&survey.markers, written));
         // Pairs found to differ though they look alike, still without a record: the next
         // look reads them again (a list that settles one item keeps the others).
         let found = match crossing.kind {
@@ -1026,6 +1031,13 @@ impl Engine {
         let unsettled = found.into_iter().filter(|key| !next.contains(key)).collect();
         let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default(), unsettled };
         self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
+    }
+
+    /// Forgets the two-way memory of the job's last sync, and the files found identical with
+    /// it (see `store::SameContents`): the next look compares both folders afresh.
+    fn forget_memory(&self, id: &JobId) {
+        let _ = self.inner.baselines.forget(id);
+        let _ = self.inner.same_contents.forget(id);
     }
 
     /// After an item was settled while Charon couldn't trust its memory (see `remember`):
@@ -1418,6 +1430,7 @@ impl Survey {
             left_for_later: Default::default(),
             agreed: 0,
             different: BTreeSet::new(),
+            uncompared: BTreeSet::new(),
             refusal: None,
             warnings: Vec::new(),
             holds: Vec::new(),
@@ -1766,6 +1779,50 @@ mod tests {
         assert_ne!(view.status, JobStatus::Syncing);
         assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review);
         assert!(engine.sync_all().unwrap().contains(&id), "Sync all asks for it");
+    }
+
+    /// A sync of Charon's own moves both folders' markers on, and they stay the same folders:
+    /// what this session read in them still holds, so a conflict left for the person isn't
+    /// read again by every list after the sync.
+    #[test]
+    fn what_this_session_read_still_holds_after_a_sync_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        // Each side holds its own version of the file, of the same size: the list reads both
+        // and leaves the conflict for the person.
+        for (folder, text, seconds) in [(&a, "ours", 0), (&b, "mine", 60)] {
+            std::fs::create_dir_all(folder).unwrap();
+            std::fs::write(folder.join("notes.txt"), text).unwrap();
+            filetime::set_file_mtime(folder.join("notes.txt"), filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0)).unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: "Notes".into(),
+            source: a.clone(),
+            destination: b.clone(),
+            mode: SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        let review = engine.prepare_review(&id).unwrap();
+        assert_eq!(review.tally.conflicts, 1);
+        engine.approve(&id, &review.review_id, true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.is_running(&id) {
+            assert!(Instant::now() < deadline, "the sync took too long");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let markers = Markers::read(&a, &b, &id);
+        assert!(matches!(markers.destination, Found::Marker(_)), "the sync left its markers");
+        let filter = ExcludeFilter::new(&[], false).unwrap();
+        let entry = |root: &Path| *Scanner::new(&filter).scan(root, Volume::of(root)).unwrap().get("notes.txt").unwrap();
+        let verdict = engine.change_runtime(&id, |rt| rt.reads.verdict("notes.txt", &entry(&a), &entry(&b), &markers));
+        assert_eq!(verdict, Some(false));
     }
 
     #[test]

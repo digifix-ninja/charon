@@ -162,14 +162,20 @@ impl Notifier {
         match jobs {
             [] => None,
             [job] => {
-                let what = Self::what_waits(job.items, job.removals, job.conflicts);
+                let what = Self::what_waits(job.items, job.removals, job.conflicts, job.uncompared);
+                // Only files to compare: the list may well have nothing to confirm.
+                let to_compare = job.only_to_compare();
                 let title = if job.items == 0 && job.conflicts > 0 {
                     format!("“{}” has {} to settle", job.name, plural(job.conflicts, "conflict"))
+                } else if to_compare {
+                    format!("“{}” has {} to compare", job.name, plural(job.uncompared, "file"))
                 } else {
                     format!("“{}” waits for your OK", job.name)
                 };
                 let next = if job.drive_connected {
                     "Nothing has been copied yet: look at the list before you eject the drive."
+                } else if to_compare {
+                    "Open Charon to look at the list."
                 } else {
                     "Open Charon to look at the list and confirm it."
                 };
@@ -179,17 +185,25 @@ impl Notifier {
                 let names: Vec<String> = jobs.iter().map(|job| format!("“{}”", job.name)).collect();
                 let (last, rest) = names.split_last()?;
                 let total = |f: fn(&WaitingJob) -> u64| jobs.iter().map(f).sum::<u64>();
-                let what = Self::what_waits(total(|j| j.items), total(|j| j.removals), total(|j| j.conflicts));
-                Some((
-                    format!("{} jobs wait for your OK", jobs.len()),
-                    format!("{} and {last}. {what} Open Charon to look at them and confirm.", rest.join(", ")),
-                ))
+                let what = Self::what_waits(total(|j| j.items), total(|j| j.removals), total(|j| j.conflicts), total(|j| j.uncompared));
+                // Jobs that only have files to compare may well have nothing to confirm.
+                let to_compare = jobs.iter().filter(|job| job.only_to_compare()).count() as u64;
+                let to_confirm = jobs.len() as u64 - to_compare;
+                let wait = |n: u64| format!("{} wait{} for your OK", plural(n, "job"), if n == 1 { "s" } else { "" });
+                let title = match (to_confirm, to_compare) {
+                    (n, 0) => wait(n),
+                    (0, n) => format!("{} have files to compare", plural(n, "job")),
+                    (n, m) => format!("{}, {} {} files to compare", wait(n), charon_core::human_count(m), if m == 1 { "has" } else { "have" }),
+                };
+                let next = if to_confirm == 0 { "Open Charon to look at them." } else { "Open Charon to look at them and confirm." };
+                Some((title, format!("{} and {last}. {what} {next}", rest.join(", "))))
             }
         }
     }
 
-    /// "23 changes are ready to sync, 3 of them removals, and 1 file changed on both sides."
-    fn what_waits(items: u64, removals: u64, conflicts: u64) -> String {
+    /// "23 changes are ready to sync, 3 of them removals, and 1 file changed on both sides.
+    /// 1 file isn't compared yet: its copies on the two sides may differ."
+    fn what_waits(items: u64, removals: u64, conflicts: u64, uncompared: u64) -> String {
         let mut text = match items {
             0 => String::new(),
             1 => "1 change is ready to sync".into(),
@@ -209,11 +223,20 @@ impl Notifier {
                 text.push_str(&format!(", and {both}"));
             }
         }
-        if text.is_empty() {
-            text = "A sync was held back".into();
+        let mut sentences = Vec::new();
+        if !text.is_empty() {
+            text.push('.');
+            sentences.push(text);
         }
-        text.push('.');
-        text
+        match uncompared {
+            0 => {}
+            1 => sentences.push("1 file isn't compared yet: its copies on the two sides may differ.".into()),
+            n => sentences.push(format!("{} files aren't compared yet: their copies on the two sides may differ.", charon_core::human_count(n))),
+        }
+        if sentences.is_empty() {
+            sentences.push("A sync was held back.".into());
+        }
+        sentences.join(" ")
     }
 }
 
@@ -295,7 +318,7 @@ mod tests {
     }
 
     fn waiting(name: &str, items: u64, removals: u64, conflicts: u64) -> WaitingJob {
-        WaitingJob { id: name.into(), name: name.into(), items, removals, conflicts, drive_connected: false }
+        WaitingJob { id: name.into(), name: name.into(), items, removals, conflicts, uncompared: 0, held: false, drive_connected: false }
     }
 
     #[test]
@@ -333,5 +356,44 @@ mod tests {
             "“A”, “B” and “C”. 6 changes are ready to sync, 1 of them a removal, and 1 file changed on both sides. Open Charon to look at them and confirm."
         );
         assert!(Notifier::waiting_message(&[]).is_none());
+    }
+
+    /// A file a background look couldn't compare is no change ready to sync: the list may
+    /// find both copies identical, and then has nothing to confirm.
+    #[test]
+    fn files_not_compared_yet_are_no_changes_ready_to_sync() {
+        let video = WaitingJob { uncompared: 1, ..waiting("Videos", 0, 0, 0) };
+        let (title, body) = Notifier::waiting_message(std::slice::from_ref(&video)).unwrap();
+        assert_eq!(title, "“Videos” has 1 file to compare");
+        assert_eq!(body, "1 file isn't compared yet: its copies on the two sides may differ. Open Charon to look at the list.");
+        let (title, body) = Notifier::waiting_message(&[WaitingJob { uncompared: 2, ..waiting("Photos", 23, 3, 0) }]).unwrap();
+        assert_eq!(title, "“Photos” waits for your OK");
+        assert_eq!(
+            body,
+            "23 changes are ready to sync, 3 of them removals. 2 files aren't compared yet: their copies on the two sides may differ. \
+             Open Charon to look at the list and confirm it."
+        );
+        let music = WaitingJob { uncompared: 1, ..waiting("Music", 0, 0, 0) };
+        let (title, body) = Notifier::waiting_message(&[video.clone(), music.clone()]).unwrap();
+        assert_eq!(title, "2 jobs have files to compare");
+        assert_eq!(body, "“Videos” and “Music”. 2 files aren't compared yet: their copies on the two sides may differ. Open Charon to look at them.");
+        let (title, body) = Notifier::waiting_message(&[waiting("Photos", 23, 3, 0), video.clone(), music]).unwrap();
+        assert_eq!(title, "1 job waits for your OK, 2 have files to compare");
+        assert_eq!(
+            body,
+            "“Photos”, “Videos” and “Music”. 23 changes are ready to sync, 3 of them removals. 2 files aren't compared yet: their copies on the two sides may differ. \
+             Open Charon to look at them and confirm."
+        );
+        let (title, _) = Notifier::waiting_message(&[waiting("Photos", 23, 3, 0), waiting("Notes", 0, 0, 2), video.clone()]).unwrap();
+        assert_eq!(title, "2 jobs wait for your OK, 1 has files to compare");
+
+        // A job held back for a look waits for an OK, whatever its look found.
+        let held = WaitingJob { held: true, ..video };
+        let (title, body) = Notifier::waiting_message(std::slice::from_ref(&held)).unwrap();
+        assert_eq!(title, "“Videos” waits for your OK");
+        assert_eq!(body, "1 file isn't compared yet: its copies on the two sides may differ. Open Charon to look at the list and confirm it.");
+        let (title, body) = Notifier::waiting_message(&[held, WaitingJob { uncompared: 1, ..waiting("Music", 0, 0, 0) }]).unwrap();
+        assert_eq!(title, "1 job waits for your OK, 1 has files to compare");
+        assert!(body.ends_with("Open Charon to look at them and confirm."), "{body}");
     }
 }

@@ -21,17 +21,18 @@ export class JobRow {
   /** The whole row. `pausedAll` is "Pause everything", which pauses the job without changing its own pause. */
   static render(job, { open, tab, log, index, scan, trashDays, pausedAll = false }) {
     const paused = job.paused || pausedAll;
+    const status = Format.statusName(job.status, job.waiting);
     return html`
       <article class="job ${open ? "open" : ""}" data-id="${job.id}" data-status="${job.status}" style="--i: ${index}">
         <div class="edge"></div>
         <div class="main" data-action="toggle">
-          <div class="orb" title="${Format.statusName(job.status)}">
+          <div class="orb" title="${status}">
             <span class="ico">${raw(Icons.status[job.status] ?? "")}</span>
           </div>
           <div class="body">
             <div class="title-line">
               <span class="name">${job.name}</span>
-              <span class="tag status">${Format.statusName(job.status)}</span>
+              <span class="tag status">${status}</span>
               <span class="tag">${Format.modeName(job.mode)}</span>
               ${raw(job.fullAutomation ? '<span class="tag auto" title="Full automation: this job changes files without asking you first">Full auto</span>' : "")}
             </div>
@@ -102,7 +103,11 @@ export class JobRow {
         parts.push("Looking for changes…", synced);
         break;
       case "pending":
-        parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`, synced);
+        if (job.pending?.items || !job.pending?.uncompared) {
+          parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`);
+        }
+        if (job.pending?.uncompared) parts.push(html`<span class="warn">${Format.uncompared(job.pending.uncompared)}</span>`);
+        parts.push(synced);
         break;
       case "conflict": {
         // Conflicts show first, but a failed last run still says what went wrong.

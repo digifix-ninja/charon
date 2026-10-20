@@ -125,13 +125,14 @@ impl Engine {
         })
     }
 
-    /// Whether the last look found changes a job that runs by itself would carry, and no
-    /// automatic run has tried them yet and ended before carrying anything. Removals that
-    /// wait for an item to be missing a while longer don't count (see `Missing`).
+    /// Whether the last look found changes a job that runs by itself would carry, or files
+    /// it couldn't compare yet (the run reads them), and no automatic run has tried them yet
+    /// and ended before carrying anything. Removals that wait for an item to be missing a
+    /// while longer don't count (see `Missing`).
     pub fn has_pending(&self, id: &JobId) -> bool {
         let now = Moment::now();
         self.runtime().get(id).is_some_and(|rt| {
-            rt.look.as_ref().is_some_and(|look| look.items > rt.missing.waiting(now) && rt.tried.is_none_or(|tried| look.at > tried))
+            rt.look.as_ref().is_some_and(|look| look.items + look.uncompared > rt.missing.waiting(now) && rt.tried.is_none_or(|tried| look.at > tried))
         })
     }
 
@@ -205,7 +206,8 @@ impl Engine {
     }
 
     /// Tells the person (in one notification) about the jobs whose changes or conflicts
-    /// wait for them and haven't been mentioned for a while. Paused and offline jobs aren't
+    /// wait for them, or whose files a look couldn't compare yet, and that haven't been
+    /// mentioned for a while. Paused and offline jobs aren't
     /// mentioned. Right after Charon starts it waits for the first looks, so the jobs found
     /// waiting then come in one notification.
     pub fn remind(&self) {
@@ -223,7 +225,7 @@ impl Engine {
                 continue;
             }
             // Only jobs whose last look found something, or that were held back.
-            let candidate = job.held.is_some() || self.runtime().get(&job.id).and_then(|rt| rt.look.as_ref()).is_some_and(|look| look.has_work());
+            let candidate = job.held.is_some() || self.runtime().get(&job.id).and_then(|rt| rt.look.as_ref()).is_some_and(|look| look.needs_a_list());
             if !candidate {
                 continue;
             }
@@ -258,6 +260,8 @@ impl Engine {
                     items: view.waiting.as_ref().map_or(0, |w| w.items),
                     removals: view.waiting.as_ref().map_or(0, |w| w.removals.total()),
                     conflicts,
+                    uncompared: view.waiting.as_ref().map_or(0, |w| w.uncompared),
+                    held: job.held.is_some(),
                     drive_connected: job.setup.trigger == Trigger::DriveConnected,
                 });
             }

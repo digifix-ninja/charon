@@ -1,5 +1,7 @@
 // Turning data into the words and numbers the window shows.
 
+import { onlyToCompare } from "./store.js";
+
 const MODE_NAMES = { mirror: "Mirror", backup: "Backup", "two-way": "Two-way" };
 const STATUS_NAMES = {
   "in-sync": "In sync",
@@ -138,7 +140,14 @@ export class Format {
   }
 
   static modeName(mode) { return MODE_NAMES[mode] ?? mode; }
-  static statusName(status) { return STATUS_NAMES[status] ?? status; }
+  /**
+   * The name of a row's status. A job whose look left only files to compare waits for no OK
+   * yet: its list compares them, and may well find nothing to confirm.
+   */
+  static statusName(status, waiting = null) {
+    if (status === "review" && waiting && onlyToCompare(waiting)) return "Files to compare";
+    return STATUS_NAMES[status] ?? status;
+  }
   static ruleName(rule) { return RULE_NAMES[rule] ?? rule; }
   static modeSentence(mode, safeDelete = true) {
     return MODE_SENTENCES[mode === "backup" && !safeDelete ? "backup-unsafe" : mode] ?? "";
@@ -204,13 +213,24 @@ export class Format {
   /**
    * "23 changes wait for your OK · 3 removals", or why a full-automation run was held.
    * Right after Charon starts, before its first look, it knows changes wait but not how many.
+   * Files a look couldn't compare yet aren't changes: "1 file not compared yet".
    */
   static waiting(waiting) {
     if (waiting.held) return `Held for your OK: ${waiting.held}`;
     if (waiting.counted === false) return "Changes wait for your OK";
-    const text = waiting.items === 1 ? "1 change waits for your OK" : `${Format.count(waiting.items)} changes wait for your OK`;
+    const parts = [];
+    if (waiting.items || !waiting.uncompared) {
+      parts.push(waiting.items === 1 ? "1 change waits for your OK" : `${Format.count(waiting.items)} changes wait for your OK`);
+    }
     const removals = (waiting.removals?.source || 0) + (waiting.removals?.destination || 0);
-    return removals ? `${text} · ${Format.plural(removals, "removal")}` : text;
+    if (removals) parts.push(Format.plural(removals, "removal"));
+    if (waiting.uncompared) parts.push(Format.uncompared(waiting.uncompared));
+    return parts.join(" · ");
+  }
+
+  /** "1 file not compared yet": files a look couldn't compare by their contents, which may differ. */
+  static uncompared(count) {
+    return `${Format.plural(count, "file")} not compared yet`;
   }
 
   /**

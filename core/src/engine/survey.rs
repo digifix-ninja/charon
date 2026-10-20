@@ -26,8 +26,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const LEFTOVER_AGE_MS: i64 = 60 * 60 * 1000;
 /// A list names at most this many of the files named like Charon 0.2's half-copied files.
 const LEFTOVERS_NAMED: usize = 5;
-/// A background look compares at most this much by contents; whatever is left counts as
-/// differing for that look only (a list the person sees, and every run, read it all).
+/// A background look compares at most this much by contents. What it leaves unread, unless a
+/// full read found it identical as both sides are now (see `store::SameContents`), is not
+/// compared yet: never "in sync" (a list the person sees, and every run, read it all).
 const CHECK_COMPARE_BYTES: u64 = 1 << 30;
 /// Comparison progress reaches the window at most this often.
 const COMPARE_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
@@ -182,12 +183,26 @@ impl Guide {
 
     /// Whether the look-alike pair at `key` (`s` and `d` as they are now) is read all the same.
     fn wants_read(&self, key: &str, s: &Entry, d: &Entry, source: &Snapshot, destination: &Snapshot) -> bool {
-        let key = if self.folded { Keys::fold(key) } else { key.to_string() };
-        self.unsettled.contains(&key)
-            || self.pairs.get(&key).is_some_and(|pair| {
+        self.left_different(key)
+            || self.pairs.get(&self.key(key)).is_some_and(|pair| {
                 !Entry::still_on(Some(s), Some(&pair.source), source.shifts_times())
                     || !Entry::still_on(Some(d), Some(&pair.destination), destination.shifts_times())
             })
+    }
+
+    /// Whether the pair at `key` was found to differ when it was last read, and was left for
+    /// the person.
+    fn left_different(&self, key: &str) -> bool {
+        self.unsettled.contains(&self.key(key))
+    }
+
+    /// `key` as the guide's records are keyed.
+    fn key(&self, key: &str) -> String {
+        if self.folded {
+            Keys::fold(key)
+        } else {
+            key.to_string()
+        }
     }
 }
 
@@ -196,9 +211,10 @@ impl Guide {
 struct Compared {
     /// Pairs found identical, now recorded as in sync.
     agreed: u64,
-    /// Pairs that look alike but whose contents differ, or that a background look left
-    /// unread.
+    /// Pairs that look alike but whose contents differ.
     different: BTreeSet<String>,
+    /// Pairs a background look left unread, with nothing known about their contents.
+    uncompared: BTreeSet<String>,
 }
 
 /// Both folders now, the plan, and what deserves a look.
@@ -231,8 +247,11 @@ pub(crate) struct Survey {
     /// Pairs of files found identical by their contents, though their dates differ.
     pub agreed: u64,
     /// Pairs that look alike but were found to differ by their contents (see
-    /// `Memory::unsettled`), or that a background look left unread.
+    /// `Memory::unsettled`).
     pub different: BTreeSet<String>,
+    /// Pairs a background look left unread, with nothing known about their contents: they
+    /// may differ. Its plan leaves them as they are, and it says so (see `Look::uncompared`).
+    pub uncompared: BTreeSet<String>,
     /// Why this plan must not run at all.
     pub refusal: Option<String>,
     pub warnings: Vec<Warning>,
@@ -388,7 +407,7 @@ impl Engine {
             self.inner.landings.load(&job.id, &setup, folded, &markers.destination)
         };
         let compared = if setup.mode.is_two_way() {
-            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &mut baseline, &guide, purpose, cancel))?
+            Self::without_downloads("The comparison of files", || self.compare_contents(job, &source, &destination, &markers, &mut baseline, &guide, purpose, cancel))?
         } else {
             Compared::default()
         };
@@ -589,6 +608,7 @@ impl Engine {
             left_for_later: Plan::default(),
             agreed,
             different: compared.different,
+            uncompared: compared.uncompared,
             refusal,
             warnings,
             holds,
@@ -833,14 +853,22 @@ impl Engine {
     /// * both sides changed since the record and still look alike: if their contents differ
     ///   after all, they're a conflict (`different`), never "already in sync".
     ///
-    /// A background look reads at most `CHECK_COMPARE_BYTES`; the rest count as differing
-    /// for that look only, so it never shows as in sync what it didn't read.
+    /// A pair this session read before isn't read again while both sides are still exactly as
+    /// they were then and both folders carry the `markers` (as read before the scans) they
+    /// carried then (see `Reads`). A background look reads at most `CHECK_COMPARE_BYTES`.
+    /// Past that, it goes by what full reads found before: identical, on the same terms (see
+    /// `store::SameContents`), or different and left for the person (see `Guide`). The rest
+    /// is not compared yet (`Compared::uncompared`): the look never shows as in sync what it
+    /// didn't read. What the look read, and the pairs found identical, are kept for the looks
+    /// after this one (the pairs even after a restart), only while both folders still carry
+    /// the markers they carried before the scans.
     #[allow(clippy::too_many_arguments)]
     fn compare_contents(
         &self,
         job: &Job,
         source: &Snapshot,
         destination: &Snapshot,
+        markers: &Markers,
         baseline: &mut Baseline,
         guide: &Guide,
         purpose: Purpose,
@@ -850,40 +878,69 @@ impl Engine {
         let total_bytes: u64 = candidates.iter().map(|c| c.source.size).sum();
         let total_files = candidates.len() as u64;
         let mut compared = Compared::default();
+        // The pairs full reads found identical before in these folders, and those this look
+        // knows to be.
+        let folded = source.is_folded();
+        let found_before = self.inner.same_contents.load(&job.id, &job.setup, folded, markers);
+        let mut found_now = Baseline::new();
+        let mut read = false;
         let (mut done_files, mut done_bytes, mut read_bytes) = (0u64, 0u64, 0u64);
         let mut last_sent: Option<std::time::Instant> = None;
         for candidate in candidates {
             let Candidate { key, source: s, destination: d, alike } = candidate;
-            let cached = self
-                .change_known_runtime(&job.id, |rt| rt.same_contents.get(&key).filter(|(cs, cd, _)| *cs == s && *cd == d).map(|(_, _, same)| *same))
-                .flatten();
+            let pair = Pair::new(s, d);
+            let cached = self.change_known_runtime(&job.id, |rt| rt.reads.verdict(&key, &s, &d, markers)).flatten();
             let same = match cached {
-                Some(same) => same,
-                // A background look that has read enough leaves the rest for the next list.
-                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => false,
+                Some(same) => Some(same),
+                // A background look that has read enough leaves the rest for the next list. It
+                // goes by what a full read found: identical as both sides are now, or different
+                // and left for the person.
+                None if purpose == Purpose::Check && read_bytes + s.size > CHECK_COMPARE_BYTES => {
+                    if found_before.get(&key).is_some_and(|before| *before == pair) {
+                        Some(true)
+                    } else {
+                        guide.left_different(&key).then_some(false)
+                    }
+                }
                 None => {
                     let a = job.setup.source.join(source.spelling(&key));
                     let b = job.setup.destination.join(destination.spelling(&key));
                     read_bytes += s.size;
                     match Contents::same(&a, &b, Some(cancel)) {
                         Ok(same) => {
-                            self.change_known_runtime(&job.id, |rt| {
-                                rt.same_contents.insert(key.clone(), (s, d, same));
-                            });
-                            same
+                            self.change_known_runtime(&job.id, |rt| rt.reads.note(&key, s, d, same, markers));
+                            read = true;
+                            Some(same)
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(Error::Cancelled),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                            // What was read before the stop holds only for the folders it was read in.
+                            if read {
+                                self.still_marked(job, markers);
+                            }
+                            return Err(Error::Cancelled);
+                        }
                         // Unreadable now: the plan decides as if they differ (never a removal),
                         // for this look only. The next one reads them again.
-                        Err(_) => false,
+                        Err(_) => Some(false),
                     }
                 }
             };
-            if same {
-                baseline.insert(key, Pair::new(s, d));
-                compared.agreed += 1;
-            } else if alike {
-                compared.different.insert(key);
+            match same {
+                Some(true) => {
+                    found_now.insert(key.clone(), pair);
+                    baseline.insert(key, pair);
+                    compared.agreed += 1;
+                }
+                Some(false) if alike => {
+                    compared.different.insert(key);
+                }
+                Some(false) => {}
+                // Not compared: the plan leaves the pair as it is, and the look says why it
+                // isn't in sync.
+                None => {
+                    baseline.insert(key.clone(), pair);
+                    compared.uncompared.insert(key);
+                }
             }
             done_files += 1;
             done_bytes += s.size;
@@ -892,7 +949,46 @@ impl Engine {
                 self.emit(EngineEvent::CompareProgress { id: job.id.clone(), files: done_files, total_files, bytes: done_bytes, total_bytes });
             }
         }
+        // What the look read, and the pairs it keeps, hold only for the folders it read.
+        let keep = found_now != found_before;
+        if (read || keep) && !self.still_marked(job, markers) {
+            return Ok(compared);
+        }
+        if keep {
+            self.keep_same_contents(job, folded, markers, &found_now);
+        }
         Ok(compared)
+    }
+
+    /// Whether both folders of `job` still carry the `markers` read before the scans. If not,
+    /// a folder was replaced while the look read it (another drive under the same name, a
+    /// folder restored from a copy) and may have been read in part: what this session read
+    /// while they carried those markers is forgotten, and the look keeps nothing it found.
+    fn still_marked(&self, job: &Job, markers: &Markers) -> bool {
+        let now = Markers::read(&job.setup.source, &job.setup.destination, &job.id);
+        if now.changed_since(markers).is_none() {
+            return true;
+        }
+        self.change_known_runtime(&job.id, |rt| rt.reads.forget(markers));
+        false
+    }
+
+    /// Keeps the pairs a look found identical for the background looks after it, even after a
+    /// restart, in the folders that carry `markers` (see `store::SameContents`): those that
+    /// are no longer to be read go. Saved while the stored state is locked, and only while
+    /// the job is still there with the folders and mode the look was made with: removing the
+    /// job or changing them forgets the record, and a look that was under way then never
+    /// brings it back. A record that can't be saved is removed, and the pairs are read again
+    /// or not compared yet.
+    fn keep_same_contents(&self, job: &Job, folded: bool, markers: &Markers, pairs: &Baseline) {
+        let state = self.state();
+        if !state.jobs.iter().any(|stored| stored.id == job.id && stored.setup.same_folders(&job.setup)) {
+            return;
+        }
+        if let Err(e) = self.inner.same_contents.save(&job.id, &job.setup, folded, markers, pairs) {
+            log::warn!("couldn't keep the files found identical in {} for later looks: {e}", job.setup.name);
+            let _ = self.inner.same_contents.forget(&job.id);
+        }
     }
 
     /// Whether the pair at `key` needs its contents read (see `compare_contents`).
@@ -1227,6 +1323,100 @@ mod tests {
         fs::write(dst.join("REPORT~1.PDF"), "ours").unwrap();
         engine.survey(&job, &cancel, Purpose::Check).unwrap();
         assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()));
+    }
+
+    /// A look that ends after the job's folders or mode changed, or after the job was
+    /// removed, keeps nothing of what it found identical: the edit or the removal forgot it,
+    /// and the record would name the job's folders as they were.
+    #[test]
+    fn a_look_outdated_by_an_edit_or_a_removal_keeps_no_files_found_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        let engine = Engine::open(tmp.path().join("data"), std::sync::Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: String::new(),
+            source: src,
+            destination: dst,
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup.clone()).unwrap().job.id;
+        let job = engine.stored_job(&id).unwrap();
+        let record = tmp.path().join("data/same-contents").join(format!("{id}.json"));
+        let file = Entry::file(4, 10_000).changed_at(7);
+        let mut found = Baseline::new();
+        found.insert("a.txt", Pair::new(file, file));
+        let marker = |side: Side| crate::run::Found::Marker(crate::run::Marker::new(&id, side, "token", 1));
+        let markers = Markers { source: marker(Side::Source), destination: marker(Side::Destination) };
+
+        engine.keep_same_contents(&job, false, &markers, &found);
+        assert!(record.is_file(), "the job is as the look saw it");
+        engine.update_job(&id, JobSetup { mode: crate::model::SyncMode::Mirror, ..setup }).unwrap();
+        assert!(!record.exists(), "the edit forgot it");
+        engine.keep_same_contents(&job, false, &markers, &found);
+        assert!(!record.exists(), "a look of the two-way job ended after the edit");
+
+        let mirror = engine.stored_job(&id).unwrap();
+        engine.remove_job(&id).unwrap();
+        engine.keep_same_contents(&mirror, false, &markers, &found);
+        assert!(!record.exists(), "a look ended after the job was removed");
+    }
+
+    /// A folder replaced while a look read it (another drive under the same name, a folder
+    /// restored from a copy) may have been read in part: what the look read stands for
+    /// neither folder, in this session or in the record of the pairs found identical.
+    #[test]
+    fn a_look_keeps_nothing_it_read_while_a_folder_was_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        for folder in [&src, &dst] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("a.txt"), "same").unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), std::sync::Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: String::new(),
+            source: src.clone(),
+            destination: dst.clone(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        let job = engine.stored_job(&id).unwrap();
+        let record = tmp.path().join("data/same-contents").join(format!("{id}.json"));
+        let marker = |side: Side, token: &str| crate::run::Marker::new(&id, side, token, 1);
+        marker(Side::Source, "source").write(&src).unwrap();
+        marker(Side::Destination, "now").write(&dst).unwrap();
+        let markers = |destination: &str| Markers { source: Found::Marker(marker(Side::Source, "source")), destination: Found::Marker(marker(Side::Destination, destination)) };
+        // The same contents under different times: the pair is read.
+        let (s, d) = (Entry::file(4, 10_000), Entry::file(4, 20_000));
+        let source: Snapshot = [("a.txt".to_string(), s)].into_iter().collect();
+        let destination: Snapshot = [("a.txt".to_string(), d)].into_iter().collect();
+        let compare = |markers: &Markers| {
+            engine.compare_contents(&job, &source, &destination, markers, &mut Baseline::new(), &Guide::default(), Purpose::Review, &AtomicBool::new(false)).unwrap()
+        };
+        let verdict = |markers: &Markers| engine.change_runtime(&id, |rt| rt.reads.verdict("a.txt", &s, &d, markers));
+
+        // The look found the destination's marker before its scans, and another since.
+        let before = markers("before");
+        assert_eq!(compare(&before).agreed, 1);
+        assert_eq!(verdict(&before), None, "not kept for this session");
+        assert!(!record.exists(), "not kept for later launches");
+
+        let now = markers("now");
+        assert_eq!(compare(&now).agreed, 1);
+        assert_eq!(verdict(&now), Some(true), "the folders stayed the same: kept");
+        assert!(record.is_file());
     }
 
     #[test]
