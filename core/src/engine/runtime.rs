@@ -4,10 +4,11 @@ use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side};
 use crate::run::{Refused, Unread};
-use crate::scan::{Entry, ExcludeFilter, Snapshot, Volume};
+use crate::scan::{Entry, ExcludeFilter, Keys, Snapshot, Volume};
 use crate::store::Absence;
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,7 +25,11 @@ pub(crate) struct JobRuntime {
     /// A run nobody looks at is due (full automation), and why. It starts as soon as nothing
     /// stands in its way, so a trigger is never lost while another job uses the folders.
     pub wanted: Option<String>,
-    /// The running job whose folders the wanted run waits for.
+    /// The person confirmed the job's list while another sync used its folders: it starts
+    /// as soon as that sync is done (see `Engine::start_confirmed`).
+    pub confirmed: Option<Confirmed>,
+    /// The sync whose folders the wanted or confirmed run waits for: another job's name, or
+    /// another Charon.
     pub waiting_for: Option<String>,
     /// Set while a review is being prepared; setting it to true stops that.
     pub preparing: Option<Arc<AtomicBool>>,
@@ -33,6 +38,11 @@ pub(crate) struct JobRuntime {
     pub progress: Option<Progress>,
     /// What the last look found.
     pub look: Option<Look>,
+    /// Goes up whenever what a look in progress would find becomes outdated: a run starts,
+    /// the job's setup changes, a folder comes back, a newer look begins. A look notes it
+    /// when it begins, and what it found counts only while it hasn't changed (see
+    /// `Engine::note_look`).
+    pub epoch: u64,
     /// The list waiting for the person's OK.
     pub review: Option<Arc<StoredReview>>,
     /// What went wrong in the last look or run.
@@ -59,6 +69,13 @@ pub(crate) struct JobRuntime {
     pub filter: Option<(JobSetup, ExcludeFilter)>,
     /// Items looks found missing on a drive that may show changes late, and since when.
     pub missing: Missing,
+    /// Folders inside the job's folders that hold Charon's own folder, as the last look met
+    /// them: other jobs' folders, maybe reached under other names, where another sync's busy
+    /// note may be (see `run::Claim`).
+    pub folders_inside: Vec<PathBuf>,
+    /// What the running (or just finished) sync writes, to tell its own writes from the
+    /// changes the folder watcher hears about meanwhile.
+    pub own_writes: Option<OwnWrites>,
     /// When the look was made whose changes the last automatic run set out to carry, if
     /// that run ended before carrying anything (a folder it couldn't read, Charon's state
     /// that couldn't be saved). Changes found by that look aren't tried again until a newer
@@ -82,11 +99,26 @@ impl JobRuntime {
         }
     }
 
+    /// Stops the looks in progress, and makes whatever they find count for nothing: the job
+    /// or its folders are about to change, or just did.
+    pub fn outdate_looks(&mut self) {
+        self.stop_looking();
+        self.epoch += 1;
+    }
+
+    /// Forgets the list waiting for the person's OK, and a confirmed run waiting to start.
+    pub fn forget_review(&mut self) {
+        self.review = None;
+        if self.confirmed.take().is_some() {
+            self.waiting_for = None;
+        }
+    }
+
     /// Forgets everything learned about the folders (the job's folders or mode changed).
     pub fn forget_folders(&mut self) {
         self.stop_looking();
+        self.forget_review();
         self.look = None;
-        self.review = None;
         self.problem = None;
         self.same_contents.clear();
         self.no_links = (false, false);
@@ -97,6 +129,81 @@ impl JobRuntime {
         self.tried = None;
         self.wanted = None;
         self.waiting_for = None;
+        self.folders_inside.clear();
+    }
+}
+
+/// A list the person confirmed whose sync waits for another sync to finish.
+#[derive(Debug, Clone)]
+pub(crate) struct Confirmed {
+    pub review_id: String,
+    /// The person ticked "I've looked at the removals and replacements".
+    pub acknowledged: bool,
+}
+
+/// The items a sync writes, by key: its plan's steps, and the items its steps made under new
+/// names (conflict copies). Changes the folder watcher hears about anywhere else while the
+/// sync runs are the person's (or another app's), and are looked at once it's done. Until
+/// the sync knows its plan (it's still looking), nothing it could write is known, and it
+/// hasn't written anything: every change is someone else's.
+#[derive(Debug, Default)]
+pub(crate) struct OwnWrites {
+    /// The sync's items and every folder above them (a folder changes when an item in it does).
+    keys: HashSet<String>,
+    /// The keys ignore upper and lower case (see `Keys::fold`).
+    folded: bool,
+    /// Keys outside the sync's items that changed while it ran (a few are enough).
+    others: BTreeSet<String>,
+    /// Something changed before the sync knew its plan.
+    changed_before: bool,
+}
+
+impl OwnWrites {
+    /// The most changes outside the sync's items kept until it's done.
+    const KEPT: usize = 100;
+
+    /// The writes of a sync carrying out `plan`, which began before as `before` (with no
+    /// plan yet).
+    pub fn of(plan: &Plan, folded: bool, before: Option<&OwnWrites>) -> Self {
+        let mut own = Self { folded, changed_before: before.is_some_and(OwnWrites::others_changed), ..Self::default() };
+        own.add(plan.actions.iter().map(Action::path));
+        own
+    }
+
+    /// Adds items the sync writes (plan keys, in the plan's form).
+    pub fn add<'a>(&mut self, items: impl Iterator<Item = &'a str>) {
+        for key in items {
+            self.keys.extend(Keys::ancestors(key).map(str::to_string));
+            self.keys.insert(key.to_string());
+        }
+        let keys = &self.keys;
+        self.others.retain(|key| !keys.contains(key));
+    }
+
+    /// Whether a change at `key` (as spelled on disk) may be the sync's own.
+    pub fn is_own(&self, key: &str) -> bool {
+        self.keys.contains(&self.form(key))
+    }
+
+    /// Notes a change outside the sync's items.
+    pub fn note_other(&mut self, key: &str) {
+        if self.others.len() < Self::KEPT {
+            self.others.insert(self.form(key));
+        }
+    }
+
+    /// Whether anything outside the sync's items changed while it ran.
+    pub fn others_changed(&self) -> bool {
+        self.changed_before || !self.others.is_empty()
+    }
+
+    /// `key` in the form of the plan's keys.
+    fn form(&self, key: &str) -> String {
+        if self.folded {
+            Keys::fold(key)
+        } else {
+            key.to_string()
+        }
     }
 }
 

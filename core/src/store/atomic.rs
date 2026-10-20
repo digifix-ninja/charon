@@ -13,6 +13,13 @@ static COUNTER: AtomicU64 = AtomicU64::new(0);
 pub fn write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent).map_err(|e| Error::file(parent, e))?;
+    write_into(path, bytes)
+}
+
+/// Like `write`, into a folder that must be there already: a folder that went away (its
+/// drive was unplugged) is never made again, where it would end up on another drive.
+pub fn write_into(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
     let temp = temp_name(path);
     let written = write_and_sync(&temp, bytes).and_then(|()| fs::rename(&temp, path).map_err(|e| Error::file(path, e)));
     if written.is_err() {
@@ -63,5 +70,16 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"two");
         let names: Vec<_> = fs::read_dir(tmp.path()).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[test]
+    fn writing_into_a_folder_that_is_gone_makes_no_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("USB/Backup/.charon/note.busy");
+        assert!(write_into(&path, b"note").is_err());
+        assert!(!tmp.path().join("USB").exists());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        write_into(&path, b"note").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"note");
     }
 }

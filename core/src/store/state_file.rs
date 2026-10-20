@@ -9,6 +9,7 @@ use crate::model::{Job, Settings, Trigger, UpgradeNotice, UpgradedJob};
 use crate::store::atomic;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 const VERSION: u32 = 2;
 
@@ -64,6 +65,12 @@ impl StateFile {
 
     pub fn save(&self, state: &StoredState) -> Result<()> {
         atomic::write(&self.path, &serde_json::to_vec_pretty(state)?)
+    }
+
+    /// When Charon 0.2's state file last changed, if it's there. An older Charon still
+    /// running writes it again (see `Engine::older_charon_running`).
+    pub fn legacy_changed_at(&self) -> Option<SystemTime> {
+        std::fs::metadata(&self.legacy).and_then(|metadata| metadata.modified()).ok()
     }
 
     /// Takes over Charon 0.2's settings and jobs. Every job comes over waiting for the

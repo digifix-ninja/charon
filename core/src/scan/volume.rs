@@ -302,7 +302,7 @@ impl FsKind {
     }
 
     /// The usual case setting of this kind of drive, when the drive can't be asked.
-    fn usually_case_sensitive(self) -> bool {
+    pub(crate) fn usually_case_sensitive(self) -> bool {
         matches!(self, FsKind::Ext | FsKind::Btrfs | FsKind::Xfs | FsKind::Zfs | FsKind::Nfs)
     }
 

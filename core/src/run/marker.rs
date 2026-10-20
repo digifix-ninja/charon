@@ -27,6 +27,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// What the name of the probe file ends with that tells whether two folders are one (see
+/// `Marker::origin`). It's there only for a moment.
+pub const PROBE_EXTENSION: &str = ".probe";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Marker {
@@ -43,6 +47,22 @@ pub enum Found {
     Missing,
     /// There, but unreadable or damaged.
     Unusable(String),
+}
+
+/// Where a job's marker found in a folder other than the job's own comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The folder is the job's own folder, reached under another name (a drive or share
+    /// mounted twice, a link).
+    SameFolder,
+    /// The folder holds a copy of the job's marker: the person copied the job's folder,
+    /// hidden `.charon` folder and all, or the copy is older than the marker there now.
+    Copy,
+    /// The job's own folder can't be reached now.
+    Away,
+    /// Charon can't tell (neither Charon folder takes a file, or the job's own marker can't
+    /// be read).
+    Unknown,
 }
 
 /// A job's markers on both sides, as found at one moment.
@@ -97,6 +117,15 @@ impl Marker {
         }
     }
 
+    /// The jobs whose markers are at the top of `root`: the jobs whose folder `root` is.
+    pub fn jobs_in(root: &Path) -> Vec<JobId> {
+        let Ok(items) = fs::read_dir(root.join(MARKER_FOLDER)) else { return Vec::new() };
+        items
+            .flatten()
+            .filter_map(|item| item.file_name().to_str().and_then(|name| name.strip_suffix(".json")).map(str::to_string))
+            .collect()
+    }
+
     /// Writes the marker for good (on the drive, not only in its memory).
     pub fn write(&self, root: &Path) -> crate::Result<()> {
         let folder = Self::real_folder(root)?;
@@ -120,8 +149,51 @@ impl Marker {
         root.join(MARKER_FOLDER).join(format!("{job}.json"))
     }
 
+    /// Where the marker of `job` found in the Charon folder of `found` comes from, when the
+    /// job's own folder is `root` (see `Origin`). The two markers are read again, side by
+    /// side: two different ones are two folders. Two identical ones are one folder, or a
+    /// copy made since the job's last sync, which nothing in them tells apart, so Charon
+    /// leaves a probe file in one of the two Charon folders, and looks for it in the other.
+    pub fn origin(job: &JobId, root: &Path, found: &Path) -> Origin {
+        if !root.is_dir() {
+            return Origin::Away;
+        }
+        match (Self::read(root, job), Self::read(found, job)) {
+            (Found::Marker(own), Found::Marker(seen)) if own == seen => match Self::same_place(root, found) {
+                Some(true) => Origin::SameFolder,
+                Some(false) => Origin::Copy,
+                None => Origin::Unknown,
+            },
+            (Found::Unusable(_), _) | (_, Found::Unusable(_)) => Origin::Unknown,
+            _ => Origin::Copy,
+        }
+    }
+
+    /// Whether the folders `a` and `b`, which both hold a Charon folder, are one folder under
+    /// two names: a probe file left in the Charon folder of one shows up in that of the
+    /// other (a new name is looked up on the drive itself, not in what the computer
+    /// remembers of the folder). `None` when neither Charon folder takes a file. Never makes
+    /// a folder.
+    fn same_place(a: &Path, b: &Path) -> Option<bool> {
+        let name = format!("{}{PROBE_EXTENSION}", uuid::Uuid::new_v4().simple());
+        for (here, there) in [(a, b), (b, a)] {
+            let folder = here.join(MARKER_FOLDER);
+            if !fs::symlink_metadata(&folder).is_ok_and(|meta| meta.is_dir()) {
+                continue;
+            }
+            let probe = folder.join(&name);
+            if fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_err() {
+                continue;
+            }
+            let seen = fs::symlink_metadata(there.join(MARKER_FOLDER).join(&name)).is_ok();
+            let _ = fs::remove_file(&probe);
+            return Some(seen);
+        }
+        None
+    }
+
     /// `root/.charon`, created when missing; never a link.
-    fn real_folder(root: &Path) -> crate::Result<PathBuf> {
+    pub(crate) fn real_folder(root: &Path) -> crate::Result<PathBuf> {
         let folder = root.join(MARKER_FOLDER);
         match fs::symlink_metadata(&folder) {
             Ok(meta) if meta.is_dir() => Ok(folder),
@@ -175,6 +247,17 @@ mod tests {
     }
 
     #[test]
+    fn the_jobs_of_a_folder_are_read_from_their_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(Marker::jobs_in(tmp.path()).is_empty());
+        Marker::new(&"job1".to_string(), Side::Source, "a", 1).write(tmp.path()).unwrap();
+        Marker::new(&"job2".to_string(), Side::Destination, "b", 0).write(tmp.path()).unwrap();
+        let mut jobs = Marker::jobs_in(tmp.path());
+        jobs.sort();
+        assert_eq!(jobs, vec!["job1".to_string(), "job2".to_string()]);
+    }
+
+    #[test]
     fn a_marker_that_changed_names_its_side() {
         let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let job = "job1".to_string();
@@ -190,6 +273,64 @@ mod tests {
         fs::create_dir(tmp.path().join(MARKER_FOLDER)).unwrap();
         fs::write(tmp.path().join(MARKER_FOLDER).join("j.json"), "{nope").unwrap();
         assert!(matches!(Marker::read(tmp.path(), &"j".to_string()), Found::Unusable(_)));
+    }
+
+    #[test]
+    fn a_copy_of_a_marker_is_told_from_the_folder_it_was_copied_from() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (backup, restored) = (tmp.path().join("USB/Documents"), tmp.path().join("Documents/From the USB backup"));
+        fs::create_dir_all(&backup).unwrap();
+        fs::create_dir_all(&restored).unwrap();
+        let job = "job".to_string();
+        let marker = Marker::new(&job, Side::Destination, "token", 4);
+        marker.write(&backup).unwrap();
+        // Copied along with the files: the same marker, in another folder.
+        marker.write(&restored).unwrap();
+        assert_eq!(Marker::origin(&job, &backup, &restored), Origin::Copy);
+        assert_eq!(fs::read_dir(backup.join(MARKER_FOLDER)).unwrap().count(), 1, "no probe is left behind");
+        assert_eq!(fs::read_dir(restored.join(MARKER_FOLDER)).unwrap().count(), 1);
+        // An older copy differs from the marker there now.
+        Marker::new(&job, Side::Destination, "token", 5).write(&backup).unwrap();
+        assert_eq!(Marker::origin(&job, &backup, &restored), Origin::Copy);
+        // The drive is away.
+        assert_eq!(Marker::origin(&job, &tmp.path().join("Elsewhere/Documents"), &restored), Origin::Away);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_reached_under_another_name_is_the_same_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let share = tmp.path().join("NAS/Docs");
+        fs::create_dir_all(&share).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("NAS"), tmp.path().join("NAS-1")).unwrap();
+        let job = "job".to_string();
+        Marker::new(&job, Side::Destination, "token", 4).write(&share).unwrap();
+        assert_eq!(Marker::origin(&job, &share, &tmp.path().join("NAS-1/Docs")), Origin::SameFolder);
+        assert_eq!(fs::read_dir(share.join(MARKER_FOLDER)).unwrap().count(), 1, "no probe is left behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_marker_charon_cannot_probe_leaves_it_unsure() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (one, two) = (tmp.path().join("one"), tmp.path().join("two"));
+        let job = "job".to_string();
+        for folder in [&one, &two] {
+            fs::create_dir_all(folder).unwrap();
+            Marker::new(&job, Side::Source, "token", 1).write(folder).unwrap();
+            fs::set_permissions(folder.join(MARKER_FOLDER), fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        // Root writes anyway: then there's nothing to show.
+        let writable = fs::write(one.join(MARKER_FOLDER).join("x"), "x").is_ok();
+        let origin = Marker::origin(&job, &one, &two);
+        for folder in [&one, &two] {
+            fs::set_permissions(folder.join(MARKER_FOLDER), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        if writable {
+            return;
+        }
+        assert_eq!(origin, Origin::Unknown);
     }
 
     #[cfg(unix)]

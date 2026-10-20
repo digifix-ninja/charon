@@ -24,8 +24,8 @@
 //! 5. **Regular look:** every few minutes, in case the watcher missed something (network
 //!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs.
 //!
-//! A sync that is due waits (it isn't dropped) while another job uses the same folders, and
-//! starts as soon as that job is done.
+//! A sync that is due waits (it isn't dropped) while another sync uses the same folders, and
+//! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
 //!
 //! Paused jobs (and everything under "Pause everything") are still looked at, so the
 //! window shows what's waiting, but never sync by themselves.
@@ -34,7 +34,7 @@ mod schedule;
 mod watcher;
 
 pub use schedule::Schedule;
-pub use watcher::FolderWatcher;
+pub use watcher::{FolderWatcher, Route};
 
 use crate::engine::Engine;
 use crate::model::{Job, JobId, Trigger};
@@ -55,6 +55,9 @@ const QUIET_AFTER_RUN: Duration = Duration::from_secs(3);
 const CHECK_SETTLE: Duration = Duration::from_secs(5);
 /// After a tick ran into a mistake in Charon itself, the next one waits this long.
 const AFTER_A_PANIC: Duration = Duration::from_secs(60);
+/// How often a confirmed sync that waits for another sync tries again (each try asks the
+/// disk). A sync of this Charon that ends starts it at once; this is for other Charons'.
+const CONFIRMED_RETRY: Duration = Duration::from_secs(5);
 
 pub struct Autopilot {
     engine: Engine,
@@ -67,6 +70,10 @@ pub struct Autopilot {
     /// When each job's schedule last came due, also kept here: if the job's record can't be
     /// saved, the schedule still doesn't come due again every second.
     scheduled: HashMap<JobId, DateTime<Utc>>,
+    /// Each watched folder as it really is (links resolved), when it could be resolved.
+    real_roots: HashMap<PathBuf, Option<PathBuf>>,
+    /// When each job's confirmed sync that waits last tried to start.
+    confirmed_tried: HashMap<JobId, Instant>,
 }
 
 impl Autopilot {
@@ -77,8 +84,16 @@ impl Autopilot {
             let watcher = FolderWatcher::new(sender)
                 .map_err(|e| log::error!("folder watching is unavailable: {e}"))
                 .ok();
-            let mut pilot =
-                Autopilot { engine, watcher, changes, changed: HashMap::new(), reachable: HashMap::new(), scheduled: HashMap::new() };
+            let mut pilot = Autopilot {
+                engine,
+                watcher,
+                changes,
+                changed: HashMap::new(),
+                reachable: HashMap::new(),
+                scheduled: HashMap::new(),
+                real_roots: HashMap::new(),
+                confirmed_tried: HashMap::new(),
+            };
             thread::sleep(STARTUP_DELAY);
             loop {
                 // A mistake in Charon itself stops nothing for good: the next tick tries
@@ -99,6 +114,11 @@ impl Autopilot {
 
     /// One look at every job.
     fn tick(&mut self) {
+        // Notices an older Charon at work, so the window says so before anything tries to sync.
+        self.engine.older_charon_running();
+        // While Charon's state can't be saved, tries again now and then (at most once a
+        // minute), so the header stops saying so once it can, even when no job syncs by itself.
+        self.engine.can_save();
         let settings = self.engine.settings();
         let jobs = self.engine.job_list();
         self.follow_folders(&jobs);
@@ -128,6 +148,14 @@ impl Autopilot {
             }
             if !reachable || self.engine.is_running(id) {
                 continue;
+            }
+            // A list the person confirmed while another sync used the folders (that sync
+            // may have been another Charon's, which says nothing when it's done).
+            if self.confirmed_tried.get(id).is_none_or(|tried| tried.elapsed() >= CONFIRMED_RETRY) {
+                self.confirmed_tried.insert(id.clone(), Instant::now());
+                if self.engine.start_confirmed(id) {
+                    continue;
+                }
             }
             // Runs by itself now: full automation, nothing waiting for a look, and no list
             // of its changes open for the person.
@@ -195,6 +223,7 @@ impl Autopilot {
         }
         self.reachable.retain(|id, _| jobs.iter().any(|job| &job.id == id));
         self.scheduled.retain(|id, _| jobs.iter().any(|job| &job.id == id));
+        self.confirmed_tried.retain(|id, _| jobs.iter().any(|job| &job.id == id));
         self.engine.remind();
     }
 
@@ -205,25 +234,42 @@ impl Autopilot {
         self.engine.start_wanted(id);
     }
 
-    /// Watches the folders of every job whose folders are reachable.
+    /// Watches the folders of every job whose folders are reachable. Each folder is known
+    /// by its path as the job names it and as it really is (a link resolved), since some
+    /// systems report changes under the real path.
     fn follow_folders(&mut self, jobs: &[Job]) {
         let Some(watcher) = self.watcher.as_mut() else { return };
-        let mut routes: Vec<(PathBuf, JobId)> = Vec::new();
+        let mut routes: Vec<Route> = Vec::new();
+        let mut real = HashMap::new();
         for job in jobs {
             for root in [&job.setup.source, &job.setup.destination] {
-                if root.is_dir() {
-                    routes.push((root.clone(), job.id.clone()));
+                if !root.is_dir() {
+                    continue;
                 }
+                // Resolved again only for a folder that just came (back), not every second.
+                let resolved = match self.real_roots.remove(root) {
+                    Some(resolved) => resolved,
+                    None => std::fs::canonicalize(root).ok(),
+                };
+                real.insert(root.clone(), resolved.clone());
+                routes.push(Route::new(root, resolved, &job.id));
             }
         }
+        self.real_roots = real;
         watcher.follow(routes);
     }
 
-    /// Notes which jobs saw changes that matter, ignoring Charon's own writes during and
-    /// just after a run, and changes to excluded items.
+    /// Notes which jobs saw changes that matter, leaving out changes to excluded items, and
+    /// Charon's own writes during and just after a sync (a change elsewhere meanwhile has the
+    /// job looked at once its sync is done).
     fn collect_changes(&mut self) {
         while let Ok((id, path)) = self.changes.try_recv() {
-            if !self.engine.is_settling(&id, QUIET_AFTER_RUN) && self.engine.note_change(&id, &path) {
+            let matters = if self.engine.is_settling(&id, QUIET_AFTER_RUN) {
+                self.engine.note_change_while_syncing(&id, &path)
+            } else {
+                self.engine.note_change(&id, &path)
+            };
+            if matters {
                 self.changed.insert(id, Instant::now());
             }
         }

@@ -196,6 +196,17 @@ pub struct Skipped {
     pub reason: String,
 }
 
+/// One of Charon's own folders the scan met (`.charon`, see `run::Marker`): the folder
+/// holding it is a job's folder, or was one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CharonFolder {
+    /// The folder holding it, as spelled on disk, relative to the scanned folder ("" for
+    /// the scanned folder itself).
+    pub folder: String,
+    /// The jobs whose markers it holds.
+    pub jobs: Vec<String>,
+}
+
 /// What a scan learned besides the items themselves.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ScanFacts {
@@ -220,6 +231,9 @@ pub struct ScanFacts {
     pub(crate) reserved: BTreeMap<String, String>,
     /// Leftover half-copied files from an interrupted run: on-disk path, size and time.
     pub(crate) partials: Vec<(String, Entry)>,
+    /// Charon's own folders met: at the top, and in the folders of other jobs that are the
+    /// same place or inside this one.
+    pub(crate) charon_folders: Vec<CharonFolder>,
     /// Which folder was scanned (see `RootId`).
     pub(crate) root: Option<crate::scan::RootId>,
     /// The drive it's on.
@@ -352,6 +366,11 @@ impl Snapshot {
     /// `skipped`), or because its name is kept for Charon's or the drive's own use.
     pub fn leaves_alone(&self, key: &str) -> bool {
         self.facts.reserved.contains_key(key) || self.facts.skipped.iter().any(|skipped| skipped.key.as_deref() == Some(key))
+    }
+
+    /// Charon's own folders met in the folder, with the markers they hold.
+    pub fn charon_folders(&self) -> &[CharonFolder] {
+        &self.facts.charon_folders
     }
 
     /// Leftover half-copied files: on-disk path and what they looked like.

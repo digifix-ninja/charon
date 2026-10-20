@@ -21,6 +21,8 @@ pub(crate) struct Snapshot {
     look: Option<Look>,
     problem: Option<String>,
     waiting_for: Option<String>,
+    /// The person confirmed the list, and its sync waits for `waiting_for`.
+    confirmed: bool,
     rev: u64,
 }
 
@@ -37,6 +39,7 @@ impl Engine {
             look: rt.and_then(|rt| rt.look.clone()),
             problem: rt.and_then(|rt| rt.problem.clone()),
             waiting_for: rt.and_then(|rt| rt.waiting_for.clone()),
+            confirmed: rt.is_some_and(|rt| rt.confirmed.is_some()),
             rev: 0,
         };
         Snapshot { rev: self.inner.rev.fetch_add(1, Ordering::Relaxed) + 1, ..snapshot }
@@ -54,7 +57,7 @@ impl Engine {
 
     /// The row the window shows, made outside the locks (it asks the disk).
     pub(crate) fn view_of(&self, snapshot: Snapshot, settings: &Settings) -> JobView {
-        let Snapshot { job, running, looking, must_ask, progress, look, problem, waiting_for, rev } = snapshot;
+        let Snapshot { job, running, looking, must_ask, progress, look, problem, waiting_for, confirmed, rev } = snapshot;
         let waiting_since = job.waiting_since;
         // A look made with another setup says nothing about this one.
         let look = look.filter(|look| look.setup == job.setup);
@@ -181,6 +184,7 @@ impl Engine {
             next_run,
             stale,
             waiting_for: if running { None } else { waiting_for },
+            confirmed: confirmed && !running,
             job,
         }
     }

@@ -24,6 +24,6 @@ pub mod scan;
 pub mod store;
 
 pub use autopilot::Autopilot;
-pub use engine::{Emitter, Engine, EngineEvent, NotePage, StepPage, SyncStart};
+pub use engine::{Approval, Emitter, Engine, EngineEvent, NotePage, StepPage, SyncStart};
 pub use error::{Error, Result};
 pub use model::*;

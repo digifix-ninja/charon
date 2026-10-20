@@ -75,4 +75,9 @@ impl DataFolder {
     pub fn logs(&self) -> PathBuf {
         self.root.join("logs")
     }
+
+    /// The Charons that worked with this data folder, newest first (see `run::BusyWatch`).
+    pub fn instances(&self) -> PathBuf {
+        self.root.join("instances.json")
+    }
 }

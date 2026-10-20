@@ -11,9 +11,9 @@ use crate::plan::{Baseline, Side};
 use crate::store::atomic;
 use serde::{Deserialize, Serialize};
 use crate::scan::Keys;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 const VERSION: u32 = 2;
 
@@ -72,15 +72,28 @@ enum AnyMemory {
     Legacy(serde_json::Map<String, serde_json::Value>),
 }
 
+/// What a memory file starts with: the folders it was made with and their markers' tokens.
+#[derive(Debug, Clone, Deserialize)]
+struct Header {
+    source: PathBuf,
+    destination: PathBuf,
+    source_token: String,
+    destination_token: String,
+}
+
 pub struct Baselines {
     folder: PathBuf,
     /// Saves and removals happen one at a time.
     writing: Mutex<()>,
+    /// The header of each job's memory file, as last saved or read. Other jobs' looks ask
+    /// for it (see `tokens`), and the whole file can be large. Only this Charon writes the
+    /// files (see `DataLock`), so what's kept here is always what's on disk.
+    headers: Mutex<HashMap<JobId, Header>>,
 }
 
 impl Baselines {
     pub fn new(folder: PathBuf) -> Self {
-        Self { folder, writing: Mutex::new(()) }
+        Self { folder, writing: Mutex::new(()), headers: Mutex::default() }
     }
 
     /// The job's memory for its current folders: empty before its first sync, and empty
@@ -107,8 +120,11 @@ impl Baselines {
                         earlier: BTreeSet::new(),
                     }
                 } else {
+                    // Left behind when the job's folders changed (and it couldn't be removed
+                    // then), or written for this job by something else: either way, the
+                    // person sees why nothing is removed this time.
                     log::warn!("the two-way memory of job {job} belongs to other folders; starting fresh");
-                    Memory::fresh(None)
+                    Memory::fresh(Some("What Charon remembers of the last sync belongs to other folders than this job's.".into()))
                 }
             }
             // An older Charon could save its memory for the wrong folders (when a job was
@@ -126,6 +142,35 @@ impl Baselines {
         }
     }
 
+    /// The tokens of the markers the job left in its current folders at its last finished
+    /// sync (source, destination). `None` when there is no memory for these folders. The
+    /// memory file is read once at most while Charon runs.
+    pub fn tokens(&self, job: &JobId, setup: &JobSetup) -> Option<(String, String)> {
+        let header = self.header(job)?;
+        (Self::same_folder(&header.source, &setup.source) && Self::same_folder(&header.destination, &setup.destination))
+            .then_some((header.source_token, header.destination_token))
+    }
+
+    /// The header of the job's memory file, if it has one.
+    fn header(&self, job: &JobId) -> Option<Header> {
+        if let Some(header) = self.headers().get(job) {
+            return Some(header.clone());
+        }
+        // Read while no save can change the file, so what's kept is what's there.
+        let _one_at_a_time = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(header) = self.headers().get(job) {
+            return Some(header.clone());
+        }
+        let bytes = std::fs::read(self.file(job)).ok()?;
+        let header: Header = serde_json::from_slice(&bytes).ok()?;
+        self.headers().insert(job.clone(), header.clone());
+        Some(header)
+    }
+
+    fn headers(&self) -> MutexGuard<'_, HashMap<JobId, Header>> {
+        self.headers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Saves the memory of a finished sync. Needs the marker tokens it goes with.
     pub fn save(&self, job: &JobId, setup: &JobSetup, memory: &Memory) -> Result<()> {
         let (source_token, destination_token) =
@@ -141,13 +186,22 @@ impl Baselines {
             pairs: memory.baseline.clone(),
         };
         let bytes = serde_json::to_vec(&stored)?;
+        let header = Header {
+            source: stored.source,
+            destination: stored.destination,
+            source_token: stored.source_token,
+            destination_token: stored.destination_token,
+        };
         let _one_at_a_time = self.writing.lock().unwrap_or_else(|e| e.into_inner());
-        atomic::write(&self.file(job), &bytes)
+        atomic::write(&self.file(job), &bytes)?;
+        self.headers().insert(job.clone(), header);
+        Ok(())
     }
 
     /// Forgets the memory (the job was removed, or its folders or mode changed).
     pub fn forget(&self, job: &JobId) -> Result<()> {
         let _one_at_a_time = self.writing.lock().unwrap_or_else(|e| e.into_inner());
+        self.headers().remove(job);
         match std::fs::remove_file(self.file(job)) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -198,8 +252,40 @@ mod tests {
         let id = "job".to_string();
         baselines.save(&id, &setup("/a", "/b"), &memory()).unwrap();
         assert_eq!(baselines.load(&id, &setup("/a", "/b")), memory());
-        assert!(baselines.load(&id, &setup("/a", "/c")).baseline.is_empty());
-        assert!(baselines.load(&id, &setup("/x", "/b")).baseline.is_empty());
+        for other in [setup("/a", "/c"), setup("/x", "/b")] {
+            let loaded = baselines.load(&id, &other);
+            assert!(loaded.baseline.is_empty() && loaded.tokens.is_none());
+            assert!(loaded.distrust.is_some(), "the review says why it starts afresh");
+        }
+    }
+
+    #[test]
+    fn the_tokens_are_read_on_their_own_for_the_same_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let baselines = Baselines::new(tmp.path().to_path_buf());
+        let id = "job".to_string();
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), None);
+        baselines.save(&id, &setup("/a", "/b"), &memory()).unwrap();
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), Some(("s".into(), "d".into())));
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/c")), None);
+    }
+
+    #[test]
+    fn the_tokens_are_read_from_disk_once_and_follow_every_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "job".to_string();
+        Baselines::new(tmp.path().to_path_buf()).save(&id, &setup("/a", "/b"), &memory()).unwrap();
+        // A Charon that just started reads the file once…
+        let baselines = Baselines::new(tmp.path().to_path_buf());
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), Some(("s".into(), "d".into())));
+        std::fs::write(baselines.file(&id), b"never read again").unwrap();
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), Some(("s".into(), "d".into())));
+        // …and follows what it saves and removes itself.
+        let newer = Memory { tokens: Some(("s2".into(), "d2".into())), ..memory() };
+        baselines.save(&id, &setup("/a", "/b"), &newer).unwrap();
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), Some(("s2".into(), "d2".into())));
+        baselines.forget(&id).unwrap();
+        assert_eq!(baselines.tokens(&id, &setup("/a", "/b")), None);
     }
 
     #[test]

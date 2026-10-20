@@ -1,14 +1,15 @@
 //! The engine: owns the jobs, looks at their folders, syncs them and tells the window what
 //! changed.
 //!
-//! * `mod.rs`     – `Engine`: opening, settings, reading rows, events
-//! * `jobs.rs`    – adding, editing, pausing and removing jobs
-//! * `survey.rs`  – looking at both folders and planning, with every safety check
-//! * `review.rs`  – the list of changes waiting for the person's OK, and confirming it
-//! * `runs.rs`    – syncing: confirmed runs, full automation, held-back runs
-//! * `checks.rs`  – background looks for changes, and reminders when changes wait
-//! * `status.rs`  – turning a job and its live state into the row the window shows
-//! * `runtime.rs` – the live state of each job (running, progress, last look, review)
+//! * `mod.rs`      – `Engine`: opening, settings, reading rows, events
+//! * `jobs.rs`     – adding, editing, pausing and removing jobs
+//! * `survey.rs`   – looking at both folders and planning, with every safety check
+//! * `overlaps.rs` – folders that are one place under two names, in a job or between jobs
+//! * `review.rs`   – the list of changes waiting for the person's OK, and confirming it
+//! * `runs.rs`     – syncing: confirmed runs, full automation, held-back runs
+//! * `checks.rs`   – background looks for changes, and reminders when changes wait
+//! * `status.rs`   – turning a job and its live state into the row the window shows
+//! * `runtime.rs`  – the live state of each job (running, progress, last look, review)
 //!
 //! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
 //! the same order, the stored state before the live state. Nothing that looks at a job's
@@ -18,18 +19,20 @@
 
 mod checks;
 mod jobs;
+mod overlaps;
 mod review;
 mod runs;
 mod runtime;
 mod status;
 mod survey;
 
-pub use review::{NotePage, StepPage};
+pub use review::{Approval, NotePage, StepPage};
 pub use runs::SyncStart;
 
 use crate::error::{Error, Result};
 use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, UpgradeNotice, WaitingJob};
 use crate::plan::Side;
+use crate::run::BusyWatch;
 use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
 use runtime::{JobRuntime, Look, Missing};
 use std::collections::HashMap;
@@ -37,7 +40,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
+
+/// While the state file can't be saved, a new save is tried this often.
+const SAVE_RETRY: Duration = Duration::from_secs(60);
 
 /// Something the window (or the tray, or notifications) may want to know.
 #[derive(Debug, Clone)]
@@ -90,6 +96,19 @@ struct Inner {
     quitting: AtomicBool,
     /// When this engine opened (reminders wait for the first looks after a start).
     opened: Instant,
+    /// The busy notes of syncs at work in the folders, this Charon's own and others' (see
+    /// `run::BusyWatch`).
+    busy: Arc<BusyWatch>,
+    /// When the last save of the state file failed, if it did (a full disk?): runs nobody
+    /// looks at wait until a save works again (see `can_save`). Its lock is taken last, and
+    /// no other lock is taken while it's held.
+    cannot_save: Mutex<Option<Instant>>,
+    /// When Charon 0.2's state file last changed, as found when the engine opened (it was
+    /// moved aside then, so usually it isn't there).
+    legacy_seen: Option<SystemTime>,
+    /// An older Charon wrote its state file while this one runs: it's running too, and
+    /// syncs by itself without this one's checks. Nothing syncs until Charon restarts.
+    older_charon: AtomicBool,
     /// Only one Charon works with the data folder at a time.
     _lock: DataLock,
 }
@@ -116,6 +135,7 @@ impl Engine {
             .filter(|(_, kept)| !kept.is_empty())
             .map(|(id, kept)| (id, JobRuntime { missing: Missing::restored(kept), ..JobRuntime::default() }))
             .collect();
+        let legacy_seen = state_file.legacy_changed_at();
         let engine = Self {
             inner: Arc::new(Inner {
                 state_file,
@@ -130,6 +150,10 @@ impl Engine {
                 rev: AtomicU64::new(0),
                 quitting: AtomicBool::new(false),
                 opened: Instant::now(),
+                busy: Arc::new(BusyWatch::open(&folder.instances())),
+                cannot_save: Mutex::new(None),
+                legacy_seen,
+                older_charon: AtomicBool::new(false),
                 _lock: lock,
             }),
         };
@@ -189,7 +213,56 @@ impl Engine {
     }
 
     pub fn overview(&self) -> Overview {
-        Overview::of(&self.jobs(), self.settings().paused_all)
+        Overview::of(&self.jobs(), self.settings().paused_all, self.problem())
+    }
+
+    /// What keeps Charon from syncing as it should, for the header and the tray: an older
+    /// Charon running at the same time, or a state file that can't be saved.
+    pub fn problem(&self) -> Option<String> {
+        if self.inner.older_charon.load(Ordering::SeqCst) {
+            Some(runs::OLDER_CHARON.into())
+        } else if self.saving_failed().is_some() {
+            Some(runs::CANNOT_SAVE.into())
+        } else {
+            None
+        }
+    }
+
+    /// Whether an older Charon (0.2) runs at the same time as this one: its state file was
+    /// written after this Charon opened. (0.2 doesn't know its jobs moved, and saves them
+    /// there again after a sync.) It syncs by itself without this version's checks, so
+    /// nothing syncs here until Charon is reopened with the older one quit. Once seen, it
+    /// stays seen. Reads one small file's date: cheap enough to ask before every sync.
+    pub fn older_charon_running(&self) -> bool {
+        if self.inner.older_charon.load(Ordering::SeqCst) {
+            return true;
+        }
+        let written = self.inner.state_file.legacy_changed_at();
+        if written.is_none() || written == self.inner.legacy_seen {
+            return false;
+        }
+        if !self.inner.older_charon.swap(true, Ordering::SeqCst) {
+            log::error!("an older Charon wrote its state file while this one runs: nothing syncs until Charon is reopened");
+            self.emit(EngineEvent::Overview(self.overview()));
+        }
+        true
+    }
+
+    /// Whether Charon's state can be saved: the last save worked, or, at most once a minute
+    /// while saves fail, a new save does.
+    pub(crate) fn can_save(&self) -> bool {
+        match self.saving_failed() {
+            None => true,
+            Some(failed) if failed.elapsed() < SAVE_RETRY => false,
+            Some(_) => {
+                let saved = self.change_state(|_| ()).is_ok();
+                if saved {
+                    log::info!("Charon can save its state again");
+                    self.emit(EngineEvent::Overview(self.overview()));
+                }
+                saved
+            }
+        }
     }
 
     /// The newest lines of a job's activity log, newest first.
@@ -290,9 +363,30 @@ impl Engine {
         let mut state = self.state();
         let mut next = state.clone();
         let result = change(&mut next);
-        self.inner.state_file.save(&next)?;
+        self.save(&next)?;
         *state = next;
         Ok(result)
+    }
+
+    /// Saves the state file (with the state lock held), and notes whether it worked.
+    fn save(&self, state: &StoredState) -> Result<()> {
+        let saved = self.inner.state_file.save(state);
+        let mut failed = self.inner.cannot_save.lock().unwrap_or_else(|e| e.into_inner());
+        match &saved {
+            Ok(()) => *failed = None,
+            Err(e) => {
+                if failed.is_none() {
+                    log::error!("couldn't save Charon's state: {e}");
+                }
+                *failed = Some(Instant::now());
+            }
+        }
+        saved
+    }
+
+    /// When the last save of the state file failed, if it did.
+    fn saving_failed(&self) -> Option<Instant> {
+        *self.inner.cannot_save.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Changes one stored job and saves.
@@ -310,14 +404,14 @@ impl Engine {
         let mut state = self.state();
         let mut next = state.clone();
         next.jobs.iter_mut().find(|job| &job.id == id).map(change).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-        let saved = self.inner.state_file.save(&next);
+        let saved = self.save(&next);
         *state = next;
         saved
     }
 
     /// Changes the stored state and the job's live state together, but only while the job
     /// isn't syncing (refused with `busy`). The stored change is saved before it counts.
-    fn with_job_at_rest(&self, id: &JobId, busy: &str, change: impl FnOnce(&mut StoredState, &mut JobRuntime) -> Result<()>) -> Result<()> {
+    fn with_job_at_rest<R>(&self, id: &JobId, busy: &str, change: impl FnOnce(&mut StoredState, &mut JobRuntime) -> Result<R>) -> Result<R> {
         let mut state = self.state();
         let mut runtime = self.runtime();
         let rt = runtime.entry(id.clone()).or_default();
@@ -325,10 +419,10 @@ impl Engine {
             return Err(Error::Invalid(busy.to_string()));
         }
         let mut next = state.clone();
-        change(&mut next, rt)?;
-        self.inner.state_file.save(&next)?;
+        let result = change(&mut next, rt)?;
+        self.save(&next)?;
         *state = next;
-        Ok(())
+        Ok(result)
     }
 
     /// Changes one job's live state.
@@ -336,13 +430,21 @@ impl Engine {
         change(self.runtime().entry(id.clone()).or_default())
     }
 
+    /// Changes one job's live state, if the job still has one. For whatever ends after the
+    /// job may have been removed (a look, a review being made): it leaves nothing behind.
+    fn change_known_runtime<R>(&self, id: &JobId, change: impl FnOnce(&mut JobRuntime) -> R) -> Option<R> {
+        self.runtime().get_mut(id).map(change)
+    }
+
     /// Changes what the looks at `job` found missing (see `Missing`), and keeps it for the
     /// next launch when that changed. It's saved while the live state is locked, so two
     /// looks never save in the wrong order; a record that can't be saved is removed, so the
-    /// next launch starts the waits over rather than trust an old record.
+    /// next launch starts the waits over rather than trust an old record. A job that has no
+    /// live state any more (it was removed while a look ran) keeps nothing.
     fn change_missing<R>(&self, job: &Job, change: impl FnOnce(&mut Missing) -> R) -> R {
         let mut runtime = self.runtime();
-        let missing = &mut runtime.entry(job.id.clone()).or_default().missing;
+        let Some(rt) = runtime.get_mut(&job.id) else { return change(&mut Missing::default()) };
+        let missing = &mut rt.missing;
         let before = missing.kept();
         let result = change(missing);
         let kept = missing.kept();
@@ -369,10 +471,36 @@ impl Engine {
 
     fn publish_all(&self) {
         let views = self.jobs();
-        let overview = Overview::of(&views, self.settings().paused_all);
+        let overview = Overview::of(&views, self.settings().paused_all, self.problem());
         for view in views {
             self.emit(EngineEvent::Job(Box::new(view)));
         }
         self.emit(EngineEvent::Overview(overview));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn a_save_that_failed_is_tried_again_after_a_while_and_the_problem_clears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Engine::open(tmp.path(), Arc::new(|_| {})).unwrap();
+        // The state file can't be replaced (a full disk would do the same).
+        let state = tmp.path().join("charon-state.json");
+        let _ = fs::remove_file(&state);
+        fs::create_dir_all(state.join("in the way")).unwrap();
+        assert!(engine.change_state(|_| ()).is_err());
+        assert_eq!(engine.problem().as_deref(), Some(runs::CANNOT_SAVE));
+        fs::remove_dir_all(&state).unwrap();
+        assert!(!engine.can_save(), "not tried again at once");
+        assert!(engine.problem().is_some());
+        // A minute later, a new save is tried, and works.
+        *engine.inner.cannot_save.lock().unwrap() = Some(Instant::now().checked_sub(SAVE_RETRY).expect("the computer has run for a minute"));
+        assert!(engine.can_save());
+        assert_eq!(engine.problem(), None);
+        assert!(state.is_file());
     }
 }

@@ -8,9 +8,11 @@
 //! * `room.rs`     – `Room`: how much room a drive has left, so a sync never fills one up
 //! * `durable.rs`  – making a run's changes durable on the drive before they're recorded
 //! * `marker.rs`   – `Marker`: tells Charon a folder is the one it synced with
+//! * `busy.rs`     – `Claim`: tells other syncs (and other Charons) a sync is at work in a folder
 //! * `meter.rs`    – `ProgressMeter`: counts what's done for the progress bar
 //! * `names.rs`    – fitting new names (conflict copies, numbered trash items) to a drive's limits
 
+mod busy;
 mod copier;
 pub(crate) mod durable;
 mod executor;
@@ -22,9 +24,10 @@ pub(crate) mod rename;
 mod room;
 mod trash;
 
+pub use busy::{BusyNote, BusyWatch, Claim, BUSY_EXTENSION};
 pub use copier::{Copier, Written};
 pub use executor::{Care, Executor, Outcome, Refused, Shores, Spellings, Unread};
-pub use marker::{Found, Marker, Markers};
+pub use marker::{Found, Marker, Markers, Origin, PROBE_EXTENSION};
 pub use meter::ProgressMeter;
 pub use room::Room;
 pub use trash::{Expired, Trash, TrashLook};

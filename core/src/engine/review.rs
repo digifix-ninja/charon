@@ -4,9 +4,12 @@
 //! discarded, replaced by a newer one, or the job changes. Confirming it carries out exactly
 //! that list: nothing else, and each step only if its items are still as they were seen. A
 //! list older than 15 minutes, or made before something changed in the folders, can't be
-//! confirmed: the person looks again.
+//! confirmed: the person looks again. A list confirmed while another sync is at work in the
+//! job's folders waits for that sync, and is carried out as soon as it's done (unless the
+//! job changed, synced, or a drive was swapped meanwhile: then the row says why it wasn't).
 
 use crate::engine::runs::Crossing;
+use crate::engine::runtime::Confirmed;
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, Look};
 use crate::error::{Error, Result};
@@ -22,6 +25,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// How long a list can be confirmed after it was made.
 const VALID_FOR_MINUTES: i64 = 15;
@@ -68,16 +72,34 @@ pub struct NotePage {
     pub total: usize,
 }
 
+/// What confirming a list did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Approval {
+    /// The sync started.
+    Started,
+    /// Another sync is at work in the job's folders: the confirmed sync starts by itself as
+    /// soon as that sync is done, unless the person calls it off (Stop, or closing the list).
+    Waiting {
+        /// That sync, as the row's `waitingFor` names it: another job's name, "another
+        /// Charon", or "Charon on <computer>".
+        #[serde(rename = "waitingFor")]
+        waiting_for: String,
+    },
+}
+
 impl Engine {
     /// Looks at both folders now and prepares the list of what the next sync would do.
     /// Slow: it scans both folders (`cancel_review` stops it).
     pub fn prepare_review(&self, id: &JobId) -> Result<Review> {
-        let (job, stop) = self.begin_look(id)?;
+        let (job, stop, epoch) = self.begin_look(id)?;
         let survey = self.survey(&job, &stop, Purpose::Review);
         self.end_look(id, &stop);
         let survey = survey?;
-        self.note_look(&job, &survey);
-        let review = self.keep_review(&job, survey, ReviewKind::Sync, None, None)?;
+        if !self.note_look(&job, &survey, Some(epoch)) {
+            return Err(Self::overtaken());
+        }
+        let review = self.keep_review(&job, survey, ReviewKind::Sync, None, None, epoch)?;
         self.publish(id);
         Ok(review)
     }
@@ -89,13 +111,21 @@ impl Engine {
         }
     }
 
-    /// The list the person closed without confirming it.
+    /// The list the person closed without confirming it (or, once confirmed, while its sync
+    /// waited for another sync).
     pub fn discard_review(&self, id: &JobId, review_id: &str) {
-        self.change_runtime(id, |rt| {
-            if rt.review.as_ref().is_some_and(|review| review.id == review_id) {
-                rt.review = None;
+        let waited = self.change_known_runtime(id, |rt| {
+            let current = rt.review.as_ref().is_some_and(|review| review.id == review_id);
+            let waited = current && rt.confirmed.is_some();
+            if current {
+                rt.forget_review();
             }
+            waited
         });
+        if waited == Some(true) {
+            self.inner.journal.info(id, "the confirmed sync that waited for another sync was called off");
+            self.publish(id);
+        }
     }
 
     /// One page of a review's steps, filtered by kind and by a part of the path.
@@ -140,8 +170,87 @@ impl Engine {
     }
 
     /// Carries out exactly the reviewed list, in the background. Refused when the list
-    /// can't be trusted anymore, or can't be confirmed as it is.
-    pub fn approve(&self, id: &JobId, review_id: &str, acknowledged: bool) -> Result<()> {
+    /// can't be trusted anymore, or can't be confirmed as it is. While another sync is at
+    /// work in the job's folders, the confirmed list waits for it, and its sync starts as
+    /// soon as that sync is done (see `start_confirmed`; the row says what it waits for).
+    /// Says which of the two happened.
+    pub fn approve(&self, id: &JobId, review_id: &str, acknowledged: bool) -> Result<Approval> {
+        match self.carry_out(id, review_id, acknowledged, false) {
+            Ok(()) => Ok(Approval::Started),
+            Err(Error::FoldersBusy(who)) if self.queue_confirmed(id, review_id, acknowledged, &who) => Ok(Approval::Waiting { waiting_for: who }),
+            // The list was replaced or closed in between.
+            Err(Error::FoldersBusy(_)) => Err(Self::gone()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Starts the sync of a list the person confirmed while another sync was at work in the
+    /// job's folders, if nothing stands in its way anymore. Returns whether it started. A
+    /// list that can't be carried out anymore (the job changed, synced, or a drive was
+    /// swapped meanwhile) is dropped, and the row says why.
+    pub fn start_confirmed(&self, id: &JobId) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
+        let Some(confirmed) = self.runtime().get(id).and_then(|rt| rt.confirmed.clone()) else { return false };
+        match self.carry_out(id, &confirmed.review_id, confirmed.acknowledged, true) {
+            Ok(()) => true,
+            Err(Error::FoldersBusy(who)) => {
+                let changed = self.change_known_runtime(id, |rt| rt.waiting_for.replace(who.clone()) != Some(who));
+                if changed == Some(true) {
+                    self.publish(id);
+                }
+                false
+            }
+            // Its own sync runs, or a folder is away for a moment: it keeps waiting. (Stopped
+            // by the person meanwhile, it was called off and said so.)
+            Err(Error::Busy) | Err(Error::Offline(_)) | Err(Error::Cancelled) => false,
+            Err(e) => {
+                self.change_known_runtime(id, |rt| {
+                    if rt.confirmed.as_ref().is_some_and(|waiting| waiting.review_id == confirmed.review_id) {
+                        rt.forget_review();
+                        rt.problem = Some(format!("The list you confirmed couldn't be carried out after all. {e}"));
+                    }
+                });
+                self.inner.journal.warn(id, &format!("the confirmed sync that waited for another sync didn't start: {e}"));
+                self.publish(id);
+                false
+            }
+        }
+    }
+
+    /// Keeps a confirmed list waiting while another sync (`who`) is at work in the job's
+    /// folders. Returns whether it waits (it's still the job's list).
+    fn queue_confirmed(&self, id: &JobId, review_id: &str, acknowledged: bool, who: &str) -> bool {
+        let queued = self.change_known_runtime(id, |rt| {
+            let current = rt.review.as_ref().is_some_and(|review| review.id == review_id);
+            if current {
+                rt.confirmed = Some(Confirmed { review_id: review_id.to_string(), acknowledged });
+                rt.waiting_for = Some(who.to_string());
+            }
+            current
+        }) == Some(true);
+        if queued {
+            self.inner.journal.info(id, &format!("confirmed by you; waits for “{who}” to finish syncing these folders"));
+            self.publish(id);
+        }
+        queued
+    }
+
+    /// The confirmed list is being carried out: it no longer waits for an OK.
+    pub(crate) fn take_review(&self, id: &JobId, review_id: &str) {
+        self.change_known_runtime(id, |rt| {
+            if rt.review.as_ref().is_some_and(|review| review.id == review_id) {
+                rt.forget_review();
+            }
+        });
+    }
+
+    /// Carries out exactly the reviewed list, after the checks that make sure it can still be
+    /// trusted. A list that `waited` for another sync was confirmed in time: neither its age
+    /// nor the changes made in the folders since count against it (each step still checks
+    /// its items right before it acts, and leaves alone what changed).
+    fn carry_out(&self, id: &JobId, review_id: &str, acknowledged: bool, waited: bool) -> Result<()> {
         let review = self.stored_review(id, review_id)?;
         // The folders must still be the very folders the list was made from.
         for side in [Side::Source, Side::Destination] {
@@ -170,10 +279,10 @@ impl Engine {
         }
         let (job, cancel) = self.begin_run(id, |job, rt| {
             let current = rt.review.as_ref().filter(|r| r.id == review_id).ok_or_else(Self::gone)?;
-            if Utc::now() > current.expires_at {
+            if !waited && Utc::now() > current.expires_at {
                 return Err(Error::ReviewOutdated(format!("This list was made more than {VALID_FOR_MINUTES} minutes ago. Look again.")));
             }
-            if current.stale.load(Ordering::Relaxed) {
+            if !waited && current.stale.load(Ordering::Relaxed) {
                 return Err(Error::ReviewOutdated("Things changed in the folders since this list was made. Look again.".into()));
             }
             if job.setup != current.survey.setup {
@@ -188,24 +297,33 @@ impl Engine {
             if current.needs_tick && !acknowledged {
                 return Err(Error::Invalid("Tick “I've looked at the removals and replacements” first.".into()));
             }
-            rt.review = None;
             Ok(())
         })?;
-        self.publish(id);
-        let reason = match review.kind {
+        let mut reason = match review.kind {
             ReviewKind::Sync => "confirmed by you".to_string(),
             ReviewKind::Resolve => format!("to settle a conflict ({})", review.title.as_deref().unwrap_or("confirmed by you")),
         };
+        if waited {
+            reason.push_str(", after waiting for another sync");
+        }
         let crossing = Crossing { kind: review.kind, approved: true, reason, resolving: review.resolving.clone() };
+        // The run's busy notes go into the folders before anything changes there, and before
+        // the person is told it started.
+        let claim = match self.claim_folders(&job, &review.survey) {
+            Ok(claim) => claim,
+            Err(who) => return Err(if self.not_begun(&job, &crossing, &who) { Error::FoldersBusy(who) } else { Error::Cancelled }),
+        };
+        self.publish(id);
         self.spawn_crossing(job, cancel, crossing, move |engine, job, cancel, crossing| {
-            engine.cross(&job, &review.survey, &cancel, &crossing);
+            engine.take_review(&job.id, &review.id);
+            engine.cross(&job, &review.survey, &cancel, &crossing, claim);
         })
     }
 
     /// Prepares the list that settles one conflict the way the person chose. Nothing
     /// changes until it's confirmed like any other list.
     pub fn prepare_resolution(&self, id: &JobId, conflict: &ConflictItem, choice: ConflictChoice) -> Result<Review> {
-        let (job, stop) = self.begin_look(id)?;
+        let (job, stop, epoch) = self.begin_look(id)?;
         if !job.setup.mode.is_two_way() {
             self.end_look(id, &stop);
             return Err(Error::Invalid("Only two-way jobs have conflicts to settle.".into()));
@@ -219,7 +337,7 @@ impl Engine {
         // conflict means its files still changed on both sides).
         let still_open = survey.plan.conflicts().iter().any(|(path, ..)| *path == key);
         if &now != conflict || !still_open {
-            self.note_look(&job, &survey);
+            self.note_look(&job, &survey, Some(epoch));
             self.publish(id);
             return Err(Error::ReviewOutdated("It changed since you saw it. Look again.".into()));
         }
@@ -234,7 +352,8 @@ impl Engine {
             }
         );
         survey.plan = plan;
-        survey.refusal = None;
+        // Folders one inside the other can't settle anything either.
+        survey.refusal = Self::nested(&survey.setup);
         survey.holds.clear();
         survey.needs_tick = false;
         survey.agreed = 0;
@@ -250,16 +369,19 @@ impl Engine {
         survey.warnings.push(Warning::info(
             "Only this item changes. The version that is replaced or removed goes to .charon-trash, even when safe deletes are off.",
         ));
-        let review = self.keep_review(&job, survey, ReviewKind::Resolve, Some(title), Some(key.to_string()))?;
+        let review = self.keep_review(&job, survey, ReviewKind::Resolve, Some(title), Some(key.to_string()), epoch)?;
         self.publish(id);
         Ok(review)
     }
 
     // ---------------------------------------------------------------- internals
 
-    /// Marks a look (a review being prepared) as started, if the job isn't busy.
-    fn begin_look(&self, id: &JobId) -> Result<(crate::model::Job, Arc<AtomicBool>)> {
+    /// Marks a look (a review being prepared) as started, if the job isn't busy. Returns the
+    /// job, the look's stop flag, and the job's epoch when it began (see `note_look`).
+    fn begin_look(&self, id: &JobId) -> Result<(crate::model::Job, Arc<AtomicBool>, u64)> {
+        // Both ask the disk, so they come before any lock is taken.
         let neighbours = self.neighbours(id);
+        let in_use = self.folders_in_use(id);
         let state = self.state();
         let job = state.jobs.iter().find(|job| &job.id == id).cloned().ok_or_else(|| Error::UnknownJob(id.clone()))?;
         let mut runtime = self.runtime();
@@ -269,28 +391,34 @@ impl Engine {
         if runtime.get(id).is_some_and(|rt| rt.is_running()) {
             return Err(Error::Busy);
         }
-        if let Some(other) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours) {
+        if let Some(other) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
             return Err(Error::FoldersBusy(other));
         }
         let rt = runtime.entry(id.clone()).or_default();
         if rt.preparing.is_some() {
             return Err(Error::Invalid("Charon is already looking at this job's folders.".into()));
         }
-        // A background look at the same folders would only read them twice.
-        if let Some(checking) = &rt.checking {
-            checking.store(true, Ordering::Relaxed);
-        }
+        // A background look at the same folders would only read them twice, and what it
+        // found would be older than what this look finds.
+        rt.outdate_looks();
         let stop = Arc::new(AtomicBool::new(false));
         rt.preparing = Some(stop.clone());
-        Ok((job, stop))
+        Ok((job, stop, rt.epoch))
     }
 
     fn end_look(&self, id: &JobId, stop: &Arc<AtomicBool>) {
-        self.change_runtime(id, |rt| {
+        self.change_known_runtime(id, |rt| {
             if rt.preparing.as_ref().is_some_and(|flag| Arc::ptr_eq(flag, stop)) {
                 rt.preparing = None;
             }
         });
+    }
+
+    /// A list made while the job synced, changed or was removed, or while a folder came back.
+    fn overtaken() -> Error {
+        Error::ReviewOutdated(
+            "The job or its folders changed while this list was being made (a sync, an edit, or a drive that came back). Look again.".into(),
+        )
     }
 
     /// A conflict as the window shows it, saying when it's about a whole app library or
@@ -309,8 +437,18 @@ impl Engine {
         self.runtime().get(id).and_then(|rt| rt.review.clone()).filter(|review| review.id == review_id).ok_or_else(Self::gone)
     }
 
-    /// Keeps a review of `survey` for the job (replacing any other) and returns it.
-    fn keep_review(&self, job: &crate::model::Job, survey: Survey, kind: ReviewKind, title: Option<String>, resolving: Option<String>) -> Result<Review> {
+    /// Keeps a review of `survey` for the job (replacing any other, and a confirmed one that
+    /// waited) and returns it. `epoch` is the job's epoch when the look began: a list the job
+    /// outgrew meanwhile (it synced, changed or was removed) isn't kept.
+    pub(crate) fn keep_review(
+        &self,
+        job: &crate::model::Job,
+        survey: Survey,
+        kind: ReviewKind,
+        title: Option<String>,
+        resolving: Option<String>,
+        epoch: u64,
+    ) -> Result<Review> {
         let prepared_at = Utc::now();
         let clearings = survey.plan.clearings();
         let steps: Vec<ReviewStep> = survey.plan.for_review().into_iter().map(|action| Self::step_of(&survey, action, kind, &clearings)).collect();
@@ -343,13 +481,22 @@ impl Engine {
             survey,
         });
         let review = self.review_of(job, &stored);
-        self.change_runtime(&job.id, |rt| {
+        let kept = self.change_known_runtime(&job.id, |rt| {
+            if rt.epoch != epoch || rt.is_running() {
+                return false;
+            }
+            rt.forget_review();
             rt.review = Some(stored);
             // The person is looking at the list: the next reminder can wait.
             rt.reminder.last = Some(Utc::now());
             rt.reminder.count = rt.reminder.count.max(1);
+            true
         });
-        Ok(review)
+        match kept {
+            Some(true) => Ok(review),
+            Some(false) => Err(Self::overtaken()),
+            None => Err(Error::UnknownJob(job.id.clone())),
+        }
     }
 
     /// The review as the window receives it.
@@ -605,19 +752,36 @@ impl Engine {
     }
 
     /// Records what a survey found as the job's latest look, and since when its changes
-    /// have waited.
-    pub(crate) fn note_look(&self, job: &crate::model::Job, survey: &Survey) {
+    /// have waited. `epoch` is the job's epoch when the look began: a look the job outgrew
+    /// meanwhile (a run began, the job changed or was removed, a folder came back) is
+    /// dropped, so it never takes the place of a newer one. A run's own look has none: no
+    /// other look can begin while a run is going. Returns whether the look was recorded.
+    pub(crate) fn note_look(&self, job: &crate::model::Job, survey: &Survey, epoch: Option<u64>) -> bool {
+        let Ok(stored) = self.stored_job(&job.id) else { return false };
+        // A look made for a setup that changed meanwhile tells nothing.
+        if stored.setup != job.setup {
+            return false;
+        }
+        let held = stored.held.is_some();
         let look = Look::of(survey);
         let at = look.at;
         let has_work = look.has_work();
-        let held = self.stored_job(&job.id).ok().and_then(|stored| stored.held).is_some();
-        self.change_runtime(&job.id, |rt| {
+        let recorded = self.change_known_runtime(&job.id, |rt| {
+            if epoch.is_some_and(|epoch| epoch != rt.epoch || rt.is_running()) {
+                return false;
+            }
             if !has_work && !held {
                 rt.reminder.count = 0;
             }
             rt.problem = None;
             rt.look = Some(look);
+            // A list counts as a look: the next background look waits its turn.
+            rt.last_checked = Some(Instant::now());
+            true
         });
+        if recorded != Some(true) {
+            return false;
+        }
         // Saved only when the wait begins or ends.
         let since = self.stored_job(&job.id).ok().and_then(|stored| stored.waiting_since);
         let wanted = if has_work || held { since.or(Some(at)) } else { None };
@@ -626,6 +790,7 @@ impl Engine {
                 log::warn!("couldn't save since when changes of {} wait: {e}", job.setup.name);
             }
         }
+        true
     }
 }
 

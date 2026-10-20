@@ -42,13 +42,18 @@ fn confirm(engine: &Engine, id: &String) {
     wait(engine, id);
 }
 
-/// Looks at the job in the background and waits until the look has found something.
+/// Looks at the job in the background and waits until a look has found something. A look
+/// that was outdated while it ran doesn't count, and the job is looked at again once it's
+/// due, as the autopilot does every second.
 fn look_until(engine: &Engine, id: &String, found: impl Fn(&Engine) -> bool) {
     engine.check(id);
     let deadline = Instant::now() + Duration::from_secs(10);
     while !found(engine) {
         assert!(Instant::now() < deadline, "the look never finished");
         thread::sleep(Duration::from_millis(20));
+        if engine.check_due(id, 1) {
+            engine.check(id);
+        }
     }
 }
 

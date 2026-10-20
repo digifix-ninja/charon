@@ -422,8 +422,12 @@ pub struct JobView {
     pub next_run: Option<DateTime<Utc>>,
     /// "Not synced for 3 days", "Changes have waited for your OK since Monday".
     pub stale: Option<String>,
-    /// A sync is due but waits for this other job, which is syncing the same folders.
+    /// A sync is due but waits for this other sync of the same folders: another job's
+    /// name, "another Charon", or "Charon on <computer>".
     pub waiting_for: Option<String>,
+    /// The person confirmed the job's list, and its sync starts as soon as `waiting_for` is
+    /// done (Stop calls it off).
+    pub confirmed: bool,
 }
 
 /// One line per state for the tray icon and the header.
@@ -442,11 +446,14 @@ pub struct Overview {
     /// Jobs that sync, but leave places out (unreadable, left out, name clashes).
     pub incomplete: usize,
     pub paused_all: bool,
+    /// What keeps Charon from syncing as it should, in a sentence: an older Charon running
+    /// at the same time, or its state that can't be saved.
+    pub problem: Option<String>,
 }
 
 impl Overview {
     /// Counts the statuses of all rows.
-    pub fn of(views: &[JobView], paused_all: bool) -> Self {
+    pub fn of(views: &[JobView], paused_all: bool, problem: Option<String>) -> Self {
         let count = |wanted: &[JobStatus]| views.iter().filter(|v| wanted.contains(&v.status)).count();
         Self {
             jobs: views.len(),
@@ -458,12 +465,16 @@ impl Overview {
             looking: count(&[JobStatus::Looking]),
             incomplete: views.iter().filter(|v| !v.unreadable.is_empty() || v.not_synced_count > 0).count(),
             paused_all,
+            problem,
         }
     }
 
     /// A short sentence, e.g. "Syncing 2 jobs" or "All in sync".
     pub fn headline(&self) -> String {
-        if self.jobs == 0 {
+        if self.problem.is_some() {
+            // Nothing else holds while Charon itself can't work as it should.
+            "Charon needs your attention".into()
+        } else if self.jobs == 0 {
             "No sync jobs yet".into()
         } else if self.syncing > 0 {
             format!("Syncing {}", plural(self.syncing as u64, "job"))

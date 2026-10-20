@@ -44,6 +44,22 @@ impl RootId {
         system::id_of(path)
     }
 
+    /// Whether the folder `inner` is the folder `outer` or somewhere inside it, judged by the
+    /// folders themselves rather than their paths, so a link, a bind mount or another
+    /// spelling of a name can't hide it. `false` where the system can't tell.
+    pub fn is_within(inner: &Path, outer: &Path) -> bool {
+        let Ok(Some(outer)) = RootId::of(outer) else { return false };
+        let Ok(inner) = std::fs::canonicalize(inner) else { return false };
+        inner.ancestors().any(|folder| matches!(RootId::of(folder), Ok(Some(id)) if id.same_place(&outer)))
+    }
+
+    /// Whether `self` and `other` are the same folder at one moment, through whichever
+    /// mount: a bind mount shows a folder through a mount of its own, so here the mount
+    /// counts for nothing (it only tells a drive that came back from the one seen before).
+    fn same_place(&self, other: &RootId) -> bool {
+        RootId { mount: None, ..*self }.same_folder(other)
+    }
+
     /// Whether `self` and `other` are the same folder. A creation time or a mount only one
     /// of them knows (or neither) doesn't count as a difference.
     pub fn same_folder(&self, other: &RootId) -> bool {
@@ -174,6 +190,21 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_inside_another_is_recognised_through_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("Dropbox");
+        std::fs::create_dir_all(outer.join("Backup")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("Elsewhere")).unwrap();
+        std::os::unix::fs::symlink(&outer, tmp.path().join("Link")).unwrap();
+        assert!(RootId::is_within(&tmp.path().join("Link/Backup"), &outer));
+        assert!(RootId::is_within(&outer, &tmp.path().join("Link")), "the same folder");
+        assert!(!RootId::is_within(&outer, &outer.join("Backup")));
+        assert!(!RootId::is_within(&tmp.path().join("Elsewhere"), &outer));
+        assert!(!RootId::is_within(&tmp.path().join("missing"), &outer));
+    }
+
     #[test]
     fn the_same_numbers_with_another_creation_time_are_another_folder() {
         let a = RootId { device: 1, index: 2, born: Some(1_000), mount: None };
@@ -191,6 +222,7 @@ mod tests {
         let again = RootId { mount: Some(41), ..before };
         assert!(!again.same_folder(&before));
         assert!(RootId { mount: None, ..before }.same_folder(&again), "an unknown mount isn't a difference");
+        assert!(again.same_place(&before), "at one moment, two mounts of a folder are one place");
     }
 
     #[test]

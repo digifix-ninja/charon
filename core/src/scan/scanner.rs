@@ -5,8 +5,8 @@
 use crate::error::{Error, Result};
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Snapshot, Volume, MARKER_FOLDER,
-    TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, RootId,
+    Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -143,6 +143,9 @@ impl<'a> Scanner<'a> {
                         snapshot.leave_out(disk, Some(&key), "named like one of Charon's own folders, so Charon leaves it alone");
                     } else {
                         snapshot.reserve(&key, &disk);
+                        if name == MARKER_FOLDER {
+                            Self::note_charon_folder(item.path(), &disk, &mut snapshot);
+                        }
                         if Keys::parent(&key).is_some() {
                             // Another job's trash or marker inside this folder: never removed.
                             snapshot.occupy_folders_of(&key);
@@ -274,11 +277,21 @@ impl<'a> Scanner<'a> {
             let Ok(item) = item else { return false };
             let (Ok(kind), Some(inner)) = (item.file_type(), item.file_name().to_str().map(str::to_owned)) else { return false };
             if name == MARKER_FOLDER {
-                kind.is_file() && (inner.ends_with(".json") || inner.ends_with(".tmp"))
+                kind.is_file()
+                    && [".json", crate::run::BUSY_EXTENSION, crate::run::PROBE_EXTENSION, ".tmp"].iter().any(|extension| inner.ends_with(extension))
             } else {
                 kind.is_dir() && crate::run::Trash::is_run_folder(&inner)
             }
         })
+    }
+
+    /// Notes Charon's own folder at `path` (`disk` is that folder as spelled on disk), with
+    /// the jobs whose markers it holds: each one is a job whose folder is the one holding it.
+    fn note_charon_folder(path: &Path, disk: &str, snapshot: &mut Snapshot) {
+        let Some(holder) = path.parent() else { return };
+        let folder = Keys::parent(disk).unwrap_or("").to_string();
+        let jobs = crate::run::Marker::jobs_in(holder);
+        snapshot.facts_mut().charon_folders.push(CharonFolder { folder, jobs });
     }
 
     /// Why the folder `item` must not be entered: it's on another drive than the scanned
@@ -513,6 +526,20 @@ mod tests {
         assert_eq!(noted, vec!["notes/.charon-trash", "projects/app/.charon"]);
         assert!(s.is_occupied("projects/app") && s.is_occupied("inner"));
         assert!(!s.contains("projects/app/.charon/settings.toml"));
+    }
+
+    #[test]
+    fn charons_folders_met_are_noted_with_their_markers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".charon/mine.json"), "{}");
+        write(&tmp.path().join("Work/Inner/.charon/other.json"), "{}");
+        write(&tmp.path().join("Busy/.charon/0123.busy"), "{}");
+        write(&tmp.path().join("notes/.charon/settings.toml"), "the person's own");
+        let s = scan(tmp.path(), &[]);
+        let mut seen: Vec<(&str, Vec<String>)> = s.charon_folders().iter().map(|c| (c.folder.as_str(), c.jobs.clone())).collect();
+        seen.sort();
+        assert_eq!(seen, vec![("", vec!["mine".to_string()]), ("Busy", vec![]), ("Work/Inner", vec!["other".to_string()])]);
+        assert!(s.is_occupied("Busy"), "a folder holding Charon's own folder is never removed");
     }
 
     #[test]

@@ -13,8 +13,8 @@ use crate::updates::{UpdateInfo, Updates};
 use charon_core::plan::Side;
 use charon_core::store::LogLine;
 use charon_core::{
-    ConflictChoice, ConflictItem, Engine, JobId, JobSetup, JobView, NotePage, Overview, Review, Settings, StepFilter, StepPage, SyncMode,
-    SyncStart, UpgradeNotice,
+    Approval, ConflictChoice, ConflictItem, Engine, JobId, JobSetup, JobView, NotePage, Overview, Review, Settings, StepFilter, StepPage,
+    SyncMode, SyncStart, UpgradeNotice,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -191,9 +191,10 @@ pub fn review_notes(state: State<AppState>, id: JobId, review_id: String, offset
     state.engine.review_notes(&id, &review_id, offset, limit).map_err(say)
 }
 
-/// The person confirmed the list: syncs exactly that list (returns once it started).
+/// The person confirmed the list: syncs exactly that list. Returns once it started, or once
+/// it waits for another sync at work in the job's folders (it then starts by itself).
 #[tauri::command]
-pub async fn approve(state: State<'_, AppState>, id: JobId, review_id: String, acknowledged: bool) -> Answer<()> {
+pub async fn approve(state: State<'_, AppState>, id: JobId, review_id: String, acknowledged: bool) -> Answer<Approval> {
     in_background(state, move |engine| engine.approve(&id, &review_id, acknowledged)).await
 }
 

@@ -2,9 +2,10 @@
 
 use crate::error::{Error, Result};
 use crate::model::RunSummary;
-use crate::scan::Volume;
+use crate::scan::{Keys, Volume};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -127,7 +128,7 @@ impl JobSetup {
             return Err(Error::Invalid("Folders must be full paths.".into()));
         }
         let (source, destination) = (Folder::of(&self.source), Folder::of(&self.destination));
-        if source == destination {
+        if source.is(&destination) {
             return Err(Error::Invalid("Source and destination are the same folder.".into()));
         }
         if source.overlaps(&destination) {
@@ -154,22 +155,36 @@ impl JobSetup {
         Ok(())
     }
 
-    /// Why this job and `other` mustn't both exist, if they mustn't: a Mirror job removes
-    /// whatever isn't in its source, so its destination must not share any folder another
-    /// job writes into. (The other job would bring files in, Mirror would remove them, and
-    /// a two-way job would carry that removal back to where the files came from.)
-    pub fn clash_with(&self, other: &JobSetup, other_name: &str) -> Option<String> {
+    /// Whether this job and `other` mustn't both exist: a Mirror job removes whatever isn't
+    /// in its source, so its destination must not share any folder another job writes into.
+    /// (The other job would bring files in, Mirror would remove them, and a two-way job would
+    /// carry that removal back to where the files came from.) Asks the disk.
+    pub fn clashes_with(&self, other: &JobSetup) -> bool {
         let clash = |mirror: &JobSetup, writer: &JobSetup| {
             mirror.mode == SyncMode::Mirror && {
                 let removes_in = Folder::of(&mirror.destination);
                 writer.written_folders().iter().any(|folder| removes_in.overlaps(&Folder::of(folder)))
             }
         };
-        (clash(self, other) || clash(other, self)).then(|| {
-            format!(
-                "This job's folders overlap with those of “{other_name}”, and one of the two is a Mirror job that would remove what the other brings in. Choose folders that don't overlap."
-            )
-        })
+        clash(self, other) || clash(other, self)
+    }
+
+    /// Why a job with this setup can't be saved next to the job `other_name`, which it
+    /// clashes with.
+    pub fn clash_message(other_name: &str) -> String {
+        format!(
+            "This job's folders overlap with those of “{other_name}”, and one of the two is a Mirror job that would remove what the other brings in. Choose folders that don't overlap."
+        )
+    }
+
+    /// Whether a sync of this job writes into the folder of `side`.
+    pub fn writes_to(&self, side: crate::plan::Side) -> bool {
+        self.mode.is_two_way() || side == crate::plan::Side::Destination
+    }
+
+    /// Whether `other` has the same folders and the same mode.
+    pub fn same_folders(&self, other: &JobSetup) -> bool {
+        self.source == other.source && self.destination == other.destination && self.mode == other.mode
     }
 
     /// The folder of one side.
@@ -394,33 +409,86 @@ impl Job {
     }
 }
 
-/// A folder path in a form two paths can be compared in: links and `..` resolved where the
-/// folder is reachable, one Unicode form, and upper/lower case ignored on macOS and
-/// Windows (their drives usually do).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Folder(String);
+/// A folder path in a form two paths can be compared in: links and `..` resolved as far as
+/// the folders exist (a folder not made yet is placed where it will be: under its nearest
+/// folder that exists, resolved), one Unicode form, and upper and lower case ignored where
+/// the drive ignores them (always on macOS and Windows, whose drives usually do).
+#[derive(Debug, Clone)]
+pub struct Folder {
+    text: String,
+    /// The drive ignores upper and lower case: `text` is in folded form (see `Keys::fold`).
+    folded: bool,
+}
 
 impl Folder {
+    /// Asks the disk: for links, and for how the drive treats upper and lower case.
     pub fn of(path: &Path) -> Self {
         use unicode_normalization::UnicodeNormalization;
-        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| Self::lexical(path));
+        let (resolved, existing) = Self::resolve(path);
         let mut text: String = resolved.to_string_lossy().nfc().collect();
         if let Some(rest) = text.strip_prefix(r"\\?\") {
             text = rest.to_string();
         }
         let text = text.replace('\\', "/");
         let text = text.trim_end_matches('/').to_string();
-        if cfg!(any(target_os = "macos", windows)) {
-            Self(text.to_lowercase())
-        } else {
-            Self(text)
-        }
+        let folded = Self::ignores_case(existing.as_deref());
+        Self { text: if folded { Keys::fold(&text) } else { text }, folded }
+    }
+
+    /// The same folder.
+    pub fn is(&self, other: &Folder) -> bool {
+        let (mine, theirs) = self.comparable(other);
+        mine == theirs
     }
 
     /// The same folder, or one inside the other.
     pub fn overlaps(&self, other: &Folder) -> bool {
-        let inside = |a: &str, b: &str| a == b || (a.len() > b.len() && a.starts_with(b) && a.as_bytes()[b.len()] == b'/') || b.is_empty();
-        inside(&self.0, &other.0) || inside(&other.0, &self.0)
+        let (mine, theirs) = self.comparable(other);
+        // The top of a drive ("/" or "C:/") ends up empty, and holds everything.
+        mine.is_empty() || theirs.is_empty() || Keys::is_within(&mine, &theirs) || Keys::is_within(&theirs, &mine)
+    }
+
+    /// Both texts in a form they can be compared in: upper and lower case are ignored when
+    /// either drive ignores them.
+    fn comparable<'a>(&'a self, other: &'a Folder) -> (Cow<'a, str>, Cow<'a, str>) {
+        let either = self.folded || other.folded;
+        let form = |folder: &'a Folder| {
+            if either && !folder.folded {
+                Cow::Owned(Keys::fold(&folder.text))
+            } else {
+                Cow::Borrowed(folder.text.as_str())
+            }
+        };
+        (form(self), form(other))
+    }
+
+    /// `path` with links and `..` resolved as far as its folders exist, and the nearest of
+    /// its folders that exists (`None` when not even the first one does).
+    fn resolve(path: &Path) -> (PathBuf, Option<PathBuf>) {
+        if let Ok(real) = std::fs::canonicalize(path) {
+            return (real.clone(), Some(real));
+        }
+        let parts: Vec<std::path::Component> = path.components().collect();
+        for kept in (1..parts.len()).rev() {
+            let existing: PathBuf = parts[..kept].iter().collect();
+            if let Ok(real) = std::fs::canonicalize(&existing) {
+                let rest: PathBuf = parts[kept..].iter().collect();
+                return (Self::lexical(&real.join(rest)), Some(real));
+            }
+        }
+        (Self::lexical(path), None)
+    }
+
+    /// Whether the drive of `existing` ignores upper and lower case. macOS and Windows
+    /// drives are taken to ignore it; elsewhere the kind of drive tells (FAT, exFAT, NTFS
+    /// and SMB shares ignore it on Linux too, and so does a drive of unknown kind, the
+    /// careful direction). The drive isn't probed: paths are compared often (before every
+    /// sync and look), and probing can mean writing a file of Charon's into the folder.
+    fn ignores_case(existing: Option<&Path>) -> bool {
+        if cfg!(any(target_os = "macos", windows)) {
+            return true;
+        }
+        existing.is_some_and(|folder| Volume::basics(folder).is_none_or(|volume| !volume.kind.usually_case_sensitive()))
     }
 
     /// `a/./b/../c` → `a/c`, without asking the disk.
@@ -468,13 +536,50 @@ mod tests {
     fn a_mirror_must_not_remove_in_folders_other_jobs_write() {
         let two_way = setup(SyncMode::TwoWay, "/home/me/Docs", "/mnt/nas/Docs");
         let mirror = setup(SyncMode::Mirror, "/home/me/Work", "/mnt/nas/Docs/Work");
-        assert!(mirror.clash_with(&two_way, "Docs").is_some());
-        assert!(two_way.clash_with(&mirror, "Work").is_some());
+        assert!(mirror.clashes_with(&two_way));
+        assert!(two_way.clashes_with(&mirror));
         // Backing up a two-way folder somewhere else is fine, and so are chained mirrors.
         let backup = setup(SyncMode::Backup, "/home/me/Docs", "/mnt/usb/Docs");
-        assert!(backup.clash_with(&two_way, "Docs").is_none());
+        assert!(!backup.clashes_with(&two_way));
         let chained = setup(SyncMode::Mirror, "/mnt/nas/Docs", "/mnt/usb/Docs");
-        assert!(chained.clash_with(&mirror, "Work").is_none());
+        assert!(!chained.clashes_with(&mirror));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_not_made_yet_is_placed_through_the_links_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("CloudStorage");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("Dropbox")).unwrap();
+        let later = Folder::of(&tmp.path().join("Dropbox/Backup"));
+        assert!(later.is(&Folder::of(&real.join("Backup"))));
+        assert!(later.overlaps(&Folder::of(&real)));
+        let dotted = Folder::of(&tmp.path().join("Dropbox/missing/../Backup"));
+        assert!(dotted.is(&later));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nesting_through_a_link_is_refused_before_the_inner_folder_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("CloudStorage");
+        std::fs::create_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&real, tmp.path().join("Dropbox")).unwrap();
+        let source = real.to_str().unwrap().to_string();
+        let destination = tmp.path().join("Dropbox/Backup").to_str().unwrap().to_string();
+        let mut mirror = setup(SyncMode::Mirror, &source, &destination);
+        assert!(mirror.validate().is_err());
+    }
+
+    #[test]
+    fn case_is_ignored_when_either_drive_ignores_it() {
+        let share = Folder { text: Keys::fold("/mnt/share/Docs"), folded: true };
+        let spelled_otherwise = Folder { text: "/mnt/share/DOCS/Work".into(), folded: false };
+        assert!(share.overlaps(&spelled_otherwise));
+        assert!(share.is(&Folder { text: "/mnt/Share/Docs".into(), folded: false }));
+        let here = Folder { text: "/home/me/Docs".into(), folded: false };
+        assert!(!here.overlaps(&Folder { text: "/home/me/docs/Work".into(), folded: false }), "a drive that tells case apart");
     }
 
     #[test]

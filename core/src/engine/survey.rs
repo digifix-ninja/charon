@@ -252,13 +252,20 @@ impl Engine {
         let folded = !(volumes.0.case_sensitive && volumes.1.case_sensitive);
         let filter = ExcludeFilter::new(&setup.excludes, folded)?;
         // The folder watcher tells the changes that matter with the same filter.
-        self.change_runtime(&job.id, |rt| rt.filter = Some((setup.clone(), filter.clone())));
+        self.change_known_runtime(&job.id, |rt| rt.filter = Some((setup.clone(), filter.clone())));
         let (mut source, mut destination) = self.scan_both(job, &filter, volumes.clone(), cancel, purpose != Purpose::Check)?;
         if folded {
             source.fold();
             destination.fold();
         }
-        let (no_source_links, no_destination_links) = self.change_runtime(&job.id, |rt| rt.no_links);
+        // Where other jobs' folders are inside these, for the busy notes of their syncs.
+        let inside = Self::folders_inside(&setup, &source, &destination);
+        let (no_source_links, no_destination_links) = self
+            .change_known_runtime(&job.id, |rt| {
+                rt.folders_inside = inside;
+                rt.no_links
+            })
+            .unwrap_or_default();
         // A drive found refusing links at an earlier sync still does, while it's the same drive.
         let refused_before = |side: Side, now: &Volume| {
             job.drives.as_ref().is_some_and(|drives| {
@@ -342,10 +349,19 @@ impl Engine {
             holds.push(text.clone());
             warnings.push(Warning::caution(text));
         }
-        let refusal = Guard::refusal(&plan, &source, &destination);
+        // The folders themselves first: one inside the other (whatever the paths say), and
+        // other jobs that would undo this one's work.
+        let overlaps = self.overlaps(job, &source, &destination);
+        let refusal = overlaps.refusal.or_else(|| Guard::refusal(&plan, &source, &destination));
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
         }
+        for clash in overlaps.clashes {
+            holds.push(clash.clone());
+            warnings.push(Warning::danger(clash));
+            needs_tick = true;
+        }
+        warnings.extend(overlaps.copies.into_iter().map(Warning::info));
 
         // What automatic syncs removed or replaced, today and since the last confirmed list,
         // counts too: for the runs nobody looks at, and in the list of a job that has them,
@@ -764,7 +780,9 @@ impl Engine {
         let mut last_sent: Option<std::time::Instant> = None;
         for candidate in candidates {
             let Candidate { key, source: s, destination: d, alike } = candidate;
-            let cached = self.change_runtime(&job.id, |rt| rt.same_contents.get(&key).filter(|(cs, cd, _)| *cs == s && *cd == d).map(|(_, _, same)| *same));
+            let cached = self
+                .change_known_runtime(&job.id, |rt| rt.same_contents.get(&key).filter(|(cs, cd, _)| *cs == s && *cd == d).map(|(_, _, same)| *same))
+                .flatten();
             let same = match cached {
                 Some(same) => Some(same),
                 // A background look that has read enough leaves the rest for the next list.
@@ -779,7 +797,7 @@ impl Engine {
                         // Unreadable now: the plan decides as if they differ (never a removal).
                         Err(_) => false,
                     };
-                    self.change_runtime(&job.id, |rt| {
+                    self.change_known_runtime(&job.id, |rt| {
                         rt.same_contents.insert(key.clone(), (s, d, same));
                     });
                     Some(same)
@@ -838,7 +856,7 @@ impl Engine {
     /// while the job looks in sync. Likewise, a conflict copy that couldn't be made only
     /// matters while both versions are there.
     fn apply_refusals(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) {
-        let refusals: Vec<_> = self.change_runtime(&job.id, |rt| rt.refused.values().cloned().collect());
+        let refusals: Vec<_> = self.change_known_runtime(&job.id, |rt| rt.refused.values().cloned().collect()).unwrap_or_default();
         let mut lapsed = Vec::new();
         for (refused, drive) in refusals {
             let (from, here) = match refused.side {
@@ -864,7 +882,7 @@ impl Engine {
             }
         }
         if !lapsed.is_empty() {
-            self.change_runtime(&job.id, |rt| {
+            self.change_known_runtime(&job.id, |rt| {
                 for refused in lapsed {
                     let place = (refused.side, refused.key.clone());
                     // Only the refusal looked at here: a sync may have recorded a newer one since.
@@ -896,7 +914,7 @@ impl Engine {
     /// and removes nothing on the side it should be copied to (see `Snapshot::freeze_unread`).
     /// A file that can be read now is tried again.
     fn apply_unread(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) -> Result<()> {
-        let unread: Vec<Unread> = self.change_runtime(&job.id, |rt| rt.unread.values().cloned().collect());
+        let unread: Vec<Unread> = self.change_known_runtime(&job.id, |rt| rt.unread.values().cloned().collect()).unwrap_or_default();
         if unread.is_empty() {
             return Ok(());
         }

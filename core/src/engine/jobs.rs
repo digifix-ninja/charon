@@ -2,10 +2,11 @@
 
 use crate::engine::{Engine, EngineEvent};
 use crate::error::{Error, Result};
-use crate::model::{Job, JobId, JobSetup, JobView};
+use crate::model::{Job, JobId, JobSetup, JobView, SyncMode};
 use crate::plan::Side;
 use crate::run::Marker;
 use crate::scan::ExcludeFilter;
+use std::collections::BTreeMap;
 
 impl Engine {
     /// Adds a job and looks at what it would do. Its first sync always waits for the
@@ -13,12 +14,13 @@ impl Engine {
     pub fn add_job(&self, mut setup: JobSetup) -> Result<JobView> {
         setup.validate()?;
         ExcludeFilter::check(&setup.excludes)?;
+        let overlap = Overlap::of(&setup, &self.job_list(), None);
         let job = Job::new(setup);
         let id = job.id.clone();
         let automation = job.setup.full_automation;
         self.change_state(|state| {
-            if let Some(clash) = state.jobs.iter().find_map(|other| job.setup.clash_with(&other.setup, &other.setup.name)) {
-                return Err(Error::Invalid(clash));
+            if let Some(other) = overlap.clash(&state.jobs)? {
+                return Err(Error::Invalid(JobSetup::clash_message(other)));
             }
             state.jobs.push(job);
             Ok(())
@@ -39,25 +41,27 @@ impl Engine {
     pub fn update_job(&self, id: &JobId, mut setup: JobSetup) -> Result<JobView> {
         setup.validate()?;
         ExcludeFilter::check(&setup.excludes)?;
-        let (old, name) = {
-            let state = self.state();
-            let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-            (job.setup.clone(), job.setup.name.clone())
+        let (name, overlap) = {
+            let jobs = self.job_list();
+            let job = jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+            (job.setup.name.clone(), Overlap::of(&setup, &jobs, Some(id)))
         };
-        let folders_changed = old.source != setup.source || old.destination != setup.destination || old.mode != setup.mode;
-        let automation_on = setup.full_automation && !old.full_automation;
-        let automation_off = !setup.full_automation && old.full_automation;
-        let review_next = setup.changes_what_syncs(&old) || automation_on;
 
-        self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing, then edit it."), |state, rt| {
-            // Overlaps that were there before the edit (from an older Charon) don't block it.
-            let clash = state.jobs.iter().filter(|other| &other.id != id).find_map(|other| {
-                let now = setup.clash_with(&other.setup, &other.setup.name)?;
-                old.clash_with(&other.setup, &other.setup.name).is_none().then_some(now)
-            });
-            if let Some(clash) = clash {
-                return Err(Error::Invalid(clash));
+        // The setup it replaces is read where it's replaced, so two quick edits in a row
+        // each compare with the one saved before.
+        let old = self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing, then edit it."), |state, rt| {
+            let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+            let old = job.setup.clone();
+            let folders_changed = !old.same_folders(&setup);
+            // An overlap that was there before (from an older Charon) doesn't block an edit
+            // that keeps the folders and the mode, such as a new name; every look still warns
+            // about it. New folders or a new mode must not overlap at all.
+            if folders_changed {
+                if let Some(other) = overlap.clash(&state.jobs)? {
+                    return Err(Error::Invalid(JobSetup::clash_message(other)));
+                }
             }
+            let review_next = setup.changes_what_syncs(&old) || (setup.full_automation && !old.full_automation);
             let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
             if job.setup != setup {
                 job.waiting_since = None;
@@ -75,11 +79,17 @@ impl Engine {
                 job.automatic_changes.clear();
                 rt.forget_folders();
             } else {
-                rt.stop_looking();
-                rt.review = None;
+                rt.forget_review();
             }
-            Ok(())
+            // Whatever a look in progress finds is for the old setup: the new one is looked
+            // at as soon as nothing else is looking.
+            rt.outdate_looks();
+            rt.last_checked = None;
+            Ok(old)
         })?;
+        let folders_changed = !old.same_folders(&setup);
+        let automation_on = setup.full_automation && !old.full_automation;
+        let automation_off = !setup.full_automation && old.full_automation;
         if folders_changed {
             if let Err(e) = self.inner.baselines.forget(id) {
                 // A memory for other folders is never used (it names its folders), so this
@@ -112,15 +122,29 @@ impl Engine {
     }
 
     /// A copy of a job, named "… copy", paused, and with full automation off (turning it
-    /// on again goes through both warnings).
+    /// on again goes through both warnings). Refused when the copy would clash with a job
+    /// (always for a Mirror job, which would share its destination with its copy): a new
+    /// job with other folders is the way then.
     pub fn duplicate_job(&self, id: &JobId) -> Result<JobView> {
-        let mut setup = self.stored_job(id)?.setup;
+        let jobs = self.job_list();
+        let original = jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+        let mut setup = original.setup.clone();
         setup.name = format!("{} copy", setup.name);
         setup.full_automation = false;
+        let overlap = Overlap::of(&setup, &jobs, None);
         let mut job = Job::new(setup);
         job.paused = true;
         let new_id = job.id.clone();
-        self.change_state(|state| state.jobs.push(job))?;
+        let name = original.setup.name.clone();
+        self.change_state(|state| {
+            if let Some(other) = overlap.clash(&state.jobs)? {
+                return Err(Error::Invalid(format!(
+                    "A copy of “{name}” would share its folders with “{other}”, and one of the two would be a Mirror job that removes what the other brings in. Add a new job with other folders instead."
+                )));
+            }
+            state.jobs.push(job);
+            Ok(())
+        })??;
         self.inner.journal.info(&new_id, "job created as a copy");
         self.publish(&new_id);
         self.job(&new_id)
@@ -146,7 +170,7 @@ impl Engine {
             (job, name)
         };
         self.with_job_at_rest(id, &format!("Stop “{name}” first, then remove it."), |state, rt| {
-            rt.stop_looking();
+            rt.outdate_looks();
             state.jobs.retain(|job| &job.id != id);
             Ok(())
         })?;
@@ -202,13 +226,55 @@ impl Engine {
                 job.setup.excludes.push(pattern.clone());
             }
             job.needs_review = true;
-            rt.stop_looking();
-            rt.review = None;
+            rt.outdate_looks();
+            rt.forget_review();
+            rt.last_checked = None;
             Ok(())
         })?;
         self.inner.journal.info(id, &format!("left out {path} (on the {})", side.word()));
         self.publish(id);
         self.check(id);
         self.job(id)
+    }
+}
+
+/// A setup checked against the other jobs before any lock is taken, because the check asks
+/// the disk (a network share that doesn't answer must not hold up every other job): those
+/// jobs' folders and modes as they were, and the first job the setup clashes with.
+struct Overlap {
+    /// The job being edited, which isn't checked against itself.
+    edited: Option<JobId>,
+    /// Every other job's folders and mode, as checked.
+    others: BTreeMap<JobId, Reach>,
+    /// The name of the first job the setup clashes with.
+    clash: Option<String>,
+}
+
+/// What a clash depends on: a job's folders and its mode.
+type Reach = (std::path::PathBuf, std::path::PathBuf, SyncMode);
+
+impl Overlap {
+    /// Checks `setup` against every job in `jobs` but `edited`.
+    fn of(setup: &JobSetup, jobs: &[Job], edited: Option<&JobId>) -> Self {
+        let others: Vec<&Job> = jobs.iter().filter(|job| Some(&job.id) != edited).collect();
+        let clash = others.iter().find(|other| setup.clashes_with(&other.setup)).map(|other| other.setup.name.clone());
+        Self { edited: edited.cloned(), others: others.into_iter().map(|job| (job.id.clone(), Self::reach(&job.setup))).collect(), clash }
+    }
+
+    fn reach(setup: &JobSetup) -> Reach {
+        (setup.source.clone(), setup.destination.clone(), setup.mode)
+    }
+
+    /// The name of the job the setup clashes with, if any, as long as `jobs` (the stored
+    /// jobs, read under the lock) still have the folders and modes it was checked against.
+    /// If another job was added, or its folders or mode changed, in between, the save is
+    /// refused, to be tried again. (A job renamed meanwhile is named as it was.)
+    fn clash(&self, jobs: &[Job]) -> Result<Option<&str>> {
+        let now: BTreeMap<JobId, Reach> =
+            jobs.iter().filter(|job| self.edited.as_ref() != Some(&job.id)).map(|job| (job.id.clone(), Self::reach(&job.setup))).collect();
+        if now != self.others {
+            return Err(Error::Invalid("Another job changed while this one was being saved. Save it again.".into()));
+        }
+        Ok(self.clash.as_deref())
     }
 }
