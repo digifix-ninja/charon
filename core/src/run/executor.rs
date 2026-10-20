@@ -535,6 +535,8 @@ impl<'a> Executor<'a> {
         // What the units whose new versions all landed remove, waiting for the plan's first
         // plain removal.
         let mut removals: Vec<(&Unit, Leftover)> = Vec::new();
+        // Whether the plan's plain removals have begun.
+        let mut removing = false;
         for step in plan.ordered_steps() {
             let action = step.action;
             if self.cancel.load(Ordering::Relaxed) {
@@ -551,7 +553,8 @@ impl<'a> Executor<'a> {
             // The libraries and databases still to be carried go before the plan's first plain
             // removal: what it removes could be the other copy of what they bring (see
             // `starts_carry`). Then what each library and database removes goes.
-            if matches!(action, Action::Delete { .. }) && step.clearing.is_none() {
+            if matches!(action, Action::Delete { .. }) && step.clearing.is_none() && !removing {
+                removing = true;
                 let waiting: Vec<(&Unit, &UnitSteps)> = units.iter().filter(|(unit, steps)| steps.removes && !carried.contains_key(unit)).collect();
                 if self.carry(&waiting, &mut carried, &mut removals, &mut outcome, &mut holds, meter).is_break()
                     || self.remove_units(&mut removals, &mut carried, &mut outcome, &mut holds, meter).is_break()
@@ -851,13 +854,16 @@ impl<'a> Executor<'a> {
 
     /// Carries the app libraries and databases of `batch` (see `Unit`): a mix of two versions
     /// may not open, or be quietly damaged (a database's journals only fit the version they
-    /// were written with). First every new version of each is written next to its target and
-    /// checked, with everything else of it (see `prepare`). What couldn't be is noted before
-    /// anything takes its place, so it holds back what the others remove: one whose removal
-    /// waits then waits whole. Then the new versions of each take their places (see
-    /// `commit_unit`), and what each removes waits in `removals` for every library and
-    /// database the plan changes (see `remove_units`). If any file of one can't be carried,
-    /// or anything of it changed meanwhile, none is, and the next sync tries again.
+    /// were written with). First every new version of each is written next to its target (see
+    /// `prepare`). That can take hours for a big library, and another program may write to
+    /// one meanwhile, so each is checked right before its new versions take their places (see
+    /// `still_ready` and `commit_unit`). When there are several, each is also checked once all
+    /// are written: what couldn't be written, or changed, is then noted before any of them
+    /// takes its place, and holds back what the others remove, so one whose removal waits
+    /// waits whole. What each removes waits in `removals` for every library and database the
+    /// plan changes (see `remove_units`). If any file of one can't be carried, or anything of
+    /// it changed meanwhile, none is but what only adds to it (see `let_additions_land`), and
+    /// the next sync tries again.
     ///
     /// Notes in `carried` why the other steps of each wait, if they do, and adds what each
     /// carried step did to the outcome. `Break` when the whole run stops there: what wasn't
@@ -886,21 +892,36 @@ impl<'a> Executor<'a> {
                 }
             }
         }
-        // What couldn't be written or changed meanwhile may be what another one removes (see
-        // `Holds`): that one waits whole, and what it doesn't bring holds back in turn what
-        // could be its old copy.
-        loop {
-            let (held, ready): (Vec<_>, Vec<_>) = prepared.into_iter().partition(|ready| ready.removals.iter().any(|step| holds.of(step).is_some()));
-            prepared = ready;
-            if held.is_empty() {
-                break;
+        if prepared.len() > 1 {
+            // Each one written before the others may have changed while they were.
+            let mut checked = Vec::new();
+            let mut unchecked = prepared.into_iter();
+            while let Some(ready) = unchecked.next() {
+                match self.still_ready(&ready, holds) {
+                    Ok(()) => checked.push(ready),
+                    Err(whole) => {
+                        if self.wait_whole(ready, whole, carried, outcome, holds, meter).is_break() {
+                            return Self::stop_with(checked.into_iter().chain(unchecked));
+                        }
+                    }
+                }
             }
-            for ready in held {
-                let (results, why) = self.held_whole(ready.unit, &ready.steps.carried, holds);
-                carried.insert(ready.unit, why);
-                Self::discard_all(ready.staged);
-                if self.record_all(outcome, holds, results).is_break() {
-                    return Self::stop_with(prepared);
+            prepared = checked;
+            // What couldn't be written or changed meanwhile may be what another one removes
+            // (see `Holds`): that one waits whole, and what it doesn't bring holds back in turn
+            // what could be its old copy.
+            loop {
+                let (held, ready): (Vec<_>, Vec<_>) = prepared.into_iter().partition(|ready| ready.removals.iter().any(|step| holds.of(step).is_some()));
+                prepared = ready;
+                if held.is_empty() {
+                    break;
+                }
+                let mut held = held.into_iter();
+                while let Some(ready) = held.next() {
+                    let whole = self.held_whole(ready.unit, &ready.steps.carried, holds);
+                    if self.wait_whole(ready, whole, carried, outcome, holds, meter).is_break() {
+                        return Self::stop_with(held.chain(prepared));
+                    }
                 }
             }
         }
@@ -908,6 +929,13 @@ impl<'a> Executor<'a> {
         while let Some(ready) = prepared.next() {
             if self.may_go_on(outcome).is_break() {
                 return Self::stop_with(std::iter::once(ready).chain(prepared));
+            }
+            // Right before its new versions take their places: the ones before took time too.
+            if let Err(whole) = self.still_ready(&ready, holds) {
+                if self.wait_whole(ready, whole, carried, outcome, holds, meter).is_break() {
+                    return Self::stop_with(prepared);
+                }
+                continue;
             }
             let unit = ready.unit;
             let ((results, why), left) = self.commit_unit(ready, meter);
@@ -931,20 +959,117 @@ impl<'a> Executor<'a> {
         ControlFlow::Break(())
     }
 
+    /// Notes that the library or database of `ready` waits whole, with what each of its
+    /// carried steps did and why its other steps wait (`whole`), but for what only adds to it
+    /// (see `let_additions_land`). `Break` when the whole run stops there.
+    fn wait_whole<'u, 'p>(
+        &self,
+        ready: Prepared<'u, 'p>,
+        whole: Carried<'p>,
+        carried: &mut HashMap<&'u Unit, Option<String>>,
+        outcome: &mut Outcome,
+        holds: &mut Holds,
+        meter: &mut ProgressMeter,
+    ) -> ControlFlow<()> {
+        let (results, why) = self.let_additions_land(whole, ready.staged, meter);
+        carried.insert(ready.unit, why);
+        self.record_all(outcome, holds, results)
+    }
+
+    /// What each carried step of an app library that doesn't land whole did, and why its
+    /// other steps wait (`waiting`), once what only adds to it is carried on its own after all
+    /// (see `adds_to_library`): the version there goes on as it was, with one more item it
+    /// doesn't use. So the new photos of a library its app keeps writing to land while the
+    /// rest of it waits. A new version already written next to its target (in `staged`) takes
+    /// its place if its original is still as it was copied; one that wasn't written yet is
+    /// copied like any file. The other new versions in `staged` are thrown away, and so is
+    /// everything once the run stops (see `stops_run`).
+    fn let_additions_land<'p>(&self, waiting: Carried<'p>, staged: Vec<(&'p Action, Staged)>, meter: &mut ProgressMeter) -> Carried<'p> {
+        let (results, why) = waiting;
+        let mut written: HashMap<(Side, String), Staged> = staged.into_iter().map(|(_, ready)| ((ready.to, ready.key.clone()), ready)).collect();
+        let mut going_on = !results.iter().any(|(_, result)| Self::stops_run(result));
+        let mut carried = Vec::with_capacity(results.len());
+        for (step, result) in results {
+            let ready = match step {
+                Action::Copy { to, path, .. } => written.remove(&(*to, path.clone())),
+                _ => None,
+            };
+            let adds = matches!(result, Ok(Done::Waits(_))) && self.adds_to_library(step);
+            going_on = going_on && !(adds && self.stopping());
+            let result = if adds && going_on {
+                let added = self.add_on_its_own(step, ready, meter);
+                going_on = !Self::stops_run(&added);
+                added
+            } else {
+                if let Some(ready) = ready {
+                    Copier::discard(&ready.partial);
+                }
+                result
+            };
+            carried.push((step, result));
+        }
+        for ready in written.into_values() {
+            Copier::discard(&ready.partial);
+        }
+        (carried, why)
+    }
+
+    /// Whether a step's result stops the whole run (see `record`): it was stopped, or a drive
+    /// went away.
+    fn stops_run(result: &Result<Done>) -> bool {
+        matches!(result, Err(Error::Cancelled | Error::LandedElsewhere(_)))
+    }
+
+    /// Whether the run was stopped, or one of its folders went away (see `may_go_on`).
+    fn stopping(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.check_roots().is_err()
+    }
+
+    /// Whether `step`, a carried step of an app library or database, only adds a file or link
+    /// to the library where the scan saw nothing, and isn't a file of a database (see
+    /// `Unit::database_of`): a database's files only go together.
+    fn adds_to_library(&self, step: &Action) -> bool {
+        let (source, destination) = (self.spellings.snapshot(Side::Source), self.spellings.snapshot(Side::Destination));
+        matches!(step, Action::Copy { existing: None, .. }) && Unit::database_of(step.path(), source, destination).is_none()
+    }
+
+    /// Carries `step`, a copy that only adds to its app library, on its own (see
+    /// `let_additions_land`): `ready`, its new version already written next to its target,
+    /// takes its place if the original is still as it was copied; without one it's copied
+    /// like any file.
+    fn add_on_its_own(&self, step: &Action, ready: Option<Staged>, meter: &mut ProgressMeter) -> Result<Done> {
+        let Some(ready) = ready else {
+            meter.start(&self.spellings.disk(Self::shown_side(step), step.path()));
+            let result = self.apply(step, false, meter);
+            meter.finish_item();
+            return result;
+        };
+        let (to, key, from) = (ready.to, ready.key.clone(), ready.from);
+        let original = self.look_fresh(to.opposite(), &self.path(to.opposite(), &key));
+        if !matches!(&original, Ok(now) if Entry::still(now.as_ref(), Some(&from))) {
+            Copier::discard(&ready.partial);
+            original?;
+            return Ok(Done::Skipped(format!("changed on the {} side since the scan", to.opposite().word())));
+        }
+        match self.commit(ready)? {
+            Some((bytes, landed)) => {
+                self.settle_copy(to, &key, from, landed, None);
+                Ok(Done::Copied(1, bytes))
+            }
+            None => Ok(Done::Skipped(format!("changed on the {} side since the scan", to.word()))),
+        }
+    }
+
     /// The first half of carrying `unit` (see `carry`): every new version of it written next
-    /// to its target. Then everything is checked again, and so is the whole library or
-    /// database on each side the plan changes it on: nothing else of it may have changed, or
-    /// been added, meanwhile (by its app, or by another computer's sync). `Err` with what
-    /// each of its carried steps did, and why its other steps wait, when it waits whole.
+    /// to its target, unless a removal of it waits already (see `Holds`). `Err` with what
+    /// each of its carried steps did, and why its other steps wait, when it waits whole (but
+    /// for what only adds to it, see `let_additions_land`).
     fn prepare<'u, 'p>(&self, unit: &'u Unit, steps: &'u UnitSteps<'p>, holds: &Holds, meter: &mut ProgressMeter) -> std::result::Result<Prepared<'u, 'p>, Carried<'p>> {
         let carried = &steps.carried;
-        let not_mixed = self.waiting(unit, Wait::NotMixed);
         let removals: Vec<&'p Action> = carried.iter().copied().filter(|step| matches!(step, Action::Delete { .. })).collect();
         if removals.iter().any(|step| holds.of(step).is_some()) {
-            return Err(self.held_whole(unit, carried, holds));
+            return Err(self.let_additions_land(self.held_whole(unit, carried, holds), Vec::new(), meter));
         }
-
-        // Every new version, written and checked next to its target.
         let mut staged: Vec<(&'p Action, Staged)> = Vec::new();
         for step in carried {
             let Action::Copy { to, path, from, existing, settles_conflict, .. } = step else { continue };
@@ -954,20 +1079,53 @@ impl<'a> Executor<'a> {
             match result {
                 Ok(Some(ready)) => staged.push((*step, ready)),
                 failed => {
-                    Self::discard_all(staged);
                     let failed = failed.map(|_| Done::Skipped(format!("changed on the {} side since the scan", to.word())));
-                    return Err((Self::one_failed(carried, step, failed, &not_mixed), Some(not_mixed)));
+                    let not_mixed = self.waiting(unit, Wait::NotMixed);
+                    let waiting = (Self::one_failed(carried, step, failed, &not_mixed), Some(not_mixed));
+                    return Err(self.let_additions_land(waiting, staged, meter));
                 }
             }
         }
+        Ok(Prepared { unit, steps, staged, removals })
+    }
 
-        // Nothing may have changed while the others were written: not the files carried, and
-        // nothing else of the unit.
-        let unchanged = staged.iter().all(|(_, ready)| {
-            let source = self.path(ready.to.opposite(), &ready.key);
-            matches!(self.look_fresh(ready.to.opposite(), &source), Ok(now) if Entry::still(now.as_ref(), Some(&ready.from)))
-                && matches!(self.look_fresh(ready.to, &ready.target), Ok(now) if Entry::still(now.as_ref(), ready.existing.as_ref()))
-        }) && removals.iter().all(|step| match step {
+    /// Whether the new versions of `ready` may take their places now (see `carry`): none of
+    /// its removals waits (see `Holds`), and nothing of it changed since they were written
+    /// (see `as_staged`). `Err` with what each of its carried steps did, and why its other
+    /// steps wait, when it waits whole.
+    fn still_ready<'p>(&self, ready: &Prepared<'_, 'p>, holds: &Holds) -> std::result::Result<(), Carried<'p>> {
+        let (unit, carried) = (ready.unit, &ready.steps.carried);
+        if ready.removals.iter().any(|step| holds.of(step).is_some()) {
+            return Err(self.held_whole(unit, carried, holds));
+        }
+        match self.as_staged(ready) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let why = self.waiting(unit, Wait::Changed);
+                Err((carried.iter().map(|step| (*step, Ok(Done::Waits(why.clone())))).collect(), Some(why)))
+            }
+            Err(e) => {
+                let not_mixed = self.waiting(unit, Wait::NotMixed);
+                let results = carried.first().map(|first| Self::one_failed(carried, first, Err(e), &not_mixed)).unwrap_or_default();
+                Err((results, Some(not_mixed)))
+            }
+        }
+    }
+
+    /// Whether nothing of the library or database of `ready` changed since its new versions
+    /// were written next to their targets: each original still as it was copied, each target
+    /// still the version it replaces (or nothing), each item it removes still as the plan saw
+    /// it with nothing in its place on the other side, and nothing else of it either, on each
+    /// side the plan changes it on: no other item, and nothing added (see `unit_unchanged`).
+    /// Its app, or another computer's sync, may have written to it meanwhile. `Err` only when
+    /// the run is stopped meanwhile.
+    fn as_staged(&self, ready: &Prepared) -> Result<bool> {
+        let copies = ready.staged.iter().all(|(_, staged)| {
+            let source = self.path(staged.to.opposite(), &staged.key);
+            matches!(self.look_fresh(staged.to.opposite(), &source), Ok(now) if Entry::still(now.as_ref(), Some(&staged.from)))
+                && matches!(self.look_fresh(staged.to, &staged.target), Ok(now) if Entry::still(now.as_ref(), staged.existing.as_ref()))
+        });
+        let removals = ready.removals.iter().all(|step| match step {
             Action::Delete { side, path, entry, .. } => {
                 let (here, there) = (self.path(*side, path), self.path(side.opposite(), path));
                 matches!(self.look_fresh(*side, &here), Ok(now) if Entry::still(now.as_ref(), Some(entry)))
@@ -975,19 +1133,7 @@ impl<'a> Executor<'a> {
             }
             _ => true,
         });
-        match self.unit_unchanged(unit, steps) {
-            Ok(true) if unchanged => Ok(Prepared { unit, steps, staged, removals }),
-            Ok(_) => {
-                Self::discard_all(staged);
-                let why = self.waiting(unit, Wait::Changed);
-                Err((carried.iter().map(|step| (*step, Ok(Done::Waits(why.clone())))).collect(), Some(why)))
-            }
-            Err(e) => {
-                Self::discard_all(staged);
-                let results = carried.first().map(|first| Self::one_failed(carried, first, Err(e), &not_mixed)).unwrap_or_default();
-                Err((results, Some(not_mixed)))
-            }
-        }
+        Ok(copies && removals && self.unit_unchanged(ready.unit, ready.steps)?)
     }
 
     /// The second half of carrying a unit (see `carry`): its new versions take their places,
@@ -995,8 +1141,9 @@ impl<'a> Executor<'a> {
     /// (see `room_for_replaced`), so that one almost never fails halfway. Nothing of it is
     /// removed before then, but the old journals of its databases are renamed aside first:
     /// they only fit the version they were written with (see `set_aside`). When one can't be
-    /// renamed aside, nothing of the unit moves. When a new version can't take its place, the
-    /// ones after it don't either, and the journals of those databases are put back.
+    /// renamed aside, nothing of the unit moves but what only adds to it (see
+    /// `let_additions_land`). When a new version can't take its place, the ones after it don't
+    /// either, but for what only adds to it, and the journals of those databases are put back.
     ///
     /// Returns what each step did so far, why the unit's other steps wait, if they do, and,
     /// when every new version landed, what it still removes: that waits for every library
@@ -1006,10 +1153,10 @@ impl<'a> Executor<'a> {
         let not_mixed = self.waiting(unit, Wait::NotMixed);
         if let Some((short, e)) = self.room_for_replaced(unit, &staged) {
             let failing = staged[short].0;
-            Self::discard_all(staged);
-            return ((Self::one_failed(&steps.carried, &failing, Err(e), &not_mixed), Some(not_mixed)), Leftover::default());
+            let waiting = (Self::one_failed(&steps.carried, &failing, Err(e), &not_mixed), Some(not_mixed));
+            return (self.let_additions_land(waiting, staged, meter), Leftover::default());
         }
-        let journals: Vec<Vec<&'p Action>> = staged.iter().map(|(_, ready)| self.journals_of(ready, &mut removals)).collect();
+        let journals = self.journals_of(&staged, &mut removals);
         let mut asides: Vec<Vec<Aside<'p>>> = Vec::new();
         for of_one in &journals {
             let mut set = Vec::new();
@@ -1020,8 +1167,8 @@ impl<'a> Executor<'a> {
                         for aside in asides.into_iter().flatten().chain(set) {
                             self.put_back_aside(aside);
                         }
-                        Self::discard_all(staged);
-                        return ((Self::one_failed(&steps.carried, journal, Err(e), &not_mixed), Some(not_mixed)), Leftover::default());
+                        let waiting = (Self::one_failed(&steps.carried, journal, Err(e), &not_mixed), Some(not_mixed));
+                        return (self.let_additions_land(waiting, staged, meter), Leftover::default());
                     }
                 }
             }
@@ -1030,10 +1177,12 @@ impl<'a> Executor<'a> {
         let mut results: Vec<(&'p Action, Result<Done>)> = Vec::new();
         // The old journals of the databases whose new versions landed.
         let mut behind: Vec<Aside<'p>> = Vec::new();
+        // The new versions that wait, once one couldn't take its place.
+        let mut unlanded: Vec<(&'p Action, Staged)> = Vec::new();
         let mut broken = false;
         for ((step, ready), set) in staged.into_iter().zip(asides) {
             let result = if broken {
-                Copier::discard(&ready.partial);
+                unlanded.push((step, ready));
                 Ok(Done::Waits(not_mixed.clone()))
             } else {
                 let (to, key, from, existing) = (ready.to, ready.key.clone(), ready.from, ready.existing);
@@ -1064,7 +1213,7 @@ impl<'a> Executor<'a> {
             // next to its new version: they're kept in the trash.
             results.extend(self.finish_asides(behind, |_| true, meter));
             results.extend(removals.into_iter().map(|step| (step, Ok(Done::Waits(not_mixed.clone())))));
-            return ((results, Some(not_mixed)), Leftover::default());
+            return (self.let_additions_land((results, Some(not_mixed)), unlanded, meter), Leftover::default());
         }
         ((results, None), Leftover { asides: behind, removals })
     }
@@ -1089,18 +1238,24 @@ impl<'a> Executor<'a> {
         None
     }
 
-    /// Takes out of `removals` the old journals of the database whose new version `ready`
-    /// is, on the side it goes to.
-    fn journals_of<'p>(&self, ready: &Staged, removals: &mut Vec<&'p Action>) -> Vec<&'p Action> {
+    /// Takes out of `removals` the old journals of each database whose new version is in
+    /// `staged`, on the side it goes to: a list for each new version, in the order of
+    /// `staged`. Each removal is looked at once, so a library with thousands of new and
+    /// removed files takes its place in moments.
+    fn journals_of<'p>(&self, staged: &[(&'p Action, Staged)], removals: &mut Vec<&'p Action>) -> Vec<Vec<&'p Action>> {
         let (source, destination) = (self.spellings.snapshot(Side::Source), self.spellings.snapshot(Side::Destination));
-        let of_database = |step: &&'p Action| match step {
-            Action::Delete { side, path, .. } => {
-                *side == ready.to && *path != ready.key && Unit::database_of(path, source, destination).is_some_and(|database| database == ready.key)
+        let databases: HashMap<(Side, &str), usize> = staged.iter().enumerate().map(|(at, (_, ready))| ((ready.to, ready.key.as_str()), at)).collect();
+        let mut journals: Vec<Vec<&'p Action>> = vec![Vec::new(); staged.len()];
+        removals.retain(|step| {
+            let Action::Delete { side, path, .. } = step else { return true };
+            match Unit::journal_of(path, source, destination).and_then(|database| databases.get(&(*side, database.as_str())).copied()) {
+                Some(at) => {
+                    journals[at].push(*step);
+                    false
+                }
+                None => true,
             }
-            _ => false,
-        };
-        let (journals, others) = std::mem::take(removals).into_iter().partition(of_database);
-        *removals = others;
+        });
         journals
     }
 
@@ -2760,6 +2915,64 @@ mod tests {
         assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
         let trash = Trash::look(&shores.destination, 0, true, false);
         assert_eq!(trash.bytes, 3, "the old one is in the trash");
+    }
+
+    /// A Photos library whose app renamed thousands of its thumbnails (it makes them anew
+    /// after an update) brings as many new files as it removes, and a new database whose old
+    /// journal goes. The old journals of the databases coming in are found with one look at
+    /// each removal: with 4,000 of each that takes moments, where pairing every new file with
+    /// every removal took many seconds, more with the square of the library's changes, while
+    /// the window showed no progress.
+    #[test]
+    fn the_journals_of_a_library_with_thousands_of_changes_are_found_in_moments() {
+        const RENAMED: usize = 4_000;
+        let (_tmp, shores) = shores();
+        let database = "Lib.photoslibrary/database/Photos.sqlite";
+        let journal = format!("{database}-wal");
+        let thumbnail = |name: String| format!("Lib.photoslibrary/resources/derivatives/{name}.jpg");
+        let (mut source, mut destination) = (Snapshot::new(), Snapshot::new());
+        source.insert(database, Entry::file(20, 2_000));
+        destination.insert(database, Entry::file(10, 1_000));
+        destination.insert(journal.as_str(), Entry::file(5, 1_000));
+        let mut copies = vec![Action::copy(Side::Destination, database, Entry::file(20, 2_000), Some(Entry::file(10, 1_000)))];
+        let mut removed = vec![Action::delete(Side::Destination, &journal, Entry::file(5, 1_000), None)];
+        for n in 0..RENAMED {
+            let (new, old) = (thumbnail(format!("{n}_thumb")), thumbnail(format!("thumb_{n}")));
+            source.insert(new.as_str(), Entry::file(1, 1_000));
+            destination.insert(old.as_str(), Entry::file(1, 1_000));
+            copies.push(Action::copy(Side::Destination, &new, Entry::file(1, 1_000), None));
+            removed.push(Action::delete(Side::Destination, &old, Entry::file(1, 1_000), None));
+        }
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel);
+        let staged: Vec<(&Action, Staged)> = copies
+            .iter()
+            .map(|step| {
+                let Action::Copy { to, path, from, existing, .. } = step else { unreachable!("only copies") };
+                let target = shores.destination.join(path);
+                let ready = Staged {
+                    to: *to,
+                    key: path.clone(),
+                    from: *from,
+                    existing: *existing,
+                    settles: false,
+                    relative: path.clone(),
+                    partial: Copier::partial_path(&target),
+                    target,
+                    unkept: BTreeSet::new(),
+                };
+                (step, ready)
+            })
+            .collect();
+        let mut removals: Vec<&Action> = removed.iter().collect();
+        let started = Instant::now();
+        let journals = executor.journals_of(&staged, &mut removals);
+        let took = started.elapsed();
+        assert_eq!(journals.len(), staged.len());
+        assert_eq!(journals[0], [&removed[0]], "the database's old journal");
+        assert!(journals[1..].iter().all(Vec::is_empty), "thumbnails have no journals");
+        assert_eq!(removals.len(), RENAMED, "every old thumbnail is still to be removed");
+        assert!(took < Duration::from_secs(1), "finding the journals took {took:?}");
     }
 
     #[test]

@@ -10,16 +10,23 @@
 //! writing to never stops the rest of a job's removals. An app library the run removes
 //! something of is carried whole after every other copy, and before anything else is
 //! removed: what it removes waits like any removal, and what it brings lands before its
-//! other copy goes. Every library carried then is ready before any of them takes its
-//! place, and what each removes goes only once they all landed, so a file moved from one
-//! library into another keeps its old copy when the other can't take it. A library is never
-//! left half changed: when a new version of it can't land, nothing of it is removed, and a
-//! database's old journal goes back next to it. A library new on the receiving side has no
+//! other copy goes. Every library carried then is written next to its targets and checked
+//! again before any of them takes its place, and each is checked once more right before it
+//! does: one that another program wrote to meanwhile waits whole. What each removes goes
+//! only once they all landed, so a file moved from one library into another keeps its old
+//! copy when the other can't take it. Nothing of a library is removed while one of its new
+//! versions can't land, and a database's old journal goes back next to it. What only adds
+//! to a library (a new photo) lands even when the rest of it waits: the version there goes
+//! on as it was, with an item it doesn't use. A library new on the receiving side has no
 //! old version to be mixed with: its files land as each is ready, while a database in it
 //! waits for its journal.
 
-use charon_core::model::{Review, StepFilter};
+use charon_core::model::{Progress, Review, StepFilter};
+use charon_core::plan::OneWayPlanner;
+use charon_core::run::{Care, Executor, Outcome, ProgressMeter, Shores};
+use charon_core::scan::{ExcludeFilter, Scanner, Volume};
 use charon_core::{ConflictRule, Engine, EngineEvent, JobSetup, JobView, Phase, SyncMode, Trigger};
+use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -627,7 +634,8 @@ fn mirror_keeps_the_old_copy_of_a_take_moved_into_another_library_when_its_copy_
 /// version can't take its place on the destination (the version it replaces can't be kept
 /// there: .charon-trash is a file). Every project is ready by then, so this only shows once
 /// the single's new versions take their places: the album's removal still waits for them,
-/// and neither project changes.
+/// and neither project's version changes. Only the take lands in the single, which its
+/// version there doesn't use.
 #[test]
 fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_whose_new_version_cant_land() {
     let tmp = tempfile::tempdir().unwrap();
@@ -643,10 +651,10 @@ fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_whose_new_ver
     wait_idle(&rig.engine, &id);
     assert!(rig.hook_fired());
     assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take", "the old copy waits for the new one");
-    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "old.wav"], "the single isn't mixed");
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "old.wav", "take.wav"], "the single isn't mixed");
     assert_eq!(read(&dst.join("Single.logicx/arrangement.txt")), "the single");
     let run = view(&rig.engine, &id).job.last_run.unwrap();
-    assert!(run.failed > 0 && run.deleted == 0, "{}", run.describe());
+    assert!(run.failed > 0 && (run.copied, run.deleted) == (1, 0), "{}", run.describe());
 
     // With the trash a folder again, the next sync carries both projects.
     fs::remove_file(dst.join(".charon-trash")).unwrap();
@@ -656,11 +664,137 @@ fn two_way_keeps_the_old_copy_of_a_take_moved_into_another_library_whose_new_ver
     assert_eq!(read(&dst.join("Single.logicx/arrangement.txt")), "the single, with a new chorus");
 }
 
+/// A Mirror sync of `src` onto `dst` by an executor of its own, outside an engine, that runs
+/// `hook` right when the run starts on the first item whose path begins with `needle`. An
+/// engine sends its live progress at most every 120 ms, so a hook on it can miss an item
+/// done sooner; the executor's own progress misses none. Returns what the run did, once its
+/// changes are on the drive.
+fn mirror_on_its_own(src: &Path, dst: &Path, needle: &str, hook: impl FnOnce()) -> Outcome {
+    let filter = ExcludeFilter::none();
+    let scan = |root: &Path| Scanner::new(&filter).scan(root, Volume::of(root)).expect("the folder is scanned");
+    let (source, destination) = (scan(src), scan(dst));
+    let plan = OneWayPlanner::mirror().plan(&source, &destination);
+    let shores = Shores { source: src.to_path_buf(), destination: dst.to_path_buf() };
+    let care = Care { safe_delete: false, keep_replaced: false, two_way: false };
+    let cancel = AtomicBool::new(false);
+    let hook = RefCell::new(Some(hook));
+    let observer = |progress: &Progress| {
+        if progress.current.as_deref().is_some_and(|current| current.starts_with(needle)) {
+            let armed = hook.borrow_mut().take();
+            if let Some(hook) = armed {
+                hook();
+            }
+        }
+    };
+    let mut meter = ProgressMeter::for_plan(&plan, &observer);
+    let executor = Executor::new(&shores, &source, &destination, care, &cancel);
+    let mut outcome = executor.run(&plan, &mut meter);
+    executor.flush(&mut outcome).expect("the run's changes are on the drive");
+    assert!(hook.borrow().is_none(), "the run came to an item starting with {needle}");
+    outcome
+}
+
+/// Two Logic projects that both change and both lose an old take, in a Mirror job: both are
+/// carried right before the plan's first plain removal, the album written next to its
+/// targets first, then the single's takes recorded again. While those are written,
+/// `meanwhile` changes the album in the destination (another computer saving it there). The
+/// album hasn't taken its place yet, and it's checked again before it does: it waits whole,
+/// as it was there, but for the bounce it adds, which its version there doesn't use. The
+/// single, which nothing changed meanwhile, is carried.
+fn a_library_written_to_while_the_next_one_is_written_waits_whole(meanwhile: impl FnOnce(&Path)) {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("Album.logicx/arrangement.txt"), "the album");
+    write(&src.join("Album.logicx/notes.txt"), "the album's notes");
+    write(&src.join("Album.logicx/old.wav"), "an old take of the album");
+    write(&src.join("Single.logicx/arrangement.txt"), "the single");
+    write(&src.join("Single.logicx/old.wav"), "an old take of the single, long gone");
+    for n in 1..=3 {
+        write(&src.join(format!("Single.logicx/take{n}.wav")), &format!("take {n}"));
+    }
+    fs::create_dir_all(&dst).unwrap();
+    assert_eq!(mirror_on_its_own(&src, &dst, "", || {}).copied, 8);
+    write(&src.join("Album.logicx/arrangement.txt"), "the album, remixed");
+    write(&src.join("Album.logicx/notes.txt"), "the album's notes, remixed");
+    write(&src.join("Album.logicx/bounce.wav"), "a bounce of the album");
+    fs::remove_file(src.join("Album.logicx/old.wav")).unwrap();
+    for n in 1..=3 {
+        write(&src.join(format!("Single.logicx/take{n}.wav")), &format!("take {n}, recorded again"));
+    }
+    fs::remove_file(src.join("Single.logicx/old.wav")).unwrap();
+    let album = dst.join("Album.logicx");
+    let outcome = mirror_on_its_own(&src, &dst, "Single.logicx/take", || meanwhile(&album));
+    assert_eq!(read(&album.join("arrangement.txt")), "the album", "nothing of the album took its place");
+    assert_eq!(read(&album.join("old.wav")), "an old take of the album", "nothing of the album was removed");
+    assert_eq!(read(&album.join("bounce.wav")), "a bounce of the album", "what only adds to the album landed");
+    for n in 1..=3 {
+        assert_eq!(read(&dst.join(format!("Single.logicx/take{n}.wav"))), format!("take {n}, recorded again"));
+    }
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["arrangement.txt", "take1.wav", "take2.wav", "take3.wav"], "the single is carried");
+    assert_eq!((outcome.copied, outcome.deleted), (4, 1), "{outcome:?}");
+    // Keys, which a drive that ignores case folds.
+    let mut waited: Vec<String> = outcome.waited.iter().map(|(key, _)| key.to_lowercase()).collect();
+    waited.sort();
+    assert_eq!(waited, ["album.logicx/arrangement.txt", "album.logicx/notes.txt", "album.logicx/old.wav"]);
+    assert!(
+        outcome.waited.iter().all(|(_, why)| why.contains("something in “Album.logicx”, an app library or document, changed while its files were being copied")),
+        "{:?}",
+        outcome.waited
+    );
+}
+
+#[test]
+fn mirror_leaves_a_library_saved_to_while_the_next_one_is_written_whole() {
+    a_library_written_to_while_the_next_one_is_written_waits_whole(|album| {
+        fs::write(album.join("notes.txt"), "the album's notes, saved on another computer").unwrap();
+    });
+}
+
+#[test]
+fn mirror_leaves_a_library_given_a_file_while_the_next_one_is_written_whole() {
+    a_library_written_to_while_the_next_one_is_written_waits_whole(|album| {
+        fs::write(album.join("vocals.wav"), "vocals recorded on another computer").unwrap();
+    });
+}
+
+/// A take moved from one Logic project into another in a Mirror job, and the single it goes
+/// into records its vocals again and loses an old take. While the vocals are written next to
+/// their target, the take changes in the source (its app still writes it). The single waits
+/// whole, and so does the album, which removes the take's old copy, though nothing of the
+/// album changed: every project is checked again before any of them takes its place, so the
+/// album, carried first, never lands without that removal.
+#[test]
+fn mirror_leaves_a_library_whole_for_a_take_that_changed_while_the_next_one_was_written() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    write(&src.join("Album.logicx/arrangement.txt"), "the album");
+    write(&src.join("Album.logicx/take.wav"), "the take");
+    write(&src.join("Single.logicx/old.wav"), "an old take of the single, long gone");
+    write(&src.join("Single.logicx/vocals.wav"), "the vocals");
+    fs::create_dir_all(&dst).unwrap();
+    assert_eq!(mirror_on_its_own(&src, &dst, "", || {}).copied, 4);
+    write(&src.join("Album.logicx/arrangement.txt"), "the album, without the take");
+    fs::rename(src.join("Album.logicx/take.wav"), src.join("Single.logicx/take.wav")).unwrap();
+    write(&src.join("Single.logicx/vocals.wav"), "the vocals, recorded again");
+    fs::remove_file(src.join("Single.logicx/old.wav")).unwrap();
+    let take = src.join("Single.logicx/take.wav");
+    let outcome = mirror_on_its_own(&src, &dst, "Single.logicx/vocals", || {
+        fs::OpenOptions::new().append(true).open(&take).unwrap().write_all(b", recorded again").unwrap();
+    });
+    assert_eq!(files_in(&dst.join("Album.logicx")), ["arrangement.txt", "take.wav"]);
+    assert_eq!(read(&dst.join("Album.logicx/arrangement.txt")), "the album", "the album waits whole");
+    assert_eq!(read(&dst.join("Album.logicx/take.wav")), "the take", "the old copy waits for the new one");
+    assert_eq!(files_in(&dst.join("Single.logicx")), ["old.wav", "vocals.wav"]);
+    assert_eq!(read(&dst.join("Single.logicx/vocals.wav")), "the vocals", "the single waits whole");
+    assert_eq!((outcome.copied, outcome.deleted), (0, 0), "{outcome:?}");
+}
+
 /// A Photos library whose albums changed and whose photo was renamed, in a two-way job,
 /// and the albums' new version can't take its place on the destination (the version it
 /// replaces can't be kept there: .charon-trash is a file). Nothing of a library is removed
-/// before all its new versions have landed: it stays exactly as it was, with the photo
-/// under its old name, the destination's only copy of it.
+/// before all its new versions have landed: its version there stays as it was, with the
+/// photo under its old name, the destination's only copy of it. Only the photo under its
+/// new name lands, which that version doesn't use.
 #[test]
 fn two_way_leaves_a_library_as_it_was_when_a_new_version_cant_take_its_place() {
     let tmp = tempfile::tempdir().unwrap();
@@ -681,11 +815,11 @@ fn two_way_leaves_a_library_as_it_was_when_a_new_version_cant_take_its_place() {
     rig.engine.approve(&id, &review.review_id, true).unwrap();
     wait_idle(&rig.engine, &id);
     assert!(rig.hook_fired());
-    assert_eq!(files_in(&library(&dst)), ["Albums/data.bin", "originals/IMG_1.jpg"], "nothing of the library changed");
+    assert_eq!(files_in(&library(&dst)), ["Albums/data.bin", "originals/IMG_0001.jpg", "originals/IMG_1.jpg"], "the library's version stays");
     assert_eq!(read(&library(&dst).join("Albums/data.bin")), "the albums");
     assert_eq!(read(&library(&dst).join("originals/IMG_1.jpg")), "a photo");
     let run = view(&rig.engine, &id).job.last_run.unwrap();
-    assert!(run.failed > 0 && (run.copied, run.deleted) == (0, 0), "{}", run.describe());
+    assert!(run.failed > 0 && (run.copied, run.deleted) == (1, 0), "{}", run.describe());
 
     // With the trash a folder again, the next sync carries the whole library.
     fs::remove_file(dst.join(".charon-trash")).unwrap();
@@ -698,9 +832,10 @@ fn two_way_leaves_a_library_as_it_was_when_a_new_version_cant_take_its_place() {
 /// too big to keep in .charon-trash on the destination's drive (the database there grew to
 /// 8 TiB, all of it a hole that takes no room), in a Mirror job with safe deletes on.
 /// Before any new version of a library takes its place, the trash must have room for every
-/// version they replace: none lands, not even the album that would come first, nothing is
-/// removed, and the run says why. Where kept copies are clones (APFS), they take no room,
-/// and the whole library lands. Never half of it.
+/// version they replace: none replaces one, nothing is removed, and the run says why. Only
+/// what the library adds lands (the album, the photo under its new name), which its version
+/// there doesn't use. Where kept copies are clones (APFS), they take no room, and the whole
+/// library lands. Never half of it.
 #[test]
 fn mirror_leaves_a_library_whole_when_the_trash_has_no_room_for_what_it_replaces() {
     let tmp = tempfile::tempdir().unwrap();
@@ -722,14 +857,19 @@ fn mirror_leaves_a_library_whole_when_the_trash_has_no_room_for_what_it_replaces
     fs::rename(library(&src).join("originals/IMG_1.jpg"), library(&src).join("originals/IMG_0001.jpg")).unwrap();
     confirm(&rig.engine, &id);
     let run = view(&rig.engine, &id).job.last_run.unwrap();
-    if cfg!(target_os = "macos") && library(&dst).join("originals/IMG_0001.jpg").exists() {
+    if cfg!(target_os = "macos") && !library(&dst).join("originals/IMG_1.jpg").exists() {
         assert_eq!(files_in(&library(&dst)), ["Albums/Trip.album", "database/Photos.sqlite", "originals/IMG_0001.jpg"], "{}", run.describe());
         assert_eq!(read(&library(&dst).join("database/Photos.sqlite")), "the database");
         return;
     }
-    assert_eq!(files_in(&library(&dst)), ["database/Photos.sqlite", "originals/IMG_1.jpg"], "nothing of the library changed: {}", run.describe());
+    assert_eq!(
+        files_in(&library(&dst)),
+        ["Albums/Trip.album", "database/Photos.sqlite", "originals/IMG_0001.jpg", "originals/IMG_1.jpg"],
+        "the library's version stays: {}",
+        run.describe()
+    );
     assert_eq!(fs::metadata(&huge).unwrap().len(), 1 << 43);
-    assert_eq!((run.copied, run.deleted, run.failed), (0, 0, 1), "{}", run.describe());
+    assert_eq!((run.copied, run.deleted, run.failed), (2, 0, 1), "{}", run.describe());
     let log = rig.engine.log(&id, 20);
     assert!(
         log.iter().any(|line| line.text.contains("to keep the replaced versions of “Lib.photoslibrary” in .charon-trash")),
@@ -841,4 +981,99 @@ fn two_way_carries_the_photos_of_a_busy_library_new_on_the_destination() {
 #[test]
 fn mirror_carries_the_photos_of_a_busy_library_new_on_the_destination() {
     a_busy_library_new_on_the_destination_lands_but_its_database(SyncMode::Mirror);
+}
+
+/// A Photos library already in the destination gets five new photos (an import), and its
+/// database and journal change with them. Its app writes to the journal now and then, once
+/// during each run, so the library can't be carried whole. The new photos only add to the
+/// library's version there, which doesn't use them: they land in the first run, while the
+/// database waits for its journal. Once the app is quiet, the next sync carries the rest.
+fn the_new_photos_of_a_busy_library_land_while_the_rest_of_it_waits(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let library = |root: &Path| root.join("Photos Library.photoslibrary");
+    write(&library(&src).join("database/Photos.sqlite"), "the database");
+    write(&library(&src).join("database/Photos.sqlite-wal"), "recent changes");
+    write(&library(&src).join("originals/IMG_1.jpg"), "photo 1");
+    let id = rig.engine.add_job(job_setup(&src, &dst, mode)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&library(&dst).join("originals/IMG_1.jpg")), "photo 1");
+    for n in 2..=6 {
+        write(&library(&src).join(format!("originals/IMG_{n}.jpg")), &format!("photo {n}"));
+    }
+    write(&library(&src).join("database/Photos.sqlite"), "the database, with five more photos");
+    write(&library(&src).join("database/Photos.sqlite-wal"), "recent changes, the import");
+    let wal = library(&src).join("database/Photos.sqlite-wal");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&wal).unwrap().write_all(b", one more").unwrap());
+    let_progress_throttle_pass();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    for n in 2..=6 {
+        assert_eq!(read(&library(&dst).join(format!("originals/IMG_{n}.jpg"))), format!("photo {n}"));
+    }
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite")), "the database", "the database waits for its journal");
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite-wal")), "recent changes");
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.skipped, run.waited), (5, 1, 1), "{}", run.describe());
+
+    // The next sync, while the app is quiet, carries the database with its journal.
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite")), "the database, with five more photos");
+    assert_eq!(read(&library(&dst).join("database/Photos.sqlite-wal")), "recent changes, the import, one more");
+}
+
+#[test]
+fn two_way_carries_the_new_photos_of_a_busy_library_already_there() {
+    the_new_photos_of_a_busy_library_land_while_the_rest_of_it_waits(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_carries_the_new_photos_of_a_busy_library_already_there() {
+    the_new_photos_of_a_busy_library_land_while_the_rest_of_it_waits(SyncMode::Mirror);
+}
+
+/// A Photos library already in the destination whose albums now list a new photo, and the
+/// photo is still being written while the run goes on (its import isn't done). A library's
+/// new version never lands without what it adds: the albums, which would list a photo the
+/// destination doesn't have, wait for it, and the library there stays one its app opens.
+/// The next sync carries both.
+fn a_library_waits_for_a_new_photo_that_changes_during_the_run(mode: SyncMode) {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    let library = |root: &Path| root.join("Lib.photoslibrary");
+    write(&library(&src).join("Albums/data.bin"), "the albums");
+    write(&library(&src).join("originals/IMG_1.jpg"), "photo 1");
+    let id = rig.engine.add_job(job_setup(&src, &dst, mode)).expect("the job is added").job.id;
+    confirm(&rig.engine, &id);
+    write(&library(&src).join("Albums/data.bin"), "the albums, with photo 2");
+    write(&library(&src).join("originals/IMG_2.jpg"), "photo 2");
+    let photo = library(&src).join("originals/IMG_2.jpg");
+    rig.at_first_step(move || fs::OpenOptions::new().append(true).open(&photo).unwrap().write_all(b", the rest of it").unwrap());
+    let_progress_throttle_pass();
+    let review = rig.engine.prepare_review(&id).unwrap();
+    rig.engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&rig.engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(read(&library(&dst).join("Albums/data.bin")), "the albums", "the albums wait for their photo");
+    assert_eq!(files_in(&library(&dst)), ["Albums/data.bin", "originals/IMG_1.jpg"]);
+    let run = view(&rig.engine, &id).job.last_run.unwrap();
+    assert_eq!((run.copied, run.skipped, run.waited), (0, 1, 1), "{}", run.describe());
+
+    confirm(&rig.engine, &id);
+    assert_eq!(read(&library(&dst).join("Albums/data.bin")), "the albums, with photo 2");
+    assert_eq!(read(&library(&dst).join("originals/IMG_2.jpg")), "photo 2, the rest of it");
+}
+
+#[test]
+fn two_way_waits_with_a_library_for_a_new_photo_that_changes_during_the_run() {
+    a_library_waits_for_a_new_photo_that_changes_during_the_run(SyncMode::TwoWay);
+}
+
+#[test]
+fn mirror_waits_with_a_library_for_a_new_photo_that_changes_during_the_run() {
+    a_library_waits_for_a_new_photo_that_changes_during_the_run(SyncMode::Mirror);
 }
