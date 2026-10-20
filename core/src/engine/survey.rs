@@ -850,16 +850,18 @@ impl Engine {
                     let a = job.setup.source.join(source.spelling(&key));
                     let b = job.setup.destination.join(destination.spelling(&key));
                     read_bytes += s.size;
-                    let same = match Contents::same(&a, &b, Some(cancel)) {
-                        Ok(same) => same,
+                    match Contents::same(&a, &b, Some(cancel)) {
+                        Ok(same) => {
+                            self.change_known_runtime(&job.id, |rt| {
+                                rt.same_contents.insert(key.clone(), (s, d, same));
+                            });
+                            Some(same)
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(Error::Cancelled),
-                        // Unreadable now: the plan decides as if they differ (never a removal).
-                        Err(_) => false,
-                    };
-                    self.change_known_runtime(&job.id, |rt| {
-                        rt.same_contents.insert(key.clone(), (s, d, same));
-                    });
-                    Some(same)
+                        // Unreadable now: the plan decides as if they differ (never a removal),
+                        // for this look only. The next one reads them again.
+                        Err(_) => Some(false),
+                    }
                 }
             };
             match same {

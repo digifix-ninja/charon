@@ -212,6 +212,33 @@ fn a_file_that_can_be_read_again_is_copied_at_the_next_sync() {
     assert_eq!(view.job.last_run.unwrap().unreadable, 0);
 }
 
+/// Two copies of a file that only their dates tell apart, one of them unreadable for a
+/// while, on a drive that keeps no change times (tmpfs here; Windows, FAT and exFAT drives
+/// and network shares too), where a file given its permissions back looks just as before:
+/// the comparison that couldn't read it counts for its own look only. Once the file can be
+/// read again, the next look finds both copies identical.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_comparison_that_could_not_read_a_file_counts_for_that_look_only() {
+    if !permissions_bite("a_comparison_that_could_not_read_a_file_counts_for_that_look_only") {
+        return;
+    }
+    let tmp = tempfile::tempdir_in("/dev/shm").unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write_at(&a.join("report.doc"), "the same report", 0);
+    write_at(&b.join("report.doc"), "the same report", 60);
+    chmod(&b.join("report.doc"), 0o000);
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay)).unwrap().job.id;
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.tally.conflicts, 1, "as if they differ: {:?}", review.steps);
+
+    chmod(&b.join("report.doc"), 0o644);
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(steps_for(&review, "report.doc").is_empty(), "{:?}", review.steps);
+    assert_eq!(review.tally.agreed, 1);
+}
+
 #[test]
 fn a_two_way_file_that_cannot_be_read_is_never_removed_on_the_other_side() {
     if !permissions_bite("a_two_way_file_that_cannot_be_read_is_never_removed_on_the_other_side") {
