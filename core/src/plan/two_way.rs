@@ -673,6 +673,24 @@ mod tests {
         assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib), "{:?}", plan.notes);
     }
 
+    /// A link in a library that the other side's drive can't hold is left out on its own: no
+    /// version of it can ever be in the library there, and the rest of the library still
+    /// syncs.
+    #[test]
+    fn a_library_syncs_without_a_link_the_other_drive_can_never_hold() {
+        let lib = "Movie.fcpbundle";
+        let event = format!("{lib}/CurrentVersion.fcpevent");
+        let clip = format!("{lib}/clip.mov");
+        let baseline = base(&[(lib, Entry::dir()), (&event, file(1, 10_000))]);
+        let source = snap(&[(lib, Entry::dir()), (&event, file(1, 10_000)), (&clip, Entry::link(b"/Volumes/Media/clip.mov", 1))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&event, file(2, 20_000))]);
+        destination.refuse_links();
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&source, &destination, &baseline);
+        assert_eq!(plan.actions, vec![Action::copy(Side::Source, &event, file(2, 20_000), Some(file(1, 10_000)))], "{:?}", plan.notes);
+        assert_eq!(plan.notes.len(), 1);
+        assert_eq!((plan.notes[0].kind, plan.notes[0].path.as_str()), (NoteKind::LeftOut, clip.as_str()));
+    }
+
     /// A Numbers document saved as one file, and a private key: only named like an app's
     /// package. They follow the job's rule like any file.
     #[test]

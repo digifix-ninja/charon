@@ -14,6 +14,10 @@ pub(crate) struct Ground<'a> {
     /// ways, names one side leaves out, items the receiving drive can't hold. Everything
     /// inside them is off-limits too.
     frozen: BTreeSet<String>,
+    /// The places in `frozen` that the receiving drive doesn't have and can never hold: a
+    /// link where it holds none, a name it can't take, a new file too big for it. An app
+    /// library holding one is synced without it (see `keep_units_whole`).
+    never_there: BTreeSet<String>,
     /// Places a planning decision put off-limits (a file meeting a folder), with everything inside.
     blocked: BTreeSet<String>,
 }
@@ -22,7 +26,7 @@ impl<'a> Ground<'a> {
     /// The ground for a plan that may copy onto the sides in `receiving`, with a note in
     /// `plan` for every place left alone.
     pub fn new(source: &'a Snapshot, destination: &'a Snapshot, receiving: &[Side], plan: &mut Plan) -> Self {
-        let mut ground = Self { source, destination, frozen: BTreeSet::new(), blocked: BTreeSet::new() };
+        let mut ground = Self { source, destination, frozen: BTreeSet::new(), never_there: BTreeSet::new(), blocked: BTreeSet::new() };
         for side in [Side::Source, Side::Destination] {
             let snapshot = ground.side(side);
             for (key, reason) in snapshot.frozen_places() {
@@ -44,9 +48,12 @@ impl<'a> Ground<'a> {
             ground.frozen.insert(key);
         }
         for &to in receiving {
-            for (key, reason) in ground.unholdable(to) {
+            for (key, reason, never_there) in ground.unholdable(to) {
                 let from = ground.side(to.opposite());
                 plan.note(NoteKind::LeftOut, Some(to.opposite()), from.spelling(&key), reason);
+                if never_there {
+                    ground.never_there.insert(key.clone());
+                }
                 ground.frozen.insert(key);
             }
         }
@@ -56,14 +63,22 @@ impl<'a> Ground<'a> {
 
     /// The files of an app library or a database only go together (see `Unit`): when one of
     /// them is left alone, so are the others. Otherwise a sync would carry some of a
-    /// library's files into a library whose other files stay as they were, or a journal
-    /// without the database it was written for, and the copy would no longer fit together.
+    /// library's files into a library whose other files stay as they were (an older version
+    /// of the one left alone, or one whose change Charon can't see), or a journal without
+    /// the database it was written for, and the copy would no longer fit together.
+    ///
+    /// An item the receiving drive doesn't have and can never hold is left out of a library
+    /// on its own: no version of it can ever be in the library there, so none can be left
+    /// behind. A database's files still never go without each other.
     fn keep_units_whole(&mut self, plan: &mut Plan) {
         let exists = |key: &str| self.source.contains(key) || self.destination.contains(key);
         let shown = |key: &str| if self.source.contains(key) { self.source.spelling(key).to_string() } else { self.destination.spelling(key).to_string() };
         // Each library kept, with the item left alone inside it that keeps it.
         let mut libraries: Vec<(String, String)> = Vec::new();
         for frozen in &self.frozen {
+            if self.never_there.contains(frozen) && Unit::database_of(frozen, self.source, self.destination).is_none() {
+                continue;
+            }
             let Some(Unit::Package(library)) = Unit::of(frozen, self.source, self.destination) else { continue };
             if library != *frozen && exists(&library) && !self.is_frozen(&library) && !libraries.iter().any(|(other, _)| *other == library) {
                 libraries.push((library, shown(frozen)));
@@ -140,33 +155,35 @@ impl<'a> Ground<'a> {
 
     /// Items on the other side that side `to`'s drive can't hold: names it can't take, files
     /// too big for it, links where it has none, and what it refused in an earlier sync. Only
-    /// the topmost such place is listed.
-    fn unholdable(&self, to: Side) -> Vec<(String, String)> {
+    /// the topmost such place is listed, with the reason, and whether it's never there: the
+    /// drive doesn't have it, and can never hold it (it didn't only refuse it once).
+    fn unholdable(&self, to: Side) -> Vec<(String, String, bool)> {
         let (from, here) = (self.side(to.opposite()), self.side(to));
         let drive = here.volume().map(Volume::describe).unwrap_or_else(|| format!("{}'s drive", to.word()));
-        let mut found: Vec<(String, String)> = Vec::new();
+        let mut found: Vec<(String, String, bool)> = Vec::new();
         for (key, entry) in from.iter() {
-            if self.is_frozen(key) || found.last().is_some_and(|(top, _)| Keys::is_within(key, top)) {
+            if self.is_frozen(key) || found.last().is_some_and(|(top, ..)| Keys::is_within(key, top)) {
                 continue;
             }
             let existing = here.get(key);
-            let reason = if let Some(why) = here.refused(key) {
-                Some(format!("an earlier sync found that {}", why.reason(&drive)))
+            let (reason, never_there) = if let Some(why) = here.refused(key) {
+                (Some(format!("an earlier sync found that {}", why.reason(&drive))), false)
             } else if existing.is_none() {
                 let name: String = Keys::name(from.spelling(key)).nfc().collect();
                 let volume = here.volume();
-                volume.and_then(|volume| volume.cannot_hold(&name)).or_else(|| match entry.kind {
+                let reason = volume.and_then(|volume| volume.cannot_hold(&name)).or_else(|| match entry.kind {
                     EntryKind::Link if !here.holds_links() => Some(format!("it's a symbolic link, and the {drive} can't hold links")),
                     EntryKind::File => volume.and_then(|volume| volume.too_big(entry.size)),
                     _ => None,
-                })
+                });
+                (reason, true)
             } else if entry.is_file() && existing.is_some_and(Entry::is_file) {
-                here.volume().and_then(|volume| volume.too_big(entry.size))
+                (here.volume().and_then(|volume| volume.too_big(entry.size)), false)
             } else {
-                None
+                (None, false)
             };
             if let Some(reason) = reason {
-                found.push((key.clone(), format!("left out: {reason}")));
+                found.push((key.clone(), format!("left out: {reason}"), never_there));
             }
         }
         found
@@ -181,6 +198,12 @@ impl<'a> Ground<'a> {
             Side::Source => self.source,
             Side::Destination => self.destination,
         }
+    }
+
+    /// Whether `key` is in a place the receiving drive doesn't have and can never hold (see
+    /// `keep_units_whole`).
+    pub fn is_never_there(&self, key: &str) -> bool {
+        self.never_there.contains(key) || Keys::ancestors(key).any(|folder| self.never_there.contains(folder))
     }
 
     /// Whether `key` is in a place nothing may touch.
@@ -556,6 +579,65 @@ mod tests {
         let kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
         assert_eq!(kept, vec![(lib, Some(Side::Source))], "one note for the library: {:?}", plan.notes);
         assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.reason.contains(&format!("“{}”", item("database/b.db")))));
+    }
+
+    /// A Final Cut library whose media was imported with "Leave files in place" holds links,
+    /// and a name an exFAT drive can't take: no version of them can ever be in the library
+    /// there, so the library is copied without them, each under its own note.
+    #[test]
+    fn a_library_is_synced_without_what_the_drive_can_never_hold() {
+        let lib = "Movie.fcpbundle";
+        let item = |name: &str| format!("{lib}/{name}");
+        let source = snap(
+            &[
+                (lib, Entry::dir()),
+                (&item("CurrentVersion.fcpevent"), Entry::file(8, 2)),
+                (&item("Original Media"), Entry::dir()),
+                (&item("Original Media/clip.mov"), Entry::link(b"/Volumes/Media/clip.mov", 1)),
+                (&item("Notes: day 1.txt"), Entry::file(3, 1)),
+            ],
+            FsKind::Apfs,
+        );
+        let destination = snap(&[], FsKind::Exfat);
+        let plan = crate::plan::OneWayPlanner::mirror().plan(&source, &destination);
+        let mut paths: Vec<&str> = plan.actions.iter().map(Action::path).collect();
+        paths.sort();
+        assert_eq!(paths, vec![lib, item("CurrentVersion.fcpevent").as_str(), item("Original Media").as_str()], "{:?}", plan.notes);
+        let mut notes: Vec<(NoteKind, &str)> = plan.notes.iter().map(|n| (n.kind, n.path.as_str())).collect();
+        notes.sort_by_key(|(_, path)| *path);
+        assert_eq!(notes, vec![(NoteKind::LeftOut, item("Notes: day 1.txt").as_str()), (NoteKind::LeftOut, item("Original Media/clip.mov").as_str())]);
+    }
+
+    /// What can leave an older version of itself in a library, or hide a change there, still
+    /// keeps the library whole: a file grown too big for the drive over the version it holds,
+    /// what the drive refused in an earlier sync, and a database's journal (its database
+    /// never goes without it).
+    #[test]
+    fn a_library_with_an_item_that_could_be_left_behind_is_left_alone_whole() {
+        let lib = "Photos Library.photoslibrary";
+        let item = |name: &str| format!("{lib}/{name}");
+        let library = |extra: &[(&str, Entry)], kind: FsKind| {
+            let mut items = vec![(lib.to_string(), Entry::dir()), (item("a.jpg"), Entry::file(4, 2))];
+            items.extend(extra.iter().map(|(name, entry)| (item(name), *entry)));
+            let items: Vec<(&str, Entry)> = items.iter().map(|(key, entry)| (key.as_str(), *entry)).collect();
+            snap(&items, kind)
+        };
+        let big = Entry::file(5_000_000_000, 2);
+        let cases = [
+            ("a file grown too big for the drive", library(&[("big.mov", big)], FsKind::Apfs), library(&[("big.mov", Entry::file(9, 1))], FsKind::Fat)),
+            ("a journal too big for the drive", library(&[("Photos.sqlite", Entry::file(8, 2)), ("Photos.sqlite-wal", big)], FsKind::Apfs), library(&[], FsKind::Fat)),
+        ];
+        for (case, source, destination) in cases {
+            let plan = crate::plan::OneWayPlanner::mirror().plan(&source, &destination);
+            assert!(plan.actions.is_empty(), "{case}: {:?}", plan.actions);
+            assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib), "{case}: {:?}", plan.notes);
+        }
+        let source = library(&[("q3: plans.txt", Entry::file(1, 2))], FsKind::Apfs);
+        let mut destination = library(&[], FsKind::Other);
+        destination.refuse(&item("q3: plans.txt"), crate::scan::Refusal::Name);
+        let plan = crate::plan::OneWayPlanner::mirror().plan(&source, &destination);
+        assert!(plan.actions.is_empty(), "a refusal: {:?}", plan.actions);
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib), "a refusal: {:?}", plan.notes);
     }
 
     #[test]
