@@ -241,9 +241,10 @@ impl Engine {
             }
             Some((true, true)) => {
                 self.inner.journal.info(id, &format!("confirmed by you, then called off: you paused everything while “{who}” was syncing these folders"));
+                // The window lets a list go once Rust refused it, and only offers to look again.
                 Err(Error::Invalid(format!(
                     "You paused everything just as this list was about to start, and “{who}” is still syncing these folders, so the list doesn't wait for it. \
-                     Confirm it again to have it sync once that sync is done."
+                     Look again once that sync is done."
                 )))
             }
             // The list was replaced or closed in between.
@@ -1130,18 +1131,26 @@ mod tests {
         assert!(ran_when_claiming() && engine.settings().paused_all);
         let row = engine.job(&id).unwrap();
         assert!(!row.confirmed && row.waiting_for.is_none(), "the list doesn't wait");
+        // The window then lets the list go and only offers to look again, so that's what it asks.
         let refused = approved.expect_err("the window is told it doesn't wait");
-        assert!(refused.to_string().starts_with("You paused everything"), "{refused}");
+        assert_eq!(
+            refused.to_string(),
+            "You paused everything just as this list was about to start, and “Charon on studio-mac” is still syncing these folders, \
+             so the list doesn't wait for it. Look again once that sync is done."
+        );
         let said = engine.log(&id, 1).first().map(|line| line.text.clone()).unwrap_or_default();
         assert!(said.contains("you paused everything"), "{said}");
         fs::remove_file(&note).unwrap();
         assert!(!engine.start_confirmed(&id));
         assert!(!dst.join("Projects/plan.txt").exists(), "nothing ran");
 
-        // Confirmed again, it waits, paused or not (the person asked for it), and syncs once the
-        // other sync is done.
+        // Once that sync is done, the person looks again, as the window does it: the list is let
+        // go, and a new one is made. Confirmed while another sync works there, the new list
+        // waits, paused or not (the person asked for it), and syncs once that sync is done.
+        engine.discard_review(&id, &review_id);
+        let again = engine.prepare_review(&id).unwrap();
         let note = another_charon_syncs(&dst.join("Projects"));
-        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+        assert!(matches!(engine.approve(&id, &again.review_id, true).unwrap(), Approval::Waiting { .. }));
         fs::remove_file(note).unwrap();
         assert!(engine.start_confirmed(&id));
         wait_idle(&engine, &id);
