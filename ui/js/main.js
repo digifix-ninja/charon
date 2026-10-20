@@ -40,6 +40,7 @@ class App {
     this.waiting = new WaitingSheet(this.store, this.review);
     this.upgrade = new UpgradeSheet(this.store, this.toast, {
       automate: id => this.editor.edit(id, { automation: true, over: true }),
+      review: id => this.review.show(id),
     });
     this.settings = new SettingsPanel(this.store, this.toast);
     this.updates = new Updates(this.toast);
