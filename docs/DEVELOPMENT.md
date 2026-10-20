@@ -274,15 +274,16 @@ each get the drive's own answer, and every look passes over such names.) It:
    (`compare_contents`): pairs of the same size that have no record and different dates, or
    that changed on both sides since the record (whatever their dates), and a file that changed
    on one side but kept its size while its time stayed put or moved only by a rounding or by
-   whole quarter hours. Identical pairs are recorded as in sync; pairs that look alike but
-   differ become conflicts. Without a record, a pair of the same size whose times are at most
-   2 seconds apart is taken as identical without being read, except where the survey's `Guide`
-   says otherwise: a pair found to differ before and left for the person (`Memory::unsettled`),
-   and, when the comparison is a fresh one, a pair that the record Charon doesn't trust shows
-   changed since on either side, are read all the same. A pair whose contents can't be read
-   counts as differing for that look. A background look reads at most 1 GB
-   (`CHECK_COMPARE_BYTES`) and counts what it left unread as differing, never as in sync, for
-   that look only; lists and runs read everything.
+   whole quarter hours. Identical pairs are recorded as in sync. Pairs that look alike but
+   differ become conflicts when both sides changed since the record or there's no record to go
+   by; when only one side changed, that change crosses. Without a record, a pair of the same
+   size whose times are at most 2 seconds apart is taken as identical without being read,
+   except where the survey's `Guide` says otherwise: a pair found to differ before and left for
+   the person (`Memory::unsettled`), and, when the comparison is a fresh one, a pair that the
+   record Charon doesn't trust shows changed since on either side, are read all the same. A
+   pair whose contents can't be read counts as differing for that look. A background look
+   reads at most 1 GB (`CHECK_COMPARE_BYTES`) and counts what it left unread as differing,
+   never as in sync, for that look only; lists and runs read everything.
 6. Plans (`plan::plan_for`), then runs the guard and the other checks. Each check can add a
    **warning** to the list, a **hold** that stops a run nobody looks at, and the need for a
    **tick** before the list can be confirmed.
@@ -392,8 +393,9 @@ drive without links, a name it can't take) stay out of it. When the memory is tr
 that item's record changes. When it isn't, the memory is kept as it was, without the settled
 item and with the reason it isn't trusted (`distrust` in the memory file, `keep_untrusted`):
 every look compares afresh and removes nothing until a whole list is confirmed, while the lists
-still say why and name the items most likely removed since. The list that settles the item
-says so too.
+still say why and name the items most likely removed since. A memory without markers (Charon
+0.2's, a damaged one, one for other folders) is left as it is, since no look trusts it anyway.
+The list that settles the item says so too.
 
 ### The guard
 
@@ -475,8 +477,8 @@ read the warnings above*.
 *Sync all* (and the tray's *Sync All…*) starts the jobs that run by themselves and opens *Waiting
 for your OK* for the others (jobs paused on their own, jobs whose folders aren't there or don't
 answer, jobs already syncing and jobs whose confirmed list waits for another sync are left out),
-where each list is prepared and confirmed on its own. There is deliberately no way to confirm them all at
-once.
+where each list is prepared and confirmed on its own. There is deliberately no way to confirm
+them all at once.
 
 *Confirm* carries out exactly that list and nothing else. The engine refuses it when:
 
@@ -828,10 +830,10 @@ sync"), in the log and in the window's last-run line. Cloud
 folders on the computer's own disk (where iCloud Drive, Dropbox and OneDrive usually keep them)
 count as local: this rule doesn't cover them, and *Newest wins* trusts their times.
 
-A job whose last sync is dated later than now synced while the clock was ahead. Each tick the
-autopilot dates such a sync now, for every job, offline ones too, and saves it
-(`correct_syncs_dated_ahead`), so the row's "Not synced for 3 days" (`Engine::stale`) still
-comes once the job really hasn't synced for that long.
+A job whose last sync is dated later than now synced while the clock was ahead, or the clock is
+behind now. Each tick the autopilot dates such a sync now, for every job, offline ones too, and
+saves it (`correct_syncs_dated_ahead`), so the row's "Not synced for 3 days" (`Engine::stale`)
+still comes once the job really hasn't synced for that long.
 
 **Folders that don't answer** (`engine/reach.rs`): a network share whose server stopped
 answering can hold up any question about a folder on it (is it there, which drive is it on,
@@ -964,8 +966,10 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   the computer and the data folder it ran with (`Launch`), and only those that ran on this
   computer with this very folder count as stopped (`ran_like`). So a data folder restored onto
   another computer, cloned or copied doesn't make the notes of a Charon still at work with the
-  original look like leftovers. A list that can't be read (or one in the older form, plain ids)
-  is started afresh, and when the list can't be saved, such a note counts for its 2 minutes. A
+  original look like leftovers. Only a copy on a computer with the same name, at the same path,
+  can't be told apart from the original. A list that can't be read (or one in the older form,
+  plain ids) is started afresh, and when the list can't be saved, such a note counts for its 2
+  minutes. A
   `.busy` file that can't be read counts as long as the file keeps changing, by its modification
   time, and is never removed: it may not be a note at all, and waiting a little is better than
   syncing next to another sync. The row names the other sync as its job's name when it's this

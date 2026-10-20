@@ -74,8 +74,9 @@ wrong folder or a damaged file is carried over before you see it, so it is only 
 know exactly what it does.
 
 The job then syncs by itself only after one more list you confirm. It asks again after a
-*Stop* (pausing the job, or everything, stops a sync of it the same way), after you change what
-it syncs, after a sync Charon couldn't record, and whenever the guard below holds a run back.
+*Stop* (pausing the job stops a sync of it the same way, and so does pausing everything, unless
+you confirmed that sync's list), after you change what it syncs, after a sync Charon couldn't
+record, and whenever the guard below holds a run back.
 Changing the mode, turning safe deletes off or swapping a Mirror or Backup job's folders turns
 full automation off again, so you read the warnings anew.
 
@@ -281,12 +282,13 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   shows *Pending* and its last run says how many removals were left for a later sync; once the
   ten minutes are up, the job syncs again by itself, whatever starts it otherwise. Charon
   remembers since when an item has been missing, even across a restart, and counts the ten
-  minutes by its own clock, so setting the computer's clock forward doesn't shorten them. After a
-  restart, after the computer wakes up, or once the share comes back, looks must also find the
-  item missing for two more minutes. When such a removal belongs to a database, the database's
-  other changes wait with it. A list you confirm shows every removal and holds none back. A USB
-  disk that Linux reads through a program (ntfs-3g, exfat-fuse) and cloud folders on the
-  computer's own drive (iCloud Drive, Dropbox, OneDrive) don't count as such drives. On Windows, a
+  minutes by its own clock, so setting the computer's clock forward while Charon runs doesn't
+  shorten them. After a restart, after the computer wakes up, or once the share comes back, looks
+  must also find the item missing for two more minutes. When such a removal belongs to a
+  database, the database's other changes wait with it. A list you confirm shows every removal
+  and holds none back. A USB disk that Linux reads through a program (ntfs-3g, exfat-fuse) and
+  cloud folders on the computer's own drive (iCloud Drive, Dropbox, OneDrive) don't count as
+  such drives. On Windows, a
   folder reached through a link or a mapped drive counts as being on the share it leads to.
 - **Files only in the cloud** (iCloud Drive, OneDrive, Dropbox on macOS and Windows) are left
   alone when Charon looks, and it says so. So are files that iCloud Drive before macOS 14, or
@@ -301,10 +303,11 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   extended attributes and Windows alternate data streams are not copied, and a change to only
   tags or permissions doesn't make a file sync. In a two-way job it doesn't stand against an
   edit on the other side either: the edit crosses. Only against a deletion on the other side
-  does such a file count as edited, and it's copied back. FAT and exFAT keep no tags (a
-  resource fork still travels), and the run's summary says so. On a Mac, `._` files are never
-  synced on their own. Folders are created fresh: their own dates, permissions and tags aren't
-  copied.
+  does such a file count as edited, and it's copied back. Inside an app library or database
+  every change counts, so a library changed on both sides still becomes one conflict. FAT and
+  exFAT keep no tags (a resource fork still travels), and the run's summary says so. On a Mac,
+  `._` files are never synced on their own. Folders are created fresh: their own dates,
+  permissions and tags aren't copied.
 - **Close the app** that uses a library or database before you confirm a list that changes it
   (the list reminds you). A file another app keeps Charon from reading waits under *Couldn't
   read* until it can be read or you leave it out there, and a notification tells you once.
