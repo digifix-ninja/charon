@@ -1113,6 +1113,36 @@ fn a_linked_trash_folder_is_never_used_and_nothing_is_lost_for_it() {
     assert_eq!(tree(&outside), outside_before);
 }
 
+/// Two-way: a removal the trash can't take fails before the file is touched. Moved aside and
+/// put back, the file would carry a new change time, and the next look would take Charon's own
+/// renames for an edit on that side and copy the removed file back as new.
+#[test]
+#[cfg(unix)] // symbolic links work differently on Windows
+fn a_two_way_removal_the_trash_cant_take_never_brings_the_file_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data, outside) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"), tmp.path().join("outside"));
+    write(&a.join("keep.txt"), "keep");
+    write(&a.join("photo.jpg"), "the photo");
+    fs::create_dir_all(&outside).unwrap();
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&a, &b, SyncMode::TwoWay));
+    confirm(&engine, &id);
+    assert_eq!(read(&b.join("photo.jpg")), "the photo");
+
+    std::os::unix::fs::symlink(&outside, b.join(".charon-trash")).unwrap();
+    fs::remove_file(a.join("photo.jpg")).unwrap();
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.removed, review.total_steps), (1, 1), "{:?}", review.steps);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert!(view(&engine, &id).job.last_run.unwrap().failed > 0, "the failure is reported");
+    assert_eq!(read(&b.join("photo.jpg")), "the photo", "a removal that can't go to the trash doesn't happen");
+    assert!(!a.join("photo.jpg").exists());
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.removed, review.total_steps), (1, 1), "still the same removal, nothing copied back: {:?}", review.steps);
+}
+
 // ------------------------------------------------------------------ probe 9: the wipe guard is narrow
 
 #[test]

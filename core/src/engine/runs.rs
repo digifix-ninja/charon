@@ -716,7 +716,7 @@ impl Engine {
         }
         let memory = survey.memory.clone().unwrap_or_default();
         let next = match crossing.kind {
-            ReviewKind::Sync => Baseline::after_run(&survey.baseline, &survey.source, &survey.destination, &survey.plan, &outcome.settled),
+            ReviewKind::Sync => Baseline::after_run(&survey.baseline, &survey.source, &survey.destination, &survey.plan, &outcome.settled, &outcome.put_back),
             // Settling one item changes the memory of that item only, when there is a memory.
             // Whatever under the settled item didn't make it (a failed copy, a stop) has no
             // record afterwards, so the next look copies it rather than removing it.

@@ -8,7 +8,8 @@
 //! replaced in place: an app that has the file open (Pages, TextEdit, Preview…) follows the
 //! file itself, not its name, so after a move it would go on saving the person's work into
 //! the trash. Replaced in place, the app notices the new version instead. (On APFS, where a
-//! copy takes no time and no room, a removed file is copied there too and then removed: see
+//! copy takes no time and no room, a removed file is copied there too and then removed, and
+//! so is one on another drive than the trash, in a folder mounted inside the job's: see
 //! `Executor::remove`.)
 //!
 //! Each dated folder holds a list of what its run put there, with each file's size and time

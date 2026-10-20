@@ -20,7 +20,7 @@ mod two_way;
 mod units;
 
 pub use action::{Action, Clearing, Note, NoteKind, Plan, PlanSummary, Side, Step};
-pub use baseline::{Baseline, Pair, Settled};
+pub use baseline::{Baseline, Pair, PutBack, Settled};
 pub use guard::{Footprints, Guard, LongCount, Recent};
 pub use one_way::OneWayPlanner;
 pub use resolve::Resolution;

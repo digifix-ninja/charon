@@ -512,7 +512,7 @@ mod tests {
         dst.leave_out("music".into(), Some("music"), "is a link or junction; Charon leaves those alone on Windows");
         let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert!(plan.actions.is_empty(), "{:?}", plan.actions);
-        let after = Baseline::after_run(&b, &src, &dst, &plan, &[]);
+        let after = Baseline::after_run(&b, &src, &dst, &plan, &[], &[]);
         assert_eq!(after.get("music/song.mp3"), b.get("music/song.mp3"), "the record stays for when the folder is back");
     }
 

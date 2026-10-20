@@ -47,6 +47,18 @@ pub struct Settled {
     pub pair: Option<Pair>,
 }
 
+/// An item a step renamed aside and put back as it was, because the step couldn't finish.
+/// On drives whose change times the scans trust, the two renames moved its change time, and
+/// nothing else about it changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PutBack {
+    pub side: Side,
+    pub path: String,
+    /// The item as the step found it, and as it is now that it's back.
+    pub found: Entry,
+    pub now: Entry,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Baseline {
@@ -124,8 +136,10 @@ impl Baseline {
     /// * a finished step: what the step left behind;
     /// * an item both sides already agreed on: both sides as the plan saw them;
     /// * anything else (a skipped or failed step, an open conflict, a place that couldn't be
-    ///   read, a run that stopped early): the old record, so the next run decides again.
-    pub fn after_run(old: &Baseline, source: &Snapshot, destination: &Snapshot, plan: &Plan, settled: &[Settled]) -> Baseline {
+    ///   read, a run that stopped early): the old record, so the next run decides again. For
+    ///   an item a failed step put back (`put_back`), with the change time it has now (see
+    ///   `follow`).
+    pub fn after_run(old: &Baseline, source: &Snapshot, destination: &Snapshot, plan: &Plan, settled: &[Settled], put_back: &[PutBack]) -> Baseline {
         let ground = Ground::quiet(source, destination, &[Side::Source, Side::Destination]);
         let planned: BTreeSet<&str> = plan.actions.iter().map(Action::path).collect();
         let all: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(old.paths()).collect();
@@ -147,7 +161,25 @@ impl Baseline {
             }
         }
         next.record(settled);
+        next.follow(put_back);
         next
+    }
+
+    /// The record of each item a failed step put back takes the change time Charon's own
+    /// renames gave the item, where the record had the one the step found. The next look then
+    /// sees the item as this run saw it: never an edit on its side, which would bring back an
+    /// item removed on the other side, or make a conflict of a change on the other side.
+    fn follow(&mut self, put_back: &[PutBack]) {
+        for item in put_back {
+            let Some(pair) = self.pairs.get_mut(&item.path) else { continue };
+            let recorded = match item.side {
+                Side::Source => &mut pair.source,
+                Side::Destination => &mut pair.destination,
+            };
+            if recorded.changed != 0 && recorded.changed == item.found.changed {
+                recorded.changed = item.now.changed;
+            }
+        }
     }
 
     /// Records what finished steps left behind (see `Settled`), leaving every other record
@@ -199,7 +231,7 @@ mod tests {
         plan.push(Action::copy(Side::Destination, "a.txt", a2, Some(a1)));
         let landed = Entry::file(2, 20_000);
         let settled = vec![Settled { path: "a.txt".into(), pair: Some(Pair::new(a2, landed)) }];
-        let next = Baseline::after_run(&old, &source, &destination, &plan, &settled);
+        let next = Baseline::after_run(&old, &source, &destination, &plan, &settled, &[]);
         assert_eq!(next.get("a.txt"), Some(&Pair::new(a2, landed)));
         // Saved again on the source meanwhile: the next run sees that as the source's change.
         let a3 = Entry::file(3, 30_000);
@@ -214,7 +246,7 @@ mod tests {
         let destination = snap(&[("a.txt", a1)]);
         let mut plan = Plan::default();
         plan.push(Action::delete(Side::Destination, "a.txt", a1, None));
-        let next = Baseline::after_run(&old, &source, &destination, &plan, &[]);
+        let next = Baseline::after_run(&old, &source, &destination, &plan, &[], &[]);
         assert_eq!(next.get("a.txt"), Some(&Pair::new(a1, a1)), "the next run still knows it was deleted on the source");
     }
 
@@ -222,7 +254,7 @@ mod tests {
     fn agreement_is_recorded_side_by_side() {
         let s = Entry::file(1, 10_000);
         let d = Entry::file(1, 11_000); // rounded by the destination's drive
-        let next = Baseline::after_run(&Baseline::new(), &snap(&[("a", s)]), &snap(&[("a", d)]), &Plan::default(), &[]);
+        let next = Baseline::after_run(&Baseline::new(), &snap(&[("a", s)]), &snap(&[("a", d)]), &Plan::default(), &[], &[]);
         assert_eq!(next.get("a"), Some(&Pair::new(s, d)));
     }
 
@@ -233,8 +265,39 @@ mod tests {
         let mut plan = Plan::default();
         plan.push(Action::delete(Side::Destination, "x", Entry::dir(), None));
         let settled = vec![Settled { path: "x".into(), pair: None }];
-        let next = Baseline::after_run(&old, &snap(&[]), &snap(&[("x", Entry::dir())]), &plan, &settled);
+        let next = Baseline::after_run(&old, &snap(&[]), &snap(&[("x", Entry::dir())]), &plan, &settled, &[]);
         assert!(next.is_empty(), "{next:?}");
+    }
+
+    /// A failed step put an item back as it was, with the change time Charon's own renames
+    /// gave it: its record takes that change time, so the next look sees no edit there. A
+    /// record that already differed from what the step found (an edit the plan saw) stays as
+    /// it was, and so does one without a change time (a drive whose change times aren't
+    /// trusted).
+    #[test]
+    fn the_record_of_an_item_put_back_follows_its_new_change_time() {
+        let other = Entry::file(9, 5_000);
+        let synced = Entry::file(4, 1_000).changed_at(10);
+        let edited = Entry::file(4, 1_000).changed_at(20);
+        let untimed = Entry::file(4, 1_000);
+        let old: Baseline = [("photo.jpg", synced), ("doc.txt", synced), ("card.jpg", untimed)]
+            .into_iter()
+            .map(|(path, entry)| (path.to_string(), Pair::new(other, entry)))
+            .collect();
+        let mut plan = Plan::default();
+        for (path, found) in [("photo.jpg", synced), ("doc.txt", edited), ("card.jpg", untimed)] {
+            plan.push(Action::delete(Side::Destination, path, found, None));
+        }
+        let destination = snap(&[("photo.jpg", synced), ("doc.txt", edited), ("card.jpg", untimed)]);
+        let put_back = [
+            PutBack { side: Side::Destination, path: "photo.jpg".into(), found: synced, now: synced.changed_at(30) },
+            PutBack { side: Side::Destination, path: "doc.txt".into(), found: edited, now: edited.changed_at(40) },
+            PutBack { side: Side::Destination, path: "card.jpg".into(), found: untimed, now: untimed.changed_at(50) },
+        ];
+        let next = Baseline::after_run(&old, &snap(&[]), &destination, &plan, &[], &put_back);
+        assert_eq!(next.get("photo.jpg"), Some(&Pair::new(other, synced.changed_at(30))));
+        assert_eq!(next.get("doc.txt"), Some(&Pair::new(other, synced)), "an edit the plan saw stays one");
+        assert_eq!(next.get("card.jpg"), Some(&Pair::new(other, untimed)));
     }
 
     #[test]
@@ -244,7 +307,7 @@ mod tests {
         let mut source = snap(&[("x", Entry::dir())]);
         source.freeze("x", "permission denied");
         let destination = snap(&[("x", Entry::dir()), ("x/a", f)]);
-        let next = Baseline::after_run(&old, &source, &destination, &Plan::default(), &[]);
+        let next = Baseline::after_run(&old, &source, &destination, &Plan::default(), &[], &[]);
         assert!(next.contains("x/a"));
     }
 
