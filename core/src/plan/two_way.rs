@@ -15,18 +15,18 @@
 //! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
 //! deletion, the edit wins: Charon never throws away work. A file whose details alone
 //! changed on one side (a tag, a permission, an app noting that it was opened: its size and
-//! time are as recorded) doesn't stand against a real edit on the other side: that edit
-//! crosses, and the version it replaces goes to the trash, like every version a two-way
-//! job replaces. Against a deletion it is an edit, and wins: an edit can put a file's old
-//! time back. An item one side changed into
-//! another kind (a folder that became a file) crosses like any change, unless the folder it
-//! replaces holds changes or items Charon leaves alone; a file meeting a folder that both
-//! sides changed, and a link taking the place of a file or folder, are a question for the
-//! person. When
-//! the newest version wins a conflict, the other version still goes to the trash; and when
-//! "newest" can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time
-//! that went backwards), both versions are kept instead. Places that couldn't be read on
-//! either side are left alone completely, and their baseline is kept.
+//! time are as recorded) doesn't stand against a real edit on the other side (not a time a
+//! drive moved by itself, by whole quarter hours say): that edit crosses, and the version
+//! it replaces goes to the trash, like every version a two-way job replaces. Against a
+//! deletion it is an edit, and wins: an edit can put a file's old time back. An item one
+//! side changed into another kind (a folder that became a file) crosses like any change,
+//! unless the folder it replaces holds changes or items Charon leaves alone; a file meeting
+//! a folder that both sides changed, and a link taking the place of a file or folder, are a
+//! question for the person. When the newest version wins a conflict, the other version
+//! still goes to the trash; and when "newest" can't be told reliably (a FAT or exFAT drive,
+//! times whole hours apart, a time that went backwards), both versions are kept instead.
+//! Places that couldn't be read on either side are left alone completely, and their
+//! baseline is kept.
 //!
 //! A file whose time is now *older* than at the last sync isn't an ordinary change either:
 //! it was restored from an older copy, or the drive lost its last writes (pulled out too
@@ -121,7 +121,10 @@ impl TwoWayPlanner {
     }
 
     /// `changes`, for deciding what crosses: when only the details of a file changed on one
-    /// side, a real edit of it on the other side is a change of that side alone.
+    /// side, a real edit of it on the other side is a change of that side alone. A time that
+    /// only moved the way drives move times isn't a real edit: then either side may hold the
+    /// edit, and the pair stays a conflict (unless its contents were read and found the same,
+    /// see `Engine::compare_contents`).
     fn changes_that_cross(&self, path: &str, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> (bool, bool) {
         let changes = self.changes(path, source, destination, baseline);
         if changes != (true, true) || self.different.contains(path) {
@@ -131,7 +134,11 @@ impl TwoWayPlanner {
         let only_details = |now: Option<&Entry>, side: Side| {
             now.zip(baseline.side(path, side)).is_some_and(|(now, before)| now.is_file() && now.changed_at(0).unchanged(before))
         };
-        let edited = |now: Option<&Entry>, side: Side| now.is_some_and(Entry::is_file) && !only_details(now, side);
+        // The size changed, or the time moved more than by a rounding or whole quarter hours
+        // (see `Entry::drifted_from`, which a change of details alone passes too).
+        let edited = |now: Option<&Entry>, side: Side| {
+            now.is_some_and(Entry::is_file) && !now.zip(baseline.side(path, side)).is_some_and(|(now, before)| now.drifted_from(before))
+        };
         if only_details(s, Side::Source) && edited(d, Side::Destination) {
             (false, true)
         } else if only_details(d, Side::Destination) && edited(s, Side::Source) {
@@ -384,6 +391,25 @@ mod tests {
         assert_eq!(ask.plan(&snap(&[("report.docx", also_edited)]), &snap(&[("report.docx", edited)]), &b).conflicts().len(), 1);
         let restored = file(900, 4_000).changed_at(9);
         assert_eq!(ask.plan(&snap(&[("report.docx", touched)]), &snap(&[("report.docx", restored)]), &b).conflicts().len(), 1);
+        // A time that only moved the way drives move times (by whole quarter hours, on an
+        // exFAT drive used under another time-zone offset) isn't a real edit. Such a pair is
+        // read, and when the contents differ, either side may hold the edit (one that kept the
+        // file's time, as an encrypted container does): it stays a conflict, by every rule.
+        let mut shifted = snap(&[("report.docx", file(1000, 10_000 + 30 * 60_000))]);
+        shifted.facts_mut().volume = Some(crate::scan::Volume {
+            kind: crate::scan::FsKind::Exfat,
+            fs: "exfat".into(),
+            mount: "/Volumes/STICK".into(),
+            name: "STICK".into(),
+            network: false,
+            case_sensitive: false,
+            case_guessed: false,
+            refuses_links: false,
+        });
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", touched)]), &shifted, &b);
+            assert!(matches!(plan.actions.as_slice(), [Action::Conflict { .. } | Action::KeepBoth { .. }]), "{rule:?}: {:?}", plan.actions);
+        }
         // Inside an app library, a change of details still counts: the library is one conflict.
         let library = [("Talk.key", Entry::dir()), ("Talk.key/Index.zip", synced)];
         let plan = ask.plan(
