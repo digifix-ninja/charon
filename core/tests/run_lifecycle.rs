@@ -63,7 +63,7 @@ fn look_until(engine: &Engine, id: &String, found: impl Fn(&Engine) -> bool) {
     while !found(engine) {
         assert!(Instant::now() < deadline, "the look never finished");
         thread::sleep(Duration::from_millis(20));
-        if engine.check_due(id, 1) {
+        if engine.check_due(id, Duration::from_secs(60)) {
             engine.check(id);
         }
     }

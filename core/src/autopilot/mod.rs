@@ -26,6 +26,9 @@
 //! 5. **Regular look:** every few minutes, in case the watcher missed something (network
 //!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs,
 //!    unless its folders are still changing: then step 2 syncs once they have settled.
+//!    Folders that never settle (an app that saves every few seconds) still sync here, once
+//!    they have kept changing for a whole interval of the regular look since they began to
+//!    and since the job last synced.
 //!
 //! A sync that is due waits (it isn't dropped) while another sync uses the same folders, and
 //! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
@@ -74,8 +77,8 @@ pub struct Autopilot {
     engine: Engine,
     watcher: Option<FolderWatcher>,
     changes: Receiver<(JobId, PathBuf)>,
-    /// When each job's folders last changed (cleared once handled).
-    changed: HashMap<JobId, Instant>,
+    /// The changes in each job's folders since they were last handled.
+    changed: HashMap<JobId, Changes>,
     /// Whether both folders of each job were reachable at the last tick.
     reachable: HashMap<JobId, bool>,
     /// When each job's schedule last came due, also kept here: if the job's record can't be
@@ -204,13 +207,14 @@ impl Autopilot {
                 }
                 continue;
             }
-            // 2. Changes settled.
-            if let Some(since) = self.changed.get(id) {
+            // 2. Changes settled: quiet for the settle time since the last change heard, and
+            //    since the last sync ended (what changes while a sync runs isn't heard here).
+            if let Some(changes) = self.changed.get(id) {
                 let settle = match job.setup.trigger {
                     Trigger::OnChange { settle_seconds } => Duration::from_secs(settle_seconds as u64),
                     _ => CHECK_SETTLE,
                 };
-                if since.elapsed() >= settle {
+                if changes.last.elapsed() >= settle && !self.engine.synced_within(id, settle) {
                     self.changed.remove(id);
                     if by_itself && job.setup.trigger.syncs_on_change() {
                         self.run(id, "after changes");
@@ -239,10 +243,14 @@ impl Autopilot {
                 continue;
             }
             // 5. Regular look. While the folders still change, step 2 waits for them to settle.
-            let settling = self.changed.contains_key(id);
+            //    Folders that never settle still sync here, but only once they have kept
+            //    changing for a whole interval of the regular look since they began to and
+            //    since the job last synced.
+            let interval = settings.check_interval();
+            let settling = self.changed.get(id).is_some_and(|changes| changes.first.elapsed() < interval || self.engine.synced_within(id, interval));
             if by_itself && job.setup.trigger.syncs_on_change() && !settling && self.engine.has_pending(id) {
                 self.run(id, "for changes found by a look");
-            } else if self.engine.check_due(id, settings.check_minutes) {
+            } else if self.engine.check_due(id, interval) {
                 self.engine.check(id);
             }
         }
@@ -303,16 +311,26 @@ impl Autopilot {
     /// job looked at once its sync is done).
     fn collect_changes(&mut self) {
         while let Ok((id, path)) = self.changes.try_recv() {
-            let matters = if self.engine.is_settling(&id, QUIET_AFTER_RUN) {
+            let matters = if self.engine.synced_within(&id, QUIET_AFTER_RUN) {
                 self.engine.note_change_while_syncing(&id, &path)
             } else {
                 self.engine.note_change(&id, &path)
             };
             if matters {
-                self.changed.insert(id, Instant::now());
+                let now = Instant::now();
+                self.changed.entry(id).and_modify(|changes| changes.last = now).or_insert(Changes { first: now, last: now });
             }
         }
     }
+}
+
+/// Changes in a job's folders that haven't been handled yet.
+#[derive(Debug, Clone, Copy)]
+struct Changes {
+    /// When the first of them came.
+    first: Instant,
+    /// When the last of them came.
+    last: Instant,
 }
 
 #[cfg(test)]
@@ -395,11 +413,67 @@ mod tests {
         until("the tick's sync, if any", || !engine.is_running(&id));
         assert!(!b.join("notes.txt").exists(), "synced while the folder still changed");
 
-        // Quiet for the settle time: it syncs.
-        pilot.changed.insert(id.clone(), Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute"));
+        // Quiet for the settle time since the change, and since the last sync: it syncs.
+        let quiet = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() - chrono::Duration::seconds(31), own: quiet });
+        pilot.changed.insert(id.clone(), Changes { first: quiet, last: quiet });
         pilot.tick();
         until("the sync", || !engine.is_running(&id));
         assert!(b.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn an_on_change_job_whose_folders_never_settle_still_syncs_once_a_regular_look() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, a, b) = on_change_job(tmp.path(), 30);
+        let mut settings = engine.settings();
+        settings.check_minutes = 1;
+        engine.set_settings(settings).unwrap();
+        let interval = engine.settings().check_interval();
+        let (mut pilot, changes) = pilot(&engine);
+        // An app saves notes.txt every few seconds, for hours: the folder is never quiet for
+        // the settle time.
+        let save = |version: &str| {
+            fs::write(a.join("notes.txt"), version).unwrap();
+            changes.send((id.clone(), a.join("notes.txt"))).unwrap();
+            engine.check(&id);
+            until("the look", || engine.has_pending(&id));
+        };
+        let synced = || {
+            until("the tick's sync, if any", || !engine.is_running(&id));
+            fs::read_to_string(b.join("notes.txt")).ok()
+        };
+        // The job last synced long ago, but the folder has only just begun to change: it waits
+        // for the folder to settle.
+        let long_ago = Moment { wall: Utc::now() - chrono::Duration::from_std(interval).unwrap(), own: Instant::now().checked_sub(interval).expect("the computer has run for a minute") };
+        engine.pretend_the_last_sync_ended(&id, long_ago);
+        save("1");
+        pilot.tick();
+        assert_eq!(synced(), None, "synced while the folder had only just begun to change");
+
+        // It has kept changing for as long as the regular look waits: the regular look syncs it.
+        pilot.changed.get_mut(&id).unwrap().first = long_ago.own;
+        save("2");
+        pilot.tick();
+        assert_eq!(synced().as_deref(), Some("2"));
+
+        // That sync took longer than the settle time, and the app saved while it ran: the
+        // folder hasn't been quiet since it ended, so no other sync follows at once.
+        pilot.changed.get_mut(&id).unwrap().last = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        fs::write(a.join("notes.txt"), "3").unwrap();
+        engine.check(&id);
+        until("the look", || engine.has_pending(&id));
+        pilot.tick();
+        assert_eq!(synced().as_deref(), Some("2"), "synced again as soon as that sync ended");
+
+        // It goes on changing: no sync again until the regular look's interval has passed
+        // since that one.
+        save("3");
+        pilot.tick();
+        assert_eq!(synced().as_deref(), Some("2"), "synced again before the regular look's interval passed");
+        engine.pretend_the_last_sync_ended(&id, long_ago);
+        pilot.tick();
+        assert_eq!(synced().as_deref(), Some("3"));
     }
 
     #[test]
@@ -432,7 +506,7 @@ mod tests {
         let answer = engine.silence(&share);
         fs::write(home.join("letter.txt"), "letter").unwrap();
         let settled = Instant::now().checked_sub(CHECK_SETTLE).expect("the computer has run for a few seconds");
-        pilot.changed.insert(local.clone(), settled);
+        pilot.changed.insert(local.clone(), Changes { first: settled, last: settled });
         let started = Instant::now();
         pilot.tick();
         assert!(started.elapsed() < crate::engine::reach::LIMIT, "the tick waited {:?}", started.elapsed());

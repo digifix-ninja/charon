@@ -167,12 +167,11 @@ impl Engine {
         self.runtime().get(id).is_some_and(|rt| rt.is_running())
     }
 
-    /// Whether the job is running or just finished: the moment its own writes would look
-    /// like changes to the folder watcher.
-    pub fn is_settling(&self, id: &JobId, quiet: Duration) -> bool {
+    /// Whether a sync of the job is running, or one ended less than `time` ago.
+    pub fn synced_within(&self, id: &JobId, time: Duration) -> bool {
         self.runtime()
             .get(id)
-            .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < quiet))
+            .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < time))
     }
 
     /// Notes that a job with full automation should sync (`reason` is for the log). The run
@@ -1153,6 +1152,15 @@ impl Survey {
             housekeeping: Default::default(),
             made_at: Utc::now(),
         }
+    }
+}
+
+#[cfg(test)]
+impl Engine {
+    /// Makes the job's last sync look as if it ended at `at`, by both clocks.
+    pub(crate) fn pretend_the_last_sync_ended(&self, id: &JobId, at: Moment) {
+        self.change_job(id, |job| job.last_synced = Some(at.wall)).unwrap();
+        self.change_runtime(id, |rt| rt.finished_at = Some(at.own));
     }
 }
 

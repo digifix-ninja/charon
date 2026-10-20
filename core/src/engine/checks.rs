@@ -114,10 +114,9 @@ impl Engine {
         self.publish(&job.id);
     }
 
-    /// Whether the last look is older than `minutes` (or there was none), and nothing is
+    /// Whether the last look is older than `interval` (or there was none), and nothing is
     /// looking or running now.
-    pub fn check_due(&self, id: &JobId, minutes: u32) -> bool {
-        let interval = Duration::from_secs(minutes.max(1) as u64 * 60);
+    pub fn check_due(&self, id: &JobId, interval: Duration) -> bool {
         self.runtime().get(id).is_none_or(|rt| {
             !rt.is_checking() && !rt.is_running() && rt.preparing.is_none() && rt.last_checked.is_none_or(|t| t.elapsed() >= interval)
         })
@@ -296,6 +295,7 @@ impl Engine {
             rt.missing.look_again();
         }
     }
+
 }
 
 #[cfg(test)]
@@ -322,7 +322,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConflictRule, JobSetup, ReviewKind, SyncMode};
+    use crate::model::{ConflictRule, JobSetup, ReviewKind, Settings, SyncMode};
     use std::fs;
     use std::sync::atomic::Ordering;
 
@@ -404,7 +404,7 @@ mod tests {
             assert!(rt.look.is_none() && !rt.is_checking());
             assert!(rt.last_checked.is_none(), "the next tick looks at the new setup");
         }
-        assert!(engine.check_due(&job.id, 15));
+        assert!(engine.check_due(&job.id, Settings::default().check_interval()));
     }
 
     #[test]

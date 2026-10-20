@@ -731,7 +731,7 @@ fn changes_made_during_a_sync_have_the_folders_looked_at_once_it_is_done() {
     confirm(engine, &id);
     assert!(rig.hook_fired());
     assert_eq!(*heard.lock().unwrap(), vec![false, false], "kept for the sync's end");
-    assert!(engine.check_due(&id, 15), "the folders are looked at again at once");
+    assert!(engine.check_due(&id, Duration::from_secs(15 * 60)), "the folders are looked at again at once");
 
     // Right after it, the sync's own items are still told apart; anything else counts.
     assert!(!engine.note_change_while_syncing(&id, &src.join("a.txt")));
@@ -746,7 +746,7 @@ fn changes_made_during_a_sync_have_the_folders_looked_at_once_it_is_done() {
     let_progress_throttle_pass();
     confirm(engine, &id);
     assert!(rig.hook_fired());
-    assert!(!engine.check_due(&id, 15));
+    assert!(!engine.check_due(&id, Duration::from_secs(15 * 60)));
 }
 
 // ==================================================================== Charon itself can't work as it should

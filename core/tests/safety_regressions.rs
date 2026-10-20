@@ -465,7 +465,7 @@ fn look_now(engine: &Engine, id: &String) -> u64 {
     // Changes that waited before a restart still show, but uncounted until a look counts them.
     assert!(view(engine, id).waiting.is_none_or(|waiting| !waiting.counted), "no look of this setup yet: {}", describe(engine, id));
     engine.check(id);
-    assert!(!engine.check_due(id, 1), "the look started");
+    assert!(!engine.check_due(id, Duration::from_secs(60)), "the look started");
     eventually("the look finished", || view(engine, id).waiting.is_some_and(|waiting| waiting.counted));
     items_waiting(engine, id)
 }
@@ -1328,7 +1328,7 @@ fn an_edited_job_with_full_automation_waits_for_an_ok_before_it_syncs_again() {
     // setup by itself (it may be done already), and the autopilot's regular look isn't due
     // again for many minutes after it.
     eventually("the edit's look", || view(&engine, &id).waiting.is_some_and(|waiting| waiting.counted));
-    assert!(!engine.check_due(&id, 1), "the edit's look counts as the last one");
+    assert!(!engine.check_due(&id, Duration::from_secs(60)), "the edit's look counts as the last one");
     let seen = items_waiting(&engine, &id);
     Autopilot::start(engine.clone());
     // New files in its new source make the edited job's on-change trigger fire. Once its row
