@@ -233,7 +233,8 @@ fn tree(root: &Path) -> BTreeMap<String, String> {
         let items = fs::read_dir(dir).unwrap_or_else(|e| panic!("{} can't be listed: {e}", dir.display()));
         for item in items {
             let path = item.unwrap_or_else(|e| panic!("an item in {} can't be listed: {e}", dir.display())).path();
-            let relative = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+            // Spelled with `/` on every system, as Charon's keys are.
+            let relative = path.strip_prefix(root).unwrap().components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/");
             let meta = fs::symlink_metadata(&path).unwrap_or_else(|e| panic!("{} can't be looked at: {e}", path.display()));
             if meta.file_type().is_symlink() {
                 out.insert(relative, format!("link -> {}", fs::read_link(&path).unwrap().display()));
