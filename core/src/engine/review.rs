@@ -9,7 +9,7 @@
 //! job changed, synced, or a drive was swapped meanwhile: then the row says why it wasn't).
 
 use crate::engine::runs::Crossing;
-use crate::engine::runtime::{Confirmed, JobRuntime};
+use crate::engine::runtime::Confirmed;
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, Look};
 use crate::error::{Error, Result};
@@ -177,11 +177,10 @@ impl Engine {
     /// soon as that sync is done (see `start_confirmed`; the row says what it waits for).
     /// Says which of the two happened.
     pub fn approve(&self, id: &JobId, review_id: &str, acknowledged: bool) -> Result<Approval> {
-        match self.carry_out(id, review_id, acknowledged, false) {
+        let confirmed = Confirmed { review_id: review_id.to_string(), acknowledged, pauses: self.pauses() };
+        match self.carry_out(id, &confirmed, false) {
             Ok(()) => Ok(Approval::Started),
-            Err(Error::FoldersBusy(who)) if self.queue_confirmed(id, review_id, acknowledged, &who) => Ok(Approval::Waiting { waiting_for: who }),
-            // The list was replaced or closed in between.
-            Err(Error::FoldersBusy(_)) => Err(Self::gone()),
+            Err(Error::FoldersBusy(who)) => self.queue_confirmed(id, confirmed, &who),
             Err(e) => Err(e),
         }
     }
@@ -195,20 +194,15 @@ impl Engine {
             return false;
         }
         let Some(confirmed) = self.runtime().get(id).and_then(|rt| rt.confirmed.clone()) else { return false };
-        match self.carry_out(id, &confirmed.review_id, confirmed.acknowledged, true) {
+        match self.carry_out(id, &confirmed, true) {
             Ok(()) => true,
             Err(Error::FoldersBusy(who)) => {
-                // Only while it's still the job's confirmed list: it may have been called off
-                // meanwhile.
-                let current = |rt: &JobRuntime| rt.confirmed.as_ref().is_some_and(|waiting| waiting.review_id == confirmed.review_id);
-                let changed = self.change_known_runtime(id, |rt| current(rt) && rt.waiting_for.replace(who.clone()) != Some(who));
-                if changed == Some(true) {
-                    self.publish(id);
-                }
+                self.keep_waiting(id, &confirmed, who);
                 false
             }
             // Its own sync runs, or a folder is away for a moment: it keeps waiting. (Stopped
-            // by the person meanwhile, it was called off and said so.)
+            // by the person, or by pausing everything, as it was about to start, it was called
+            // off and said so.)
             Err(Error::Busy) | Err(Error::Offline(_)) | Err(Error::Cancelled) => false,
             Err(e) => {
                 self.change_known_runtime(id, |rt| {
@@ -225,21 +219,89 @@ impl Engine {
     }
 
     /// Keeps a confirmed list waiting while another sync (`who`) is at work in the job's
-    /// folders. Returns whether it waits (it's still the job's list).
-    fn queue_confirmed(&self, id: &JobId, review_id: &str, acknowledged: bool, who: &str) -> bool {
-        let queued = self.change_known_runtime(id, |rt| {
-            let current = rt.review.as_ref().is_some_and(|review| review.id == review_id);
-            if current {
-                rt.confirmed = Some(Confirmed { review_id: review_id.to_string(), acknowledged });
+    /// folders, if it's still the job's list. Not if the person paused everything since they
+    /// confirmed it: the pause came while the list's sync was about to start, and found
+    /// nothing waiting to call off (see `pause_everything`). The list is called off then, and
+    /// the window and the job's log say so.
+    fn queue_confirmed(&self, id: &JobId, confirmed: Confirmed, who: &str) -> Result<Approval> {
+        let outcome = self.change_known_runtime(id, |rt| {
+            let current = rt.review.as_ref().is_some_and(|review| review.id == confirmed.review_id);
+            let paused = self.paused_since(&confirmed);
+            if current && !paused {
+                rt.confirmed = Some(confirmed);
                 rt.waiting_for = Some(who.to_string());
             }
-            current
-        }) == Some(true);
-        if queued {
-            self.inner.journal.info(id, &format!("confirmed by you; waits for “{who}” to finish syncing these folders"));
+            (current, paused)
+        });
+        match outcome {
+            Some((true, false)) => {
+                self.inner.journal.info(id, &format!("confirmed by you; waits for “{who}” to finish syncing these folders"));
+                self.publish(id);
+                Ok(Approval::Waiting { waiting_for: who.to_string() })
+            }
+            Some((true, true)) => {
+                self.inner.journal.info(id, &format!("confirmed by you, then called off: you paused everything while “{who}” was syncing these folders"));
+                Err(Error::Invalid(format!(
+                    "You paused everything just as this list was about to start, and “{who}” is still syncing these folders, so the list doesn't wait for it. \
+                     Confirm it again to have it sync once that sync is done."
+                )))
+            }
+            // The list was replaced or closed in between.
+            _ => Err(Self::gone()),
+        }
+    }
+
+    /// Keeps a confirmed list that found another sync (`who`) at work in the job's folders
+    /// waiting, and the row saying for whom, while it's still the job's confirmed list (it may
+    /// have been called off meanwhile). Not if the person paused everything since they
+    /// confirmed it: the pause came while the list's sync was about to start, and found it
+    /// marked as running (see `pause_everything`). The list is called off then, and the job's
+    /// log says so, unless another try of it began meanwhile: that one sees the pause itself.
+    fn keep_waiting(&self, id: &JobId, confirmed: &Confirmed, who: String) {
+        let (called_off, changed) = self
+            .change_known_runtime(id, |rt| {
+                if !rt.confirmed.as_ref().is_some_and(|waiting| waiting.review_id == confirmed.review_id) {
+                    return (false, false);
+                }
+                if self.paused_since(confirmed) {
+                    return (!rt.is_running() && rt.call_off_confirmed(), false);
+                }
+                (false, rt.waiting_for.replace(who.clone()) != Some(who))
+            })
+            .unwrap_or_default();
+        if called_off {
+            self.note_called_off(id, " (Pause everything)");
+        }
+        if called_off || changed {
             self.publish(id);
         }
-        queued
+    }
+
+    /// Whether the person paused everything since they confirmed `confirmed`.
+    fn paused_since(&self, confirmed: &Confirmed) -> bool {
+        self.pauses() != confirmed.pauses
+    }
+
+    /// Ends the sync of a list that waited before it changed anything, because the person
+    /// paused everything since they confirmed it (see `carry_out`): the list is called off, and
+    /// the job's log says so. One the person stopped meanwhile ends as stopped.
+    fn call_off_as_it_starts(&self, job: &crate::model::Job, crossing: &Crossing, confirmed: &Confirmed) {
+        let id = &job.id;
+        let called_off = self.change_runtime(id, |rt| {
+            if !Self::unmark_run(rt) {
+                return None;
+            }
+            Some(rt.confirmed.as_ref().is_some_and(|waiting| waiting.review_id == confirmed.review_id) && rt.call_off_confirmed())
+        });
+        match called_off {
+            None => self.unfinished(job, crossing, Error::Cancelled),
+            Some(called_off) => {
+                if called_off {
+                    self.note_called_off(id, " (Pause everything)");
+                }
+                self.publish(id);
+            }
+        }
     }
 
     /// The confirmed list is being carried out: it no longer waits for an OK.
@@ -251,12 +313,14 @@ impl Engine {
         });
     }
 
-    /// Carries out exactly the reviewed list, after the checks that make sure it can still be
-    /// trusted. A list that `waited` for another sync was confirmed in time: neither its age
-    /// nor the changes made in the folders since count against it (each step still checks
-    /// its items right before it acts, and leaves alone what changed; an app library or a
-    /// database is only carried when nothing of it changed, see `run::Executor`).
-    fn carry_out(&self, id: &JobId, review_id: &str, acknowledged: bool, waited: bool) -> Result<()> {
+    /// Carries out exactly the list the person confirmed, after the checks that make sure it
+    /// can still be trusted. A list that `waited` for another sync was confirmed in time:
+    /// neither its age nor the changes made in the folders since count against it (each step
+    /// still checks its items right before it acts, and leaves alone what changed; an app
+    /// library or a database is only carried when nothing of it changed, see `run::Executor`).
+    /// It's called off, though, if the person paused everything since they confirmed it.
+    fn carry_out(&self, id: &JobId, confirmed: &Confirmed, waited: bool) -> Result<()> {
+        let (review_id, acknowledged) = (confirmed.review_id.as_str(), confirmed.acknowledged);
         let review = self.stored_review(id, review_id)?;
         // The folders must still be the very folders the list was made from.
         for side in [Side::Source, Side::Destination] {
@@ -325,12 +389,22 @@ impl Engine {
         // network share). Those changes didn't count against the list, and aren't in it: once
         // it's done, the folders are looked at again.
         crossing.outdated = waited;
+        #[cfg(test)]
+        tests::before_the_claim();
         // The run's busy notes go into the folders before anything changes there, and before
         // the person is told it started.
         let claim = match self.claim_folders(&job, &review.survey) {
             Ok(claim) => claim,
             Err(who) => return Err(if self.not_begun(&job, &crossing, &who) { Error::FoldersBusy(who) } else { Error::Cancelled }),
         };
+        // Pausing everything calls off a list that waits, even one whose sync was about to start
+        // when the person paused: that pause found the job marked as running, and left it to
+        // here. From here on, the sync is at work, and goes on.
+        if waited && self.paused_since(confirmed) {
+            drop(claim);
+            self.call_off_as_it_starts(&job, &crossing, confirmed);
+            return Err(Error::Cancelled);
+        }
         self.publish(id);
         self.spawn_crossing(job, cancel, crossing, move |engine, job, cancel, crossing| {
             engine.take_review(&job.id, &review.id);
@@ -902,8 +976,190 @@ impl Look {
 mod tests {
     use super::*;
     use crate::model::{ConflictRule, JobSetup, SyncMode, Trigger};
+    use crate::run::{BusyNote, BUSY_EXTENSION};
+    use std::cell::RefCell;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use std::thread;
+
+    thread_local! {
+        /// What `carry_out` runs on this thread once the job is marked as running, right before
+        /// the sync claims its folders: the moment a confirmed list's sync neither waits nor is
+        /// at work yet.
+        static BEFORE_THE_CLAIM: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+
+    /// Runs what this thread set to run before the next claim, once (see `when_claiming`).
+    pub(super) fn before_the_claim() {
+        if let Some(hook) = BEFORE_THE_CLAIM.with(|hook| hook.borrow_mut().take()) {
+            hook();
+        }
+    }
+
+    /// Pauses everything on this thread when the next confirmed list's sync is about to claim
+    /// its folders, after making sure the job was marked as running then.
+    fn pause_everything_when_claiming(engine: &Engine, id: &JobId) {
+        let (engine, id) = (engine.clone(), id.clone());
+        let hook = move || {
+            assert!(engine.is_running(&id), "the job is marked as running");
+            engine.set_all_paused(true).unwrap();
+        };
+        BEFORE_THE_CLAIM.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    /// Whether what this thread set to run before a claim ran.
+    fn ran_when_claiming() -> bool {
+        BEFORE_THE_CLAIM.with(|hook| hook.borrow().is_none())
+    }
+
+    /// A Backup job "Docs" whose list copies Projects/plan.txt into the destination's Projects
+    /// folder, ready to confirm. Returns the engine, the job, its destination and the list.
+    fn docs(tmp: &Path) -> (Engine, JobId, PathBuf, String) {
+        let (src, dst) = (tmp.join("src"), tmp.join("dst"));
+        fs::create_dir_all(src.join("Projects")).unwrap();
+        fs::create_dir_all(dst.join("Projects")).unwrap();
+        fs::write(src.join("Projects/plan.txt"), "plan").unwrap();
+        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
+        let setup = JobSetup {
+            name: "Docs".into(),
+            source: src,
+            destination: dst.clone(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: JobSetup::default_excludes(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while engine.job(&id).unwrap().looking {
+            assert!(Instant::now() < deadline, "the first look took too long");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let review = engine.prepare_review(&id).unwrap();
+        (engine, id, dst, review.review_id)
+    }
+
+    /// Leaves a note in `folder` as Charon on another computer does while it syncs there. In a
+    /// folder inside the job's folders that had no Charon folder when they were looked at, only
+    /// a sync's claim meets it, once the job is marked as running (see `claim_folders`).
+    fn another_charon_syncs(folder: &Path) -> PathBuf {
+        let mut note = BusyNote::new(&"elsewhere".to_string(), "Projects", "another-charon");
+        note.host = "studio-mac".into();
+        let file = folder.join(".charon").join(format!("another-charon{BUSY_EXTENSION}"));
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, serde_json::to_vec(&note).unwrap()).unwrap();
+        file
+    }
+
+    /// The busy notes in the Charon folder of `folder`.
+    fn busy_notes(folder: &Path) -> usize {
+        fs::read_dir(folder.join(".charon"))
+            .map(|items| items.flatten().filter(|item| item.file_name().to_string_lossy().ends_with(BUSY_EXTENSION)).count())
+            .unwrap_or(0)
+    }
+
+    fn wait_idle(engine: &Engine, id: &JobId) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while engine.is_running(id) {
+            assert!(Instant::now() < deadline, "the sync took too long");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Asserts that the job's confirmed list doesn't wait anymore, and that its log says Pause
+    /// everything called it off.
+    fn called_off_by_pausing_everything(engine: &Engine, id: &JobId) {
+        let row = engine.job(id).unwrap();
+        assert!(!row.confirmed && row.waiting_for.is_none(), "the list no longer waits");
+        let said = engine.log(id, 1).first().map(|line| line.text.clone());
+        assert_eq!(said.as_deref(), Some("the confirmed sync that waited for another sync was called off (Pause everything)"));
+    }
+
+    #[test]
+    fn pausing_everything_while_a_waiting_list_is_tried_again_calls_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+        let note = another_charon_syncs(&dst.join("Projects"));
+        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+
+        // The list is tried again: its sync is marked as running, and before it finds the other
+        // sync still at work, the person pauses everything.
+        pause_everything_when_claiming(&engine, &id);
+        assert!(!engine.start_confirmed(&id));
+        assert!(ran_when_claiming() && engine.settings().paused_all);
+        called_off_by_pausing_everything(&engine, &id);
+
+        // The other sync ends: nothing starts by itself.
+        fs::remove_file(note).unwrap();
+        assert!(!engine.start_confirmed(&id));
+        assert!(!engine.is_running(&id) && !dst.join("Projects/plan.txt").exists(), "nothing ran");
+    }
+
+    #[test]
+    fn pausing_everything_just_as_a_waiting_list_starts_calls_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+        let note = another_charon_syncs(&dst.join("Projects"));
+        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+
+        // The other sync ends, and the list is tried again: its sync is marked as running, and
+        // before it claims the folders, the person pauses everything.
+        fs::remove_file(note).unwrap();
+        pause_everything_when_claiming(&engine, &id);
+        let started = engine.start_confirmed(&id);
+        assert!(ran_when_claiming() && engine.settings().paused_all);
+        wait_idle(&engine, &id);
+        assert!(!started && !dst.join("Projects/plan.txt").exists(), "nothing ran");
+        called_off_by_pausing_everything(&engine, &id);
+        assert!(engine.job(&id).unwrap().job.last_run.is_none(), "no sync began");
+        assert_eq!(busy_notes(&dst) + busy_notes(&dst.join("Projects")), 0, "its busy notes are gone");
+    }
+
+    #[test]
+    fn pausing_everything_as_a_list_is_confirmed_while_another_sync_works_keeps_it_from_waiting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+        let note = another_charon_syncs(&dst.join("Projects"));
+
+        // The person confirms the list; its sync is marked as running, and before it finds the
+        // other sync at work, they pause everything.
+        pause_everything_when_claiming(&engine, &id);
+        let approved = engine.approve(&id, &review_id, true);
+        assert!(ran_when_claiming() && engine.settings().paused_all);
+        let row = engine.job(&id).unwrap();
+        assert!(!row.confirmed && row.waiting_for.is_none(), "the list doesn't wait");
+        let refused = approved.expect_err("the window is told it doesn't wait");
+        assert!(refused.to_string().starts_with("You paused everything"), "{refused}");
+        let said = engine.log(&id, 1).first().map(|line| line.text.clone()).unwrap_or_default();
+        assert!(said.contains("you paused everything"), "{said}");
+        fs::remove_file(&note).unwrap();
+        assert!(!engine.start_confirmed(&id));
+        assert!(!dst.join("Projects/plan.txt").exists(), "nothing ran");
+
+        // Confirmed again, it waits, paused or not (the person asked for it), and syncs once the
+        // other sync is done.
+        let note = another_charon_syncs(&dst.join("Projects"));
+        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+        fs::remove_file(note).unwrap();
+        assert!(engine.start_confirmed(&id));
+        wait_idle(&engine, &id);
+        assert!(dst.join("Projects/plan.txt").exists());
+    }
+
+    #[test]
+    fn a_list_confirmed_just_as_everything_is_paused_syncs_when_nothing_else_works_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+
+        // A sync the person confirmed that's at work goes on.
+        pause_everything_when_claiming(&engine, &id);
+        assert_eq!(engine.approve(&id, &review_id, true).unwrap(), Approval::Started);
+        assert!(ran_when_claiming() && engine.settings().paused_all);
+        wait_idle(&engine, &id);
+        assert!(dst.join("Projects/plan.txt").exists());
+    }
 
     #[test]
     fn a_confirmed_sync_stopped_after_it_was_picked_up_never_starts() {
@@ -927,19 +1183,19 @@ mod tests {
         let id = engine.add_job(setup).unwrap().job.id;
         let review = engine.prepare_review(&id).unwrap();
         // Confirmed while another sync used the folders, as `queue_confirmed` keeps it.
-        let waiting = Confirmed { review_id: review.review_id.clone(), acknowledged: true };
+        let waiting = Confirmed { review_id: review.review_id.clone(), acknowledged: true, pauses: engine.pauses() };
         engine.change_runtime(&id, |rt| rt.confirmed = Some(waiting.clone()));
 
         // `start_confirmed` picks it up, and the person presses Stop before its sync begins.
         let picked = engine.runtime().get(&id).and_then(|rt| rt.confirmed.clone()).unwrap();
         engine.cancel(&id);
-        assert!(matches!(engine.carry_out(&id, &picked.review_id, picked.acknowledged, true), Err(Error::Cancelled)));
+        assert!(matches!(engine.carry_out(&id, &picked, true), Err(Error::Cancelled)));
         assert!(!engine.is_running(&id));
         assert!(!dst.join("a.txt").exists(), "nothing ran");
 
         // The same list, not called off, starts.
         engine.change_runtime(&id, |rt| rt.confirmed = Some(waiting.clone()));
-        engine.carry_out(&id, &waiting.review_id, waiting.acknowledged, true).unwrap();
+        engine.carry_out(&id, &waiting, true).unwrap();
         while engine.is_running(&id) {
             thread::sleep(std::time::Duration::from_millis(10));
         }

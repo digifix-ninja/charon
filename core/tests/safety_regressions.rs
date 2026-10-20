@@ -1663,7 +1663,7 @@ fn sync_now_sync_all_and_automatic_starts_change_nothing_for_jobs_that_wait_for_
         assert!(!engine.is_running(id), "no run started");
         engine.check(id);
     }
-    let mut asking = engine.sync_all();
+    let mut asking = engine.sync_all().unwrap();
     asking.sort();
     let mut all: Vec<String> = jobs.iter().map(|(id, _)| id.clone()).collect();
     all.sort();

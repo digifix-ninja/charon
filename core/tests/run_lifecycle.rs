@@ -232,7 +232,7 @@ mod when_the_state_cant_be_saved {
         assert!(view.waiting.is_some());
         assert_eq!(engine.overview().waiting, 1);
         assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review);
-        assert_eq!(engine.sync_all(), vec![id.clone()], "Sync all lists it among the jobs that ask");
+        assert_eq!(engine.sync_all().unwrap(), vec![id.clone()], "Sync all lists it among the jobs that ask");
     }
 }
 
