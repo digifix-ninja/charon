@@ -15,7 +15,7 @@ use crate::engine::runtime::{Moment, OwnWrites, MISSING_FOR};
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
-use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
+use crate::model::{plural, Drives, Finished, Folder, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
 use crate::scan::{never_download_on_this_thread, ExcludeFilter, Snapshot};
@@ -101,8 +101,11 @@ impl Engine {
     /// and returns the other jobs that could sync now: their lists need the person's OK.
     pub fn sync_all(&self) -> Vec<JobId> {
         let mut asking = Vec::new();
-        for job in self.job_list() {
-            if job.paused || !job.setup.source.is_dir() || !job.setup.destination.is_dir() || self.is_running(&job.id) {
+        let jobs = self.job_list();
+        // Folders that don't answer in time count as away.
+        let whereabouts = self.whereabouts_of(&jobs);
+        for (job, found) in jobs.into_iter().zip(whereabouts) {
+            if job.paused || !found.both_there() || self.is_running(&job.id) {
                 continue;
             }
             if job.runs_by_itself() && !self.must_ask(&job.id) {
@@ -409,18 +412,36 @@ impl Engine {
         true
     }
 
-    /// Which other jobs share a folder with `id` (asks the disk; done before locking).
+    /// Which other jobs share a folder with `id` (asks the disk, with a time limit; done
+    /// before locking). A job whose folders don't answer in time counts as sharing: where
+    /// they lead can't be told, so a sync of it at work keeps this job waiting.
     pub(crate) fn neighbours(&self, id: &JobId) -> Neighbours {
         let jobs = self.job_list();
         let Some(me) = jobs.iter().find(|job| &job.id == id) else {
             return Neighbours { mine: Self::nowhere(), others: HashMap::new() };
         };
-        let others = jobs
+        let others: Vec<&Job> = jobs.iter().filter(|other| other.id != me.id).collect();
+        let paths: Vec<&Path> =
+            std::iter::once(me).chain(others.iter().copied()).flat_map(|job| [job.setup.source.as_path(), job.setup.destination.as_path()]).collect();
+        let folders = self.folders_of(&paths);
+        let (mine, theirs) = folders.split_at(2);
+        let others = others
             .iter()
-            .filter(|other| other.id != me.id)
-            .map(|other| (other.id.clone(), (other.setup.clone(), me.setup.shares_folders_with(&other.setup))))
+            .zip(theirs.chunks_exact(2))
+            .map(|(other, theirs)| (other.id.clone(), (other.setup.clone(), Self::may_share(mine, theirs))))
             .collect();
         Neighbours { mine: me.setup.clone(), others }
+    }
+
+    /// Whether two jobs' folders may be one place, or one inside the other: they are, or
+    /// one of them didn't answer (`None`).
+    fn may_share(mine: &[Option<Folder>], theirs: &[Option<Folder>]) -> bool {
+        mine.iter().any(|a| {
+            theirs.iter().any(|b| match (a, b) {
+                (Some(a), Some(b)) => a.overlaps(b),
+                _ => true,
+            })
+        })
     }
 
     /// The name of a running job that shares a folder with `job`, if there is one. A job
@@ -1368,5 +1389,44 @@ mod tests {
         assert_ne!(view.status, JobStatus::Syncing);
         assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review);
         assert!(engine.sync_all().contains(&id), "Sync all asks for it");
+    }
+
+    #[test]
+    fn a_job_whose_folders_dont_answer_counts_as_sharing_folders() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [home, usb, share, copy] = ["home", "usb", "share", "copy"].map(|name| tmp.path().join(name));
+        for folder in [&home, &usb, &share, &copy] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_| {})).unwrap();
+        let job = |name: &str, source: &Path, destination: &Path| JobSetup {
+            name: name.into(),
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        };
+        let local = engine.add_job(job("Home", &home, &usb)).unwrap().job.id;
+        let shared = engine.add_job(job("Share", &share, &copy)).unwrap().job.id;
+        assert!(!engine.neighbours(&local).others[&shared].1, "different folders");
+
+        // The share stops answering: where its folders lead can't be told, so a sync of that
+        // job at work would keep this one waiting. Nothing waits for the share itself.
+        let answer = engine.silence(&share);
+        let asked = Instant::now();
+        assert!(engine.neighbours(&local).others[&shared].1);
+        assert!(asked.elapsed() < crate::engine::reach::LIMIT, "waited {:?}", asked.elapsed());
+
+        answer.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.is_silent(&share) {
+            assert!(Instant::now() < deadline, "the share took too long to answer");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!engine.neighbours(&local).others[&shared].1);
     }
 }

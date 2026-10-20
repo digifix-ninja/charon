@@ -9,7 +9,8 @@
 //! * the job's own two folders, by the folders themselves (see `RootId::is_within`), and by
 //!   the job's own markers: one of its folders found inside the other under another name
 //!   (a share mounted twice, where the folders' numbers can't tell);
-//! * every other job, by its folders' paths as they resolve now (see `JobSetup::clashes_with`);
+//! * every other job, by its folders' paths as they resolve now (see `JobSetup::clashes_with`),
+//!   asked with a time limit: a folder that doesn't answer is compared at a later look;
 //! * every other job, by the markers it left in its folders (see `run::Marker`): they are
 //!   found inside this job's folders, at their top, or in a folder above, under whatever
 //!   name the folder is reached.
@@ -59,7 +60,10 @@ impl Engine {
         let mut clashes = Vec::new();
         let mut unseen: Vec<&Job> = Vec::new();
         for other in &others {
-            if job.setup.clashes_with(&other.setup) {
+            // Asked with a time limit. A folder that doesn't answer (a share whose server is
+            // away) isn't one of this job's folders, which this look just read: it's compared
+            // again at a later look.
+            if job.setup.clashes_as(&other.setup, |paths| self.folders_of(paths)) {
                 clashes.push(format!(
                     "This job's folders overlap with those of “{}”, and one of the two is a Mirror job, which removes what the other brings in (a two-way job then carries those removals back). \
                      Check the removals in this list, and give one of the two jobs other folders.",
@@ -129,7 +133,11 @@ impl Engine {
                 continue;
             }
             let (mine, theirs, name, folder) = (found.side.word(), marker.side.word(), &other.setup.name, found.folder.display());
-            let sure = match Marker::origin(&other.id, other.setup.root(marker.side), &found.folder) {
+            // The other job's folder is asked about with a time limit: one that doesn't answer
+            // can't tell, the careful direction.
+            let (whose, here) = (other.id.clone(), found.folder.clone());
+            let origin = self.ask_about(other.setup.root(marker.side), move |root| Marker::origin(&whose, root, &here));
+            let sure = match origin.unwrap_or(Origin::Unknown) {
                 Origin::SameFolder => true,
                 Origin::Unknown => false,
                 Origin::Copy => {

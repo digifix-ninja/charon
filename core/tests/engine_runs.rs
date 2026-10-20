@@ -8,8 +8,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Opens the engine once a previous one on `data` has let go of it (its threads may still
+/// hold it for a moment after the last handle is dropped).
 fn engine(data: &Path) -> Engine {
-    Engine::open(data, Arc::new(|_: EngineEvent| {})).unwrap()
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match Engine::open(data, Arc::new(|_: EngineEvent| {})) {
+            Ok(engine) => return engine,
+            Err(Error::AlreadyRunning) => {
+                assert!(Instant::now() < deadline, "the previous engine never let go of the data folder");
+                thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the engine doesn't open: {e}"),
+        }
+    }
 }
 
 /// An engine that keeps every event it sends.

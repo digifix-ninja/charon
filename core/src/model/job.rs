@@ -160,10 +160,20 @@ impl JobSetup {
     /// (The other job would bring files in, Mirror would remove them, and a two-way job would
     /// carry that removal back to where the files came from.) Asks the disk.
     pub fn clashes_with(&self, other: &JobSetup) -> bool {
+        self.clashes_as(other, |paths| paths.iter().map(|path| Some(Folder::of(path))).collect())
+    }
+
+    /// `clashes_with`, with each folder as `resolve` finds it, in the order given: `None`
+    /// for one it can't tell now (a share that doesn't answer), which is compared with nothing.
+    pub fn clashes_as(&self, other: &JobSetup, resolve: impl Fn(&[&Path]) -> Vec<Option<Folder>>) -> bool {
         let clash = |mirror: &JobSetup, writer: &JobSetup| {
-            mirror.mode == SyncMode::Mirror && {
-                let removes_in = Folder::of(&mirror.destination);
-                writer.written_folders().iter().any(|folder| removes_in.overlaps(&Folder::of(folder)))
+            if mirror.mode != SyncMode::Mirror {
+                return false;
+            }
+            let paths: Vec<&Path> = std::iter::once(mirror.destination.as_path()).chain(writer.written_folders()).collect();
+            match resolve(&paths).split_first() {
+                Some((Some(removes_in), written)) => written.iter().flatten().any(|folder| removes_in.overlaps(folder)),
+                _ => false,
             }
         };
         clash(self, other) || clash(other, self)
@@ -201,13 +211,6 @@ impl JobSetup {
             SyncMode::TwoWay => vec![&self.source, &self.destination],
             SyncMode::Mirror | SyncMode::Backup => vec![&self.destination],
         }
-    }
-
-    /// Whether this job and `other` touch a common folder (read or written).
-    pub fn shares_folders_with(&self, other: &JobSetup) -> bool {
-        let mine = [Folder::of(&self.source), Folder::of(&self.destination)];
-        let theirs = [Folder::of(&other.source), Folder::of(&other.destination)];
-        mine.iter().any(|a| theirs.iter().any(|b| a.overlaps(b)))
     }
 
     /// Whether a change from `before` to `self` changes what a sync does, so the next sync

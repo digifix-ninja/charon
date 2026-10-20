@@ -12,7 +12,9 @@
 //! Every second, for each job, in this order:
 //! 1. **Drive connected:** both folders just became reachable → sync, or look. A folder
 //!    that is there but on another drive than at the last sync (the folder an unplugged
-//!    drive leaves behind) doesn't count as reachable.
+//!    drive leaves behind) doesn't count as reachable, nor does one that doesn't answer
+//!    within a few seconds (a network share whose server is away): the folders are asked
+//!    about on threads of their own, so such a share holds up no other job.
 //! 2. **Changes settled:** the folders changed and have been quiet for a moment → sync
 //!    (on-change jobs that run by themselves) or look (every other job).
 //! 3. **Schedule:** an interval or daily job is due → sync, or look. Either way the next
@@ -41,8 +43,9 @@ mod watcher;
 pub use schedule::Schedule;
 pub use watcher::{FolderWatcher, Route};
 
-use crate::engine::{Engine, Moment};
+use crate::engine::{Engine, Moment, Whereabouts};
 use crate::model::{Job, JobId, Trigger};
+use crate::plan::Side;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -139,15 +142,18 @@ impl Autopilot {
         self.engine.can_save();
         let settings = self.engine.settings();
         let jobs = self.engine.job_list();
-        self.follow_folders(&jobs);
+        // Every folder is asked about at once, on threads of their own: a share that doesn't
+        // answer in time counts as away for this tick, and holds up no other job.
+        let whereabouts = self.engine.whereabouts_of(&jobs);
+        self.follow_folders(&jobs, &whereabouts);
         self.collect_changes();
         let now = Utc::now();
 
-        for job in &jobs {
+        for (job, found) in jobs.iter().zip(&whereabouts) {
             let id = &job.id;
             // A folder on another drive than at the last sync (a leftover mount folder) isn't
             // the job's folder: nothing is looked at or synced there by itself.
-            let reachable = job.setup.source.is_dir() && job.setup.destination.is_dir() && Engine::drive_moved(job).is_none();
+            let reachable = found.reachable(job);
             let was_reachable = self.reachable.insert(id.clone(), reachable);
             if was_reachable.is_some() && was_reachable != Some(reachable) {
                 // A drive went away or came (maybe another one under the same name): a list
@@ -262,25 +268,30 @@ impl Autopilot {
         self.engine.start_wanted(id);
     }
 
-    /// Watches the folders of every job whose folders are reachable. Each folder is known
-    /// by its path as the job names it and as it really is (a link resolved), since some
-    /// systems report changes under the real path.
-    fn follow_folders(&mut self, jobs: &[Job]) {
+    /// Watches the folders of every job that are there (as `whereabouts` found them). Each
+    /// folder is known by its path as the job names it and as it really is (a link
+    /// resolved), since some systems report changes under the real path.
+    fn follow_folders(&mut self, jobs: &[Job], whereabouts: &[Whereabouts]) {
         let Some(watcher) = self.watcher.as_mut() else { return };
         let mut routes: Vec<Route> = Vec::new();
         let mut real = HashMap::new();
-        for job in jobs {
-            for root in [&job.setup.source, &job.setup.destination] {
-                if !root.is_dir() {
+        for (job, found) in jobs.iter().zip(whereabouts) {
+            for side in [Side::Source, Side::Destination] {
+                if !found.side(side).is_there() {
                     continue;
                 }
+                let root = job.setup.root(side).to_path_buf();
                 // Resolved again only for a folder that just came (back), not every second.
-                let resolved = match self.real_roots.remove(root) {
+                // One that doesn't answer in time is watched from a later tick on.
+                let resolved = match self.real_roots.remove(&root) {
                     Some(resolved) => resolved,
-                    None => std::fs::canonicalize(root).ok(),
+                    None => match self.engine.ask_about(&root, |root| std::fs::canonicalize(root).ok()) {
+                        Some(resolved) => resolved,
+                        None => continue,
+                    },
                 };
                 real.insert(root.clone(), resolved.clone());
-                routes.push(Route::new(root, resolved, &job.id));
+                routes.push(Route::new(&root, resolved, &job.id));
             }
         }
         self.real_roots = real;
@@ -389,6 +400,51 @@ mod tests {
         pilot.tick();
         until("the sync", || !engine.is_running(&id));
         assert!(b.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn a_share_that_doesnt_answer_counts_as_away_and_holds_up_no_other_job() {
+        let tmp = tempfile::tempdir().unwrap();
+        let [home, usb, share, copy] = ["home", "usb", "share", "copy"].map(|name| tmp.path().join(name));
+        for folder in [&home, &usb, &share, &copy] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_| {})).unwrap();
+        let job = |name: &str, source: &Path, destination: &Path| JobSetup {
+            name: name.into(),
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::DriveConnected,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        };
+        let local = engine.add_job(job("Home", &home, &usb)).unwrap().job.id;
+        let shared = engine.add_job(job("Share", &share, &copy)).unwrap().job.id;
+        let (mut pilot, _changes) = pilot(&engine);
+        pilot.tick();
+        assert_eq!((pilot.reachable[&local], pilot.reachable[&shared]), (true, true));
+        until("the first looks", || [&local, &shared].iter().all(|id| !engine.job(id).unwrap().looking));
+
+        // The share stops answering: it counts as away, at once, and the other job carries on.
+        let answer = engine.silence(&share);
+        fs::write(home.join("letter.txt"), "letter").unwrap();
+        let settled = Instant::now().checked_sub(CHECK_SETTLE).expect("the computer has run for a few seconds");
+        pilot.changed.insert(local.clone(), settled);
+        let started = Instant::now();
+        pilot.tick();
+        assert!(started.elapsed() < crate::engine::reach::LIMIT, "the tick waited {:?}", started.elapsed());
+        assert_eq!((pilot.reachable[&local], pilot.reachable[&shared]), (true, false));
+        assert_eq!(engine.job(&shared).unwrap().status, crate::model::JobStatus::Offline);
+        until("the look at the other job", || engine.job(&local).unwrap().waiting.is_some_and(|waiting| waiting.items == 1));
+
+        // Once it answers again, it's back.
+        answer.send(()).unwrap();
+        until("the share's answer", || !engine.is_silent(&share));
+        pilot.tick();
+        assert!(pilot.reachable[&shared]);
     }
 
     #[test]

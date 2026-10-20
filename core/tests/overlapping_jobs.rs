@@ -344,6 +344,7 @@ fn a_link_made_after_two_jobs_were_saved_cannot_let_them_undo_each_other_unnotic
     confirm(&engine, &docs);
     write(&tmp.path().join("work/plan.txt"), "plan");
     let work = add(&engine, job_setup("Work", &tmp.path().join("work"), &nas_again.join("Docs/Work"), SyncMode::Mirror));
+    eventually("the first look", || !view(&engine, &work).looking);
     // Then NAS-1 turns out to be the share under another name, where Work's folder is too.
     fs::remove_dir_all(&nas_again).unwrap();
     std::os::unix::fs::symlink(&nas, &nas_again).unwrap();
@@ -612,9 +613,11 @@ fn another_charons_sync_in_a_folder_inside_makes_the_job_wait() {
     let engine = plain_engine(&tmp.path().join("data"));
     let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
     write(&src.join("Work/plan.txt"), "plan");
-    // Another Charon syncs src/Work (reached on its computer under another name).
-    another_charons_note(&src.join("Work"), Some("studio-mac"));
     let id = add(&engine, job_setup("Everything", &src, &dst, SyncMode::Backup));
+    eventually("the first look", || !view(&engine, &id).looking);
+    // Another Charon syncs src/Work (reached on its computer under another name). It began
+    // after the first look, so only the list's look meets it.
+    another_charons_note(&src.join("Work"), Some("studio-mac"));
     let review = engine.prepare_review(&id).unwrap();
     engine.approve(&id, &review.review_id, true).unwrap();
     assert!(view(&engine, &id).confirmed);
