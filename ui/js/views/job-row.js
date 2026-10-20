@@ -18,8 +18,9 @@ const PLACE_KINDS = {
 };
 
 export class JobRow {
-  /** The whole row. */
-  static render(job, { open, tab, log, index, scan, trashDays }) {
+  /** The whole row. `pausedAll` is "Pause everything", which pauses the job without changing its own pause. */
+  static render(job, { open, tab, log, index, scan, trashDays, pausedAll = false }) {
+    const paused = job.paused || pausedAll;
     return html`
       <article class="job ${open ? "open" : ""}" data-id="${job.id}" data-status="${job.status}" style="--i: ${index}">
         <div class="edge"></div>
@@ -39,14 +40,14 @@ export class JobRow {
               <span class="arrow">${Format.arrow(job.mode)}</span>
               ${raw(JobRow.shore(job.destination, job.destinationVolume, job.destinationOnline))}
             </div>
-            ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job))}
+            ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job, paused))}
             ${raw(JobRow.flags(job))}
             ${raw(JobRow.waitsFor(job))}
             ${raw(job.stale ? html`<div class="stale"><span class="ico">${raw(Icons.warn)}</span>${job.stale}</div>` : "")}
           </div>
           ${raw(JobRow.actions(job))}
         </div>
-        <div class="detail"><div class="inner">${raw(open ? JobRow.detail(job, tab, log, trashDays) : "")}</div></div>
+        <div class="detail"><div class="inner">${raw(open ? JobRow.detail(job, tab, log, trashDays, paused) : "")}</div></div>
       </article>`;
   }
 
@@ -85,8 +86,8 @@ export class JobRow {
       </div>`;
   }
 
-  /** The one-line summary under the shores. */
-  static info(job) {
+  /** The one-line summary under the shores. A paused job, paused by itself or with everything, has no schedule to show. */
+  static info(job, paused = job.paused) {
     const parts = [];
     const synced = job.lastSynced ? `Synced ${Format.ago(job.lastSynced)}` : "Never synced";
     switch (job.status) {
@@ -103,9 +104,12 @@ export class JobRow {
       case "pending":
         parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`, synced);
         break;
-      case "conflict":
-        parts.push(html`<span class="warn">${Format.plural(job.conflicts.length, "conflict")} to settle</span>`, synced);
+      case "conflict": {
+        // Conflicts show first, but a failed last run still says what went wrong.
+        const problem = JobRow.problem(job);
+        parts.push(html`<span class="warn">${Format.plural(job.conflicts.length, "conflict")} to settle</span>`, problem ? html`<span class="bad">${problem}</span>` : synced);
         break;
+      }
       case "error":
       case "offline":
         parts.push(html`<span class="warn">${JobRow.problem(job) ?? "Something went wrong"}</span>`);
@@ -122,7 +126,7 @@ export class JobRow {
           parts.push(`last run carried ${Format.plural(job.lastRun.copied, "file")}${job.lastRun.deleted ? `, removed ${job.lastRun.deleted}` : ""}`);
         }
     }
-    if (!job.paused && job.status !== "offline") parts.push(Dom.escape(Format.schedule(job)));
+    if (!paused && job.status !== "offline") parts.push(Dom.escape(Format.schedule(job)));
     return `<div class="info">${parts.join('<span class="sep">·</span>')}</div>`;
   }
 
@@ -142,10 +146,10 @@ export class JobRow {
       flags.push(html`<button class="flag review" data-action="review" title="Look at the list of changes">
         <span class="ico">${raw(Icons.review)}</span><span>${Format.waiting(job.waiting)}</span></button>`);
     }
-    if (job.unreadable?.length) {
-      const n = job.unreadable.length;
+    const unread = job.unreadableCount || job.unreadable?.length || 0;
+    if (unread) {
       flags.push(html`<button class="flag unreadable" data-action="unreadable" title="Show the places">
-        <span class="ico">${raw(Icons.warn)}</span><span>${n === 1 ? "1 place couldn't be read" : `${Format.count(n)} places couldn't be read`}</span></button>`);
+        <span class="ico">${raw(Icons.warn)}</span><span>${unread === 1 ? "1 place couldn't be read" : `${Format.count(unread)} places couldn't be read`}</span></button>`);
     }
     const missing = job.notSyncedCount || job.notSynced?.length || 0;
     if (missing) {
@@ -181,16 +185,17 @@ export class JobRow {
 
   // ---------------------------------------------------------------- detail
 
-  static detail(job, tab, log, trashDays) {
+  static detail(job, tab, log, trashDays, paused = job.paused) {
     const tabs = [["activity", "Activity"], ["details", "Details"]];
     const missing = job.notSyncedCount || job.notSynced?.length || 0;
+    const unread = job.unreadableCount || job.unreadable?.length || 0;
     if (job.notSynced?.length) tabs.unshift(["not-synced", "Not synced", missing]);
-    if (job.unreadable?.length) tabs.unshift(["unreadable", "Couldn't read", job.unreadable.length]);
+    if (job.unreadable?.length) tabs.unshift(["unreadable", "Couldn't read", unread]);
     if (job.conflicts.length) tabs.unshift(["conflicts", "Conflicts", job.conflicts.length]);
     const body = tab === "conflicts" && job.conflicts.length ? JobRow.conflicts(job)
-      : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job)
+      : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job, unread)
       : tab === "not-synced" && job.notSynced?.length ? JobRow.notSynced(job, missing)
-      : tab === "details" ? JobRow.facts(job, trashDays)
+      : tab === "details" ? JobRow.facts(job, trashDays, paused)
       : JobRow.log(log);
     return html`<div class="panel">
         <div class="tabs">${tabs.map(([key, label, badge]) => raw(html`<button data-action="tab" data-tab="${key}" class="${tab === key ? "on" : ""}">${label}${raw(badge ? html`<span class="badge ${key}">${badge}</span>` : "")}</button>`))}</div>
@@ -204,7 +209,7 @@ export class JobRow {
     return `<div class="log">${lines.map(l => html`<div class="line ${l.level}"><span class="time">${Format.stamp(l.time)}</span><span class="text">${l.text}</span></div>`).join("")}</div>`;
   }
 
-  static facts(job, trashDays) {
+  static facts(job, trashDays, paused = job.paused) {
     const fact = (k, v, wide = false) => html`<div class="fact ${wide ? "wide" : ""}"><div class="k">${k}</div><div class="v">${raw(v)}</div></div>`;
     const esc = Dom.escape;
     const folder = (path, volume) => `<code>${esc(path)}</code>${volume ? ` <span class="faint">on ${esc(Format.volume(volume))}</span>` : ""}`;
@@ -221,7 +226,7 @@ export class JobRow {
       ${fact("Destination", folder(job.destination, job.destinationVolume), true)}
       ${fact("Excluded", job.excludes.length ? job.excludes.map(e => `<code>${esc(e)}</code>`).join(", ") : "Nothing", true)}
       ${fact("Full automation", job.fullAutomation ? `<span class="bad">On</span>${job.needsReview ? esc(", but the next sync waits for your OK") : ""}` : "Off: every sync waits for your OK")}
-      ${fact("Next", esc(job.nextRun ? `${job.runsByItself ? "Sync" : "Look"} ${Format.upcoming(job.nextRun)}` : job.paused ? "Paused" : "When triggered"))}
+      ${fact("Next", esc(job.nextRun ? `${job.runsByItself ? "Sync" : "Look"} ${Format.upcoming(job.nextRun)}` : paused ? "Paused" : "When triggered"))}
       ${fact("Last run", esc(job.lastRun ? `${Format.ago(job.lastRun.finishedAt)}: ${Format.run(job.lastRun)}` : "Never"), true)}
     </div>`;
   }
@@ -253,7 +258,8 @@ export class JobRow {
   }
 
   /** Places the last look couldn't read. Nothing in them is synced until they can be. */
-  static unreadable(job) {
+  static unreadable(job, total) {
+    const more = total - job.unreadable.length;
     return `<div class="place-list">
       <p class="tab-hint">Nothing in these places is synced until Charon can read them. This isn't an error: everything else crosses as usual.</p>
       ${job.unreadable.map((place, i) => html`
@@ -267,7 +273,8 @@ export class JobRow {
           ${raw(place.privacy ? '<button class="btn" data-action="privacy">Open Privacy settings</button>' : "")}
           <button class="btn" data-action="leave-out" data-list="unreadable" data-index="${i}">Leave this folder out</button>
         </div>
-      </div>`).join("")}</div>`;
+      </div>`).join("")}
+      ${more > 0 ? html`<p class="tab-hint">And ${Format.count(more)} more. The list of changes shows them all, under Notes.</p>` : ""}</div>`;
   }
 
   /**

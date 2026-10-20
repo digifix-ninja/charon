@@ -240,6 +240,9 @@ pub(crate) struct Survey {
     pub holds: Vec<String>,
     /// Confirming needs an explicit tick.
     pub needs_tick: bool,
+    /// A folder isn't as the last sync left it: it's on another drive, or (Mirror and
+    /// Backup) it lacks the marker Charon left there. Only a confirmed sync takes it as it is.
+    pub unfamiliar: bool,
     pub housekeeping: Housekeeping,
     pub made_at: DateTime<Utc>,
 }
@@ -337,6 +340,7 @@ impl Engine {
         let mut warnings = Vec::new();
         let mut holds = Vec::new();
         let mut needs_tick = false;
+        let mut unfamiliar = false;
         // Why the job waits, where this look can't tell by itself.
         match job.held.as_deref() {
             Some(held) if purpose == Purpose::Review && held == runs::STOPPED => warnings.push(Warning::info(held)),
@@ -446,6 +450,7 @@ impl Engine {
                     holds.push(text.clone());
                     warnings.push(Warning::danger(text));
                     needs_tick = true;
+                    unfamiliar = true;
                 }
             }
         }
@@ -456,6 +461,7 @@ impl Engine {
                 holds.push(text.clone());
                 warnings.push(Warning::danger(text));
                 needs_tick = true;
+                unfamiliar = true;
             }
         }
 
@@ -588,6 +594,7 @@ impl Engine {
             warnings,
             holds,
             needs_tick,
+            unfamiliar,
             housekeeping,
             made_at: Utc::now(),
         })

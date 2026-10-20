@@ -1,6 +1,7 @@
 // The first start of Charon 0.3.0: jobs that used to sync by themselves now prepare the list
 // of changes and wait for an OK. This says so, job by job, and offers full automation back
-// (behind its two warnings) to anyone who wants it.
+// (behind its two warnings) to anyone who wants it. A job with full automation on still waits
+// for one confirmed list before it syncs by itself; the sheet says so and offers that list.
 
 import { Api } from "../api.js";
 import { Dom } from "../dom.js";
@@ -11,11 +12,12 @@ import { Sheet } from "./sheet.js";
 const { html, raw } = Dom;
 
 export class UpgradeSheet extends Sheet {
-  constructor(store, toast, { automate }) {
+  constructor(store, toast, { automate, review }) {
     super(Dom.$("#upgrade"));
     this.store = store;
     this.toast = toast;
     this.automate = automate;
+    this.review = review;
     this.notice = null;
     this.kept = new Set();   // jobs the person chose to keep asking
     this.element.addEventListener("click", event => this.onClick(event));
@@ -61,8 +63,11 @@ export class UpgradeSheet extends Sheet {
     let choice;
     if (!job) {
       choice = '<span class="upgrade-state">This job has been deleted.</span>';
-    } else if (job.fullAutomation) {
+    } else if (job.runsByItself) {
       choice = '<span class="upgrade-state auto">Full automation is on: it syncs by itself again.</span>';
+    } else if (job.fullAutomation) {
+      choice = html`<span class="upgrade-state auto">Full automation is on. Confirm its next list once, and it syncs by itself from then on.</span>
+        <button class="btn primary small" data-do="review" data-id="${item.id}">Review and sync</button>`;
     } else if (this.kept.has(item.id)) {
       choice = html`<span class="upgrade-state calm">It keeps asking you.</span>
         <button class="btn ghost small" data-do="automate" data-id="${item.id}">Turn on full automation…</button>`;
@@ -86,6 +91,7 @@ export class UpgradeSheet extends Sheet {
         this.kept.add(id);
         return this.render();
       case "automate": return this.automate(id);
+      case "review": return this.review(id);
       case "done":
         target.disabled = true;
         try {

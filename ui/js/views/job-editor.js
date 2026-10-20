@@ -43,7 +43,12 @@ const AUTOMATION_RISKS = {
   backup: "In Backup mode a damaged file in the source replaces the good copy in the destination.",
 };
 
-const RESET_WARNING = "Charon will forget what was synced. This time it compares both folders afresh: nothing is removed, so files deleted on one side since the last sync come back, and files that differ become conflicts.";
+/** What a two-way sync without a memory of the last one does with files that differ, per rule. */
+const DIFFERING_FILES = {
+  ask: "files that differ are left for you to choose",
+  "keep-both": "files that differ are kept twice",
+  "newest-wins": "where files differ, the version saved last replaces the other, which goes to .charon-trash (both are kept when the times can't tell)",
+};
 
 export class JobEditor extends Sheet {
   constructor(store, toast, { saved }) {
@@ -236,7 +241,7 @@ export class JobEditor extends Sheet {
         <span>Full automation is on: this job changes files without asking you first.</span></div>`);
     }
     if (this.forgetsWhatWasSynced()) {
-      notes.push(html`<div class="notice caution"><span class="ico">${raw(Icons.warn)}</span><span>${RESET_WARNING}</span></div>`);
+      notes.push(html`<div class="notice caution"><span class="ico">${raw(Icons.warn)}</span><span>${this.resetWarning()}</span></div>`);
     }
     return `<div class="sheet-notes">${notes.join("")}</div>`;
   }
@@ -266,6 +271,28 @@ export class JobEditor extends Sheet {
     const d = this.draft;
     if (!o || o.mode !== "two-way") return false;
     return o.source !== d.source || o.destination !== d.destination || o.mode !== d.mode;
+  }
+
+  /**
+   * What the next sync does once Charon forgot what was synced, by the mode the draft has:
+   * two-way compares both folders afresh and removes nothing, Mirror makes the destination a
+   * copy of the source, and Backup puts the source's version over files that differ.
+   */
+  resetWarning() {
+    const d = this.draft;
+    const forget = "Charon will forget what was synced.";
+    switch (d.mode) {
+      case "mirror": {
+        const gone = d.safeDelete ? "" : " Safe deletes are off, so what it removes or replaces is gone for good.";
+        return `${forget} As a mirror, the next sync makes the destination a copy of the source: it removes everything that is only in the destination, and the source's version replaces files that differ.${gone}`;
+      }
+      case "backup": {
+        const gone = d.safeDelete ? "" : " Safe deletes are off, so what it replaces is gone for good.";
+        return `${forget} As a backup, the next sync removes nothing, but where a file differs, the source's version replaces the destination's.${gone}`;
+      }
+      default:
+        return `${forget} This time it compares both folders afresh and removes nothing, so files deleted on one side since the last sync come back, and ${DIFFERING_FILES[d.conflict]}.`;
+    }
   }
 
   /** True when the saved change alters what a sync does, so the next sync waits for an OK. */

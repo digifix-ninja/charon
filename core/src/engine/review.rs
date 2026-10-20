@@ -54,6 +54,8 @@ pub(crate) struct StoredReview {
     pub warnings: Vec<Warning>,
     pub blocked: Option<String>,
     pub needs_tick: bool,
+    /// Why a list without steps is still worth confirming (see `Review::confirm_anyway`).
+    pub confirm_anyway: Option<String>,
     /// The conflict a resolution settles, by its key.
     pub resolving: Option<String>,
 }
@@ -313,7 +315,8 @@ impl Engine {
                 return Err(Error::Invalid(blocked.clone()));
             }
             if current.needs_tick && !acknowledged {
-                return Err(Error::Invalid("Tick “I've looked at the removals and replacements” first.".into()));
+                let tick = if current.steps.is_empty() { "I've read the warnings above" } else { "I've looked at the removals and replacements" };
+                return Err(Error::Invalid(format!("Tick “{tick}” first.")));
             }
             Ok(())
         })?;
@@ -480,6 +483,10 @@ impl Engine {
                 can_leave_out: note.kind == NoteKind::Unreadable && note.side.is_some(),
             })
             .collect();
+        let confirm_anyway = match kind {
+            ReviewKind::Sync if steps.is_empty() => Self::confirm_anyway(job, &survey, self.must_ask(&job.id)),
+            _ => None,
+        };
         let stored = Arc::new(StoredReview {
             id: uuid::Uuid::new_v4().simple().to_string(),
             kind,
@@ -491,6 +498,7 @@ impl Engine {
             warnings: survey.warnings.clone(),
             blocked: survey.refusal.clone(),
             needs_tick: survey.needs_tick,
+            confirm_anyway,
             resolving,
             steps,
             notes,
@@ -549,6 +557,7 @@ impl Engine {
             warnings: stored.warnings.clone(),
             blocked: stored.blocked.clone(),
             needs_tick: stored.needs_tick,
+            confirm_anyway: stored.confirm_anyway.clone(),
             clusters: Self::clusters_of(survey),
             housekeeping,
             total_steps: stored.steps.len(),
@@ -556,6 +565,29 @@ impl Engine {
             steps: stored.steps.iter().take(FIRST_STEPS).cloned().collect(),
             notes: stored.notes.iter().take(FIRST_NOTES).cloned().collect(),
         }
+    }
+
+    /// Why a list without steps is still worth confirming, in a sentence for the list, or
+    /// `None` when it would only say that both folders match. Confirming it changes no file,
+    /// but it is a sync like any other: it ends a hold, lets full automation sync by itself
+    /// again, and records both folders as they are now (their drives, Charon's markers and,
+    /// in two-way, the memory that lets removals cross).
+    fn confirm_anyway(job: &crate::model::Job, survey: &Survey, must_ask: bool) -> Option<String> {
+        let held = job.held.is_some();
+        let why = if job.setup.full_automation && (held || job.needs_review || must_ask) {
+            "Confirm once so Charon may sync this job by itself from now on."
+        } else if held {
+            "Confirm it, and the job stops waiting for your OK."
+        } else if survey.unfamiliar {
+            "If these are the right folders, confirm it: Charon then takes them as they are now."
+        } else if survey.setup.mode.is_two_way() && !survey.trusted {
+            "Confirm it, and Charon remembers both folders as they are now, so that later lists can carry what you remove on one side to the other."
+        } else if job.last_synced.is_none() {
+            "Confirm it as the job's first sync, so Charon knows both folders from now on."
+        } else {
+            return None;
+        };
+        Some(why.into())
     }
 
     fn tally_of(survey: &Survey) -> Tally {
@@ -840,6 +872,7 @@ impl Look {
                 .collect()
         };
         let mut unreadable = places(&[NoteKind::Unreadable]);
+        let unreadable_count = unreadable.len() as u64;
         unreadable.truncate(crate::model::PLACES_SHOWN);
         let mut not_synced = places(&[NoteKind::LeftOut, NoteKind::NameClash, NoteKind::Blocked]);
         let not_synced_count = not_synced.len() as u64;
@@ -857,6 +890,7 @@ impl Look {
             replacements,
             conflicts,
             unreadable,
+            unreadable_count,
             not_synced,
             not_synced_count,
             volumes,

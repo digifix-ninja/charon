@@ -2,7 +2,7 @@
 //! Small routine syncs stay silent.
 
 use crate::state::AppState;
-use charon_core::{human_bytes, plural, Finished, JobId, WaitingJob};
+use charon_core::{human_bytes, plural, Finished, JobId, RunSummary, WaitingJob};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
@@ -128,12 +128,30 @@ impl Notifier {
             ));
         }
         if run.bytes >= BIG_SYNC_BYTES || run.copied >= BIG_SYNC_FILES {
-            return Some((
-                format!("{name} is in sync"),
-                format!("Copied {} ({}).", plural(run.copied, "file"), human_bytes(run.bytes)),
-            ));
+            return Some(Self::big_sync(name, run));
         }
         None
+    }
+
+    /// The title and text for a big sync: "in sync" only when it left nothing for a later
+    /// sync. A drive's owner waits for this one before ejecting it.
+    fn big_sync(name: &str, run: &RunSummary) -> (String, String) {
+        let mut text = format!("Copied {} ({}).", plural(run.copied, "file"), human_bytes(run.bytes));
+        if run.skipped == 0 && run.left_for_later == 0 {
+            return (format!("{name} is in sync"), text);
+        }
+        if run.skipped > 0 {
+            let (they, wait) = if run.skipped == 1 { ("it was left as it was", "waits") } else { ("they were left as they were", "wait") };
+            text.push_str(&format!(" {} changed while Charon synced, so {they} and {wait} for the next sync.", plural(run.skipped, "item")));
+        }
+        if run.left_for_later > 0 {
+            let (were, items) = if run.left_for_later == 1 { ("was", "the item") } else { ("were", "the items") };
+            text.push_str(&format!(
+                " {} {were} left for a later sync: {items} went missing only a little while ago on a drive that may show changes late.",
+                plural(run.left_for_later, "removal")
+            ));
+        }
+        (format!("{name} isn't fully in sync yet"), text)
     }
 
     fn waiting_message(jobs: &[WaitingJob]) -> Option<(String, String)> {
@@ -230,6 +248,35 @@ mod tests {
         assert_eq!(title, "Documents: 2 files couldn't be read");
         // Listed before this run: nothing new to tell.
         assert!(Notifier::finished(&documents(serde_json::json!({ "unreadable": 1 }))).is_none());
+    }
+
+    #[test]
+    fn a_big_sync_is_only_in_sync_when_it_left_nothing_for_a_later_sync() {
+        let big = |fields: serde_json::Value| {
+            let mut run = serde_json::json!({ "copied": 1500, "bytes": 12_000_000_000u64 });
+            run.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+            Notifier::finished(&documents(run)).unwrap()
+        };
+        let (title, body) = big(serde_json::json!({}));
+        assert_eq!((title.as_str(), body.as_str()), ("Documents is in sync", "Copied 1,500 files (12.0 GB)."));
+        // Files the person's apps changed while it ran are not on the drive yet.
+        let (title, body) = big(serde_json::json!({ "skipped": 40 }));
+        assert_eq!(title, "Documents isn't fully in sync yet");
+        assert_eq!(body, "Copied 1,500 files (12.0 GB). 40 items changed while Charon synced, so they were left as they were and wait for the next sync.");
+        let (_, body) = big(serde_json::json!({ "skipped": 1 }));
+        assert_eq!(body, "Copied 1,500 files (12.0 GB). 1 item changed while Charon synced, so it was left as it was and waits for the next sync.");
+        let (title, body) = big(serde_json::json!({ "leftForLater": 3 }));
+        assert_eq!(title, "Documents isn't fully in sync yet");
+        assert_eq!(
+            body,
+            "Copied 1,500 files (12.0 GB). 3 removals were left for a later sync: the items went missing only a little while ago on a drive that may show changes late."
+        );
+        let (_, body) = big(serde_json::json!({ "skipped": 1, "leftForLater": 1 }));
+        assert_eq!(
+            body,
+            "Copied 1,500 files (12.0 GB). 1 item changed while Charon synced, so it was left as it was and waits for the next sync. \
+             1 removal was left for a later sync: the item went missing only a little while ago on a drive that may show changes late."
+        );
     }
 
     fn waiting(name: &str, items: u64, removals: u64, conflicts: u64) -> WaitingJob {

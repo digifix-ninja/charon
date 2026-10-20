@@ -249,18 +249,17 @@ export class ReviewDialog extends Overlay {
   }
 
   /**
-   * Nothing to do. A job with full automation still asks once (its first sync, or after it
-   * was held or stopped): confirming the empty list lets it sync by itself again.
+   * Nothing to do. Rust says when the empty list is still worth confirming, and why (the job
+   * waits for that OK, or the folders are taken as they are now); then it can be confirmed.
    */
   settledHtml(review) {
-    const line = this.confirmsNothing(review) ? '<p class="r-settled-why">Confirm once so Charon may sync this job by itself from now on.</p>' : "";
-    return `<div class="r-settled">Both shores already match.${line}</div>`;
+    const why = review.confirmAnyway ? html`<p class="r-settled-why">${review.confirmAnyway}</p>` : "";
+    return `<div class="r-settled">Both shores already match.${why}</div>`;
   }
 
-  /** An empty list that is still worth confirming: the job waits for an OK before it runs by itself. */
-  confirmsNothing(review) {
-    const job = this.store.jobs.get(review.jobId);
-    return review.kind === "sync" && review.totalSteps === 0 && review.fullAutomation && Boolean(job?.needsReview);
+  /** Whether a list can be confirmed at all: it has steps, or Rust says why to confirm it anyway. */
+  canConfirm(review) {
+    return review.totalSteps > 0 || Boolean(review.confirmAnyway);
   }
 
   /** Both folders, with their drives and file counts, and what the job does with removed files. */
@@ -418,14 +417,18 @@ export class ReviewDialog extends Overlay {
       </div>`;
   }
 
-  /** "I've looked at the removals and replacements", when the review asks for it. */
+  /**
+   * "I've looked at the removals and replacements" when the review asks for it, or for an
+   * empty list that can be confirmed, "I've read the warnings above".
+   */
   tickHtml() {
     const s = this.state;
     const review = s.review;
     if (s.phase !== "ready" && s.phase !== "approving") return "";
-    if (!review.needsTick || review.blocked || review.totalSteps === 0) return "";
+    if (!review.needsTick || review.blocked || !this.canConfirm(review)) return "";
+    const what = review.totalSteps > 0 ? "I've looked at the removals and replacements" : "I've read the warnings above";
     return html`<label class="r-tick"><input type="checkbox" data-field="tick" ${s.ticked ? "checked" : ""}>
-        <span>I've looked at the removals and replacements</span></label>`;
+        <span>${what}</span></label>`;
   }
 
   renderAlert() {
@@ -452,7 +455,7 @@ export class ReviewDialog extends Overlay {
       const destructive = Format.isDestructive(review.tally);
       const kind = destructive ? "danger-solid" : "primary";
       let confirm = "";
-      if (review.totalSteps > 0 || this.confirmsNothing(review)) {
+      if (this.canConfirm(review)) {
         if (approving) {
           // Rust is starting this list: nothing here can swap it for another until it answers.
           confirm = html`<button class="btn ${kind} confirm" data-do="confirm" disabled>Starting…</button>`;

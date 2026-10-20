@@ -31,9 +31,16 @@ const NOT_SYNCED = ["left-out", "name-clash", "blocked"];
 const FILTER_KINDS = {
   removals: ["remove"],
   replacements: ["replace", "settle"],
-  conflicts: ["conflict", "keep-both"],
+  conflicts: ["conflict", "keep-both", "settle"],
   new: ["new", "folder"],
 };
+
+/**
+ * Whether a job needs the person, as Rust's JobView::needs_you says: an error or a conflict,
+ * whatever its row shows first, but not the reason a job is out of reach or syncing.
+ */
+const needsYou = j => j.status === "error" || j.status === "conflict" || j.conflicts.length > 0
+  || (!["offline", "syncing"].includes(j.status) && Boolean(j.problem || j.lastRun?.error));
 
 /** The order steps are listed in: what can hurt first. */
 const KIND_ORDER = ["conflict", "remove", "replace", "settle", "keep-both", "new", "folder"];
@@ -93,6 +100,7 @@ function job(id, fields) {
     progress: null,
     conflicts: [],
     unreadable: [],
+    unreadableCount: 0,
     notSynced: [],
     notSyncedCount: 0,
     problem: null,
@@ -299,6 +307,7 @@ export class DemoBackend {
     this.checked = new Set();   // ids of the jobs looked at since the demo started
     this.timers = new Map();    // id → a running sync's timer
     this.logs = new Map();      // id → log lines, newest first
+    this.nextRuns = new Map();  // id → when its schedule comes next (sent only while it isn't paused)
     this.reviewCount = 0;
     this.refuseOnce = false;
     this.noticeSeen = false;
@@ -347,6 +356,7 @@ export class DemoBackend {
     ];
     this.jobs = jobs;
     for (const j of jobs) {
+      if (j.nextRun) this.nextRuns.set(j.id, j.nextRun);
       this.worlds.set(j.id, WORLDS[j.id]());
       this.logs.set(j.id, this.startingLog(j));
       this.settle(j);
@@ -380,7 +390,7 @@ export class DemoBackend {
       syncing: count("syncing"),
       pending: count("pending"),
       waiting: this.jobs.filter(j => j.waiting).length,
-      attention: count("error", "conflict"),
+      attention: this.jobs.filter(needsYou).length,
       offline: count("offline"),
       looking: count("looking"),
       incomplete: this.jobs.filter(j => j.unreadable.length || j.notSyncedCount > 0).length,
@@ -425,10 +435,14 @@ export class DemoBackend {
     const places = checked && w.looked ? w.notes.filter(n => NOT_SYNCED.includes(n.kind) && n.side) : [];
     j.notSynced = places.slice(0, 100).map(({ kind, side, path, reason }) => ({ kind, side, path, reason, privacy: false }));
     j.notSyncedCount = places.length;
+    j.unreadableCount = j.unreadable.length;
     const failedRun = j.lastRun && !j.lastRun.cancelled && (j.lastRun.error || j.lastRun.failed > 0);
+    // "Pause everything" pauses each job without changing its own pause, as in Rust.
+    const paused = j.paused || this.settings.pausedAll;
+    j.nextRun = paused ? null : this.nextRuns.get(j.id) ?? null;
     j.status = this.timers.has(j.id) ? "syncing"
       : !this.online(j) ? "offline"
-      : j.paused ? "paused"
+      : paused ? "paused"
       : j.conflicts.length ? "conflict"
       : failedRun ? "error"
       : j.waiting ? "review"
@@ -584,6 +598,7 @@ export class DemoBackend {
       warnings: [...(warnings ?? w.warnings), ...info],
       blocked: kind === "sync" ? w.blocked ?? null : null,
       needsTick: kind === "sync" && sorted.some(s => s.danger),
+      confirmAnyway: kind === "sync" && !sorted.length ? this.confirmAnyway(j, w) : null,
       clusters,
       housekeeping: kind === "sync" ? w.housekeeping : [],
       totalSteps: sorted.length,
@@ -593,6 +608,16 @@ export class DemoBackend {
     };
     this.reviews.set(review.reviewId, { review, steps: sorted, notes, jobId: j.id, setup: setupKey(j), stale: false, settles });
     return review;
+  }
+
+  /** Why a list without steps is still worth confirming, as Rust says it (null: it only says both folders match). */
+  confirmAnyway(j, w) {
+    if (j.fullAutomation && (j.needsReview || w.held)) return "Confirm once so Charon may sync this job by itself from now on.";
+    if (w.held) return "Confirm it, and the job stops waiting for your OK.";
+    if (j.lastSynced) return null;
+    return j.mode === "two-way"
+      ? "Confirm it, and Charon remembers both folders as they are now, so that later lists can carry what you remove on one side to the other."
+      : "Confirm it as the job's first sync, so Charon knows both folders from now on.";
   }
 
   /** A review of settling one conflict, exactly as the person saw it. */
@@ -647,7 +672,9 @@ export class DemoBackend {
     if (refused) throw refused;
     if (entry.stale) throw "Something changed in the folders since this list was made. Look again.";
     if (review.blocked) throw review.blocked;
-    if (review.needsTick && !acknowledged) throw "Tick “I've looked at the removals and replacements” first.";
+    if (review.needsTick && !acknowledged) {
+      throw `Tick “${review.totalSteps ? "I've looked at the removals and replacements" : "I've read the warnings above"}” first.`;
+    }
     if (this.refuseOnce) {
       this.refuseOnce = false;
       throw "The destination drive was replaced by another one with the same name. Look again.";
@@ -878,6 +905,7 @@ export class DemoBackend {
       case "set_all_paused":
         this.settings = { ...this.settings, pausedAll: args.paused };
         this.emit("settings", this.settings);
+        for (const j of this.jobs) this.publish(j);
         this.emit("overview", this.overview());
         return null;
       case "set_settings":
@@ -1008,8 +1036,12 @@ function tallyOf(steps, agreed) {
         else st.removed++;
         break;
       case "settle":
+        // Counted among the replaced files of the side it replaces too, as Rust does.
         t.newestWins++;
-        if (st) st.bytesIn += s.bytes;
+        if (st) {
+          st.replaced++;
+          st.bytesIn += s.bytes;
+        }
         t.bytes += s.bytes;
         break;
       case "keep-both":

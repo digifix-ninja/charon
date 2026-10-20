@@ -125,6 +125,7 @@ impl Engine {
         };
         let conflicts = look.as_ref().map(|look| look.conflicts.clone()).unwrap_or_default();
         let unreadable = look.as_ref().map(|look| look.unreadable.clone()).unwrap_or_default();
+        let unreadable_count = look.as_ref().map_or(0, |look| look.unreadable_count);
         let not_synced = look.as_ref().map(|look| look.not_synced.clone()).unwrap_or_default();
         let not_synced_count = look.as_ref().map_or(0, |look| look.not_synced_count);
 
@@ -187,6 +188,7 @@ impl Engine {
             progress: if running { progress } else { None },
             conflicts,
             unreadable,
+            unreadable_count,
             not_synced,
             not_synced_count,
             problem,

@@ -1201,6 +1201,7 @@ impl Engine {
                 for place in unread {
                     if !look.unreadable.contains(&place) {
                         look.unreadable.push(place);
+                        look.unreadable_count += 1;
                     }
                 }
                 look.unreadable.truncate(PLACES_SHOWN);
@@ -1364,6 +1365,7 @@ impl Survey {
             warnings: Vec::new(),
             holds: Vec::new(),
             needs_tick: false,
+            unfamiliar: false,
             housekeeping: Default::default(),
             made_at: Utc::now(),
         }

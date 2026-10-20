@@ -107,6 +107,7 @@ export class JobList {
       log: this.store.logs.get(id),
       scan: this.store.scans.get(id),
       trashDays: this.store.settings?.trashDays ?? 30,
+      pausedAll: this.store.pausedAll(),
       index,
     });
   }

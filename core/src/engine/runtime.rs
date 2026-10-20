@@ -506,8 +506,9 @@ pub(crate) struct Look {
     pub removals: PerSide,
     pub replacements: PerSide,
     pub conflicts: Vec<ConflictItem>,
-    /// At most `PLACES_SHOWN` of each.
+    /// At most `PLACES_SHOWN` of each; the counts count them all.
     pub unreadable: Vec<Place>,
+    pub unreadable_count: u64,
     pub not_synced: Vec<Place>,
     pub not_synced_count: u64,
     pub volumes: Option<(VolumeLabel, VolumeLabel)>,

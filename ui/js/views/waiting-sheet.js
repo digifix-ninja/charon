@@ -64,8 +64,8 @@ export class WaitingSheet extends Sheet {
     try {
       const review = await Api.prepareReview(entry.id);
       if (entry.token !== token) return Api.discardReview(review.jobId, review.reviewId).catch(() => {});
-      // An empty list is let go, unless a job with full automation waits for one OK first.
-      if (review.totalSteps === 0 && !this.review.confirmsNothing(review)) {
+      // An empty list is let go, unless Rust says why it's worth confirming anyway.
+      if (!this.review.canConfirm(review)) {
         entry.state = "nothing";
         Api.discardReview(review.jobId, review.reviewId).catch(() => {});
       } else {
@@ -162,8 +162,9 @@ export class WaitingSheet extends Sheet {
         if (entry.state === "blocked") {
           return { text: `Blocked: ${review.blocked}`, tone: "danger", extra, action: { do: "review", label: "Review…" } };
         }
-        const changes = Format.changeList(review.tally)
-          || (review.totalSteps ? Format.plural(review.totalSteps, "step") : "nothing to copy. Confirm once so it may sync by itself");
+        const changes = review.totalSteps
+          ? Format.changeList(review.tally) || Format.plural(review.totalSteps, "step")
+          : `nothing to copy. ${review.confirmAnyway}`;
         return { text: `Ready: ${changes}`, tone: "ready", extra, action: { do: "review", label: "Review…", primary: true } };
       }
       case "nothing": return { text: "Nothing to do", tone: "calm" };

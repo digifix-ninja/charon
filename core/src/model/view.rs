@@ -406,8 +406,10 @@ pub struct JobView {
     pub pending: Option<Pending>,
     pub progress: Option<Progress>,
     pub conflicts: Vec<ConflictItem>,
-    /// Places the last look couldn't read (at most `PLACES_SHOWN`).
+    /// Places the last look couldn't read (at most `PLACES_SHOWN`; `unreadable_count`
+    /// counts them all).
     pub unreadable: Vec<Place>,
+    pub unreadable_count: u64,
     /// Items the last look had to leave out, name clashes and blocked items: they aren't
     /// synced (at most `PLACES_SHOWN`; `not_synced_count` counts them all).
     pub not_synced: Vec<Place>,
@@ -430,6 +432,18 @@ pub struct JobView {
     pub confirmed: bool,
 }
 
+impl JobView {
+    /// Whether the job needs the person: an error or a conflict, whatever its row shows
+    /// first. A paused job with a conflict, or whose last run failed, needs them too. A job
+    /// out of reach or syncing has nothing to fix yet (its problem only says why).
+    pub fn needs_you(&self) -> bool {
+        let failed = self.problem.is_some() || self.job.last_run.as_ref().is_some_and(|run| run.error.is_some());
+        matches!(self.status, JobStatus::Error | JobStatus::Conflict)
+            || !self.conflicts.is_empty()
+            || (failed && !matches!(self.status, JobStatus::Offline | JobStatus::Syncing))
+    }
+}
+
 /// One line per state for the tray icon and the header.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -439,6 +453,7 @@ pub struct Overview {
     pub pending: usize,
     /// Jobs with changes waiting for the person's OK.
     pub waiting: usize,
+    /// Jobs that need the person (see `JobView::needs_you`).
     pub attention: usize,
     pub offline: usize,
     /// Jobs Charon hasn't looked at since it started or since a folder came back.
@@ -460,7 +475,7 @@ impl Overview {
             syncing: count(&[JobStatus::Syncing]),
             pending: count(&[JobStatus::Pending]),
             waiting: views.iter().filter(|v| v.waiting.is_some()).count(),
-            attention: count(&[JobStatus::Error, JobStatus::Conflict]),
+            attention: views.iter().filter(|v| v.needs_you()).count(),
             offline: count(&[JobStatus::Offline]),
             looking: count(&[JobStatus::Looking]),
             incomplete: views.iter().filter(|v| !v.unreadable.is_empty() || v.not_synced_count > 0).count(),
@@ -499,6 +514,9 @@ impl Overview {
             format!("{} {} sync everything", plural(self.incomplete as u64, "job"), if self.incomplete == 1 { "doesn't" } else { "don't" })
         } else if self.looking > 0 {
             "Looking for changes…".into()
+        } else if self.offline > 0 {
+            // Whether the jobs out of reach are in sync isn't known.
+            format!("All reachable jobs in sync · {} offline", human_count(self.offline as u64))
         } else {
             "All in sync".into()
         }
@@ -581,6 +599,74 @@ mod tests {
         let mut stopped = failed(1, &["a.txt"]);
         stopped.error = Some("The destination folder went away during the sync.".into());
         assert_eq!(stopped.problem(), stopped.error);
+    }
+
+    /// A two-way job's row with `status`, and nothing else to say.
+    fn row(status: JobStatus) -> JobView {
+        let job = Job::new(crate::model::JobSetup {
+            name: "Notes".into(),
+            source: "/a".into(),
+            destination: "/b".into(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: crate::model::ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        });
+        JobView {
+            job,
+            rev: 1,
+            status,
+            runs_by_itself: false,
+            looking: false,
+            waiting: None,
+            pending: None,
+            progress: None,
+            conflicts: Vec::new(),
+            unreadable: Vec::new(),
+            unreadable_count: 0,
+            not_synced: Vec::new(),
+            not_synced_count: 0,
+            problem: None,
+            source_online: true,
+            destination_online: true,
+            source_volume: None,
+            destination_volume: None,
+            next_run: None,
+            stale: None,
+            waiting_for: None,
+            confirmed: false,
+        }
+    }
+
+    #[test]
+    fn the_tray_never_says_all_in_sync_while_a_job_is_offline_or_needs_the_person() {
+        let headline = |rows: &[JobView], paused_all: bool| Overview::of(rows, paused_all, None).headline();
+        let in_sync = row(JobStatus::InSync);
+        assert_eq!(headline(std::slice::from_ref(&in_sync), false), "All in sync");
+
+        // A job out of reach: whether it's in sync isn't known, and its reason is no problem to fix.
+        let offline = JobView {
+            destination_online: false,
+            problem: Some("The destination isn't reachable. Is the drive connected?".into()),
+            ..row(JobStatus::Offline)
+        };
+        let overview = Overview::of(&[in_sync.clone(), offline.clone()], false, None);
+        assert_eq!((overview.attention, overview.offline), (0, 1));
+        assert_eq!(overview.headline(), "All reachable jobs in sync · 1 offline");
+        assert_eq!(headline(&[offline.clone(), offline], false), "All reachable jobs in sync · 2 offline");
+
+        // Paused shows first, but a conflict or a failed run still needs the person.
+        let conflict = JobView { conflicts: vec![ConflictItem::new("a.txt", "a.txt", None, None)], ..row(JobStatus::Paused) };
+        assert_eq!(headline(&[in_sync.clone(), conflict.clone()], false), "1 job needs attention");
+        let mut failed = row(JobStatus::Paused);
+        failed.job.last_run = Some(RunSummary { failed: 1, failed_items: vec!["me.pst".into()], ..RunSummary::starting(Utc::now(), true) });
+        failed.problem = failed.job.last_run.as_ref().and_then(RunSummary::problem);
+        assert_eq!(headline(&[in_sync.clone(), failed.clone()], true), "1 job needs attention");
+        assert_eq!(headline(&[in_sync.clone(), conflict, failed], true), "2 jobs need attention");
+        // Paused with nothing wrong: everything is paused, nothing needs the person.
+        assert_eq!(headline(&[in_sync, row(JobStatus::Paused)], true), "Everything paused");
     }
 
     #[test]
