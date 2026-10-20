@@ -107,6 +107,9 @@ pub struct Refused {
     pub key: String,
     pub why: Refusal,
     pub item: Entry,
+    /// Where the drive refused it. For `Refusal::TakenName`, the path at which the drive
+    /// found another item: once nothing is there, the name is free again.
+    pub at: PathBuf,
 }
 
 /// A file the system wouldn't let a run read on the side it was to be copied from (no
@@ -383,6 +386,8 @@ pub struct Executor<'a> {
     footprints: RefCell<Vec<Footprint>>,
     destroyed: RefCell<(Vec<String>, Vec<String>)>,
     unkept: RefCell<Vec<(String, String)>>,
+    /// What each side's drive answered when asked whether it holds links (see `link`).
+    links: RefCell<HashMap<Side, Option<bool>>>,
 }
 
 impl<'a> Executor<'a> {
@@ -404,6 +409,7 @@ impl<'a> Executor<'a> {
             footprints: RefCell::default(),
             destroyed: RefCell::default(),
             unkept: RefCell::default(),
+            links: RefCell::default(),
         }
     }
 
@@ -529,7 +535,7 @@ impl<'a> Executor<'a> {
                 log::info!("{}: {} refused: {}", action.path(), path.display(), why.reason("drive"));
                 let place = self.locate(action, &path);
                 outcome.left_out.push((action.path().to_string(), self.refusal_reason(action.path(), place.as_ref(), why)));
-                if let Some(refused) = place.and_then(|(side, key)| self.refused_item(side, key, why)) {
+                if let Some(refused) = place.and_then(|(side, key)| self.refused_item(side, key, why, path)) {
                     if !outcome.refused.contains(&refused) {
                         outcome.refused.push(refused);
                     }
@@ -616,11 +622,11 @@ impl<'a> Executor<'a> {
         })
     }
 
-    /// The record of an item `side`'s drive refused, with the item as the other side has it
-    /// (`None` for a name this run made up, like a conflict copy's).
-    fn refused_item(&self, side: Side, key: String, why: Refusal) -> Option<Refused> {
+    /// The record of an item `side`'s drive refused at `at`, with the item as the other side
+    /// has it (`None` for a name this run made up, like a conflict copy's).
+    fn refused_item(&self, side: Side, key: String, why: Refusal, at: PathBuf) -> Option<Refused> {
         let item = *self.spellings.snapshot(side.opposite()).get(&key)?;
-        Some(Refused { side, key, why, item })
+        Some(Refused { side, key, why, item, at })
     }
 
     /// `side`'s drive as the person knows it: "Backup SSD (exFAT)".
@@ -1013,26 +1019,44 @@ impl<'a> Executor<'a> {
             EntryKind::File => {
                 self.room_for(to, from.size)?;
                 let coarse = self.spellings.snapshot(to.opposite()).volume().is_some_and(|v| v.coarse_times());
-                let mut copier = Copier::new(self.cancel).coarse_source_times(coarse);
+                let mut copier = Copier::new(self.cancel).coarse_source_times(coarse).within(root);
                 if !self.holds_attributes(to) {
                     copier = copier.without_attributes();
                 }
                 let written = copier.file(&from_path, &target, from, &mut |n| meter.add_bytes(n))?;
                 (written.partial, written.unkept)
             }
-            EntryKind::Link => {
-                let vague = self.spellings.snapshot(to).volume().is_some_and(Volume::answers_links_vaguely);
-                (Copier::link(&from_path, &target, from, vague)?, BTreeSet::new())
-            }
+            EntryKind::Link => (self.link(to, &from_path, &target, from)?, BTreeSet::new()),
             EntryKind::Dir => return Err(Error::Invalid("a folder can't be copied as a file".into())),
         };
         self.touch(&target);
+        // Where the path next to the target was too long, the copy waits in a folder above.
+        self.touch(&partial);
         // One last look, fresh from the drive: the target must still be what the plan saw.
         if !Entry::still(self.look_fresh(to, &target)?.as_ref(), existing) {
             Copier::discard(&partial);
             return Ok(None);
         }
         Ok(Some(Staged { to, key: key.to_string(), from: *from, existing: existing.copied(), settles, relative, target, partial, unkept }))
+    }
+
+    /// Makes the link for a copy onto `to` (see `Copier::link`). An answer that may only be
+    /// about the link's own folder (one that can't be written to, or is locked) counts as
+    /// the drive refusing links only when the drive refuses a link at the top of the job's
+    /// folder too, where it takes a file. Otherwise the copy fails with what the drive said,
+    /// and the drive is never taken for one that can't hold links.
+    fn link(&self, to: Side, from_path: &Path, target: &Path, from: &Entry) -> Result<PathBuf> {
+        let root = self.shores.root(to);
+        let vague = self.spellings.snapshot(to).volume().is_some_and(Volume::answers_links_vaguely);
+        match Copier::link(from_path, target, from, root) {
+            Err(e) if Copier::may_refuse_links(&e, vague) && self.drive_holds_links(to) == Some(false) => Err(Error::NoLinks),
+            other => other,
+        }
+    }
+
+    /// Whether `side`'s drive holds links, asked once per run (see `Copier::drive_holds_links`).
+    fn drive_holds_links(&self, side: Side) -> Option<bool> {
+        *self.links.borrow_mut().entry(side).or_insert_with(|| Copier::drive_holds_links(self.shores.root(side)))
     }
 
     /// The second half of a copy: the new version takes the target's place. Returns the
@@ -1166,7 +1190,7 @@ impl<'a> Executor<'a> {
     /// `replace` on a drive that can't swap names: the old item is renamed aside and checked,
     /// then the copy takes the free name.
     fn replace_aside(&self, to: Side, partial: &Path, target: &Path, relative: &str, expected: &Entry) -> Result<bool> {
-        let aside = match Self::move_aside(target) {
+        let aside = match Self::move_aside(target, self.shores.root(to)) {
             Ok(Some(aside)) => aside,
             // Removed meanwhile: not what the plan saw anymore.
             Ok(None) => {
@@ -1203,20 +1227,17 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Renames the item at `path` to a fresh temporary name next to it, and returns that
-    /// name; `None` if nothing is there anymore. Whatever is at `path` at that instant moves,
-    /// even a version an app saved a moment ago: the look after the move sees it.
-    fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
-        for _ in 0..5 {
-            let aside = Copier::partial_path(path);
-            match move_to_new_name(path, &aside) {
-                Ok(()) => return Ok(Some(aside)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(None),
-                Err(e) => return Err(Error::file(path, e)),
-            }
+    /// Renames the item at `path` to a fresh temporary name, and returns that name; `None`
+    /// if nothing is there anymore. The name is next to the item, or in the nearest folder
+    /// above, up to `top`, where its path isn't too long (see `Copier::temporary`). Whatever
+    /// is at `path` at that instant moves, even a version an app saved a moment ago: the
+    /// look after the move sees it.
+    fn move_aside(path: &Path, top: &Path) -> Result<Option<PathBuf>> {
+        match Copier::temporary(path, top, |aside| move_to_new_name(path, aside)) {
+            Ok((aside, ())) => Ok(Some(aside)),
+            Err((_, e)) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+            Err((_, e)) => Err(Error::file(path, e)),
         }
-        Err(Error::Invalid(format!("no free temporary name next to {}", path.display())))
     }
 
     /// Puts an item Charon renamed aside back under its name, or, when something new took
@@ -1422,7 +1443,7 @@ impl<'a> Executor<'a> {
             return removed;
         }
         if keep {
-            let Some(aside) = Self::move_aside(target)? else { return Ok(true) };
+            let Some(aside) = Self::move_aside(target, root)? else { return Ok(true) };
             let moved = self.look_fresh(side, &aside);
             if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
                 self.put_back(side, &aside, target, relative);
@@ -1443,7 +1464,7 @@ impl<'a> Executor<'a> {
     fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
         Self::make_writable(target);
         // Gone already: what the plan wanted.
-        let Some(aside) = Self::move_aside(target)? else { return Ok(true) };
+        let Some(aside) = Self::move_aside(target, self.shores.root(side))? else { return Ok(true) };
         let moved = self.look_fresh(side, &aside);
         if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
             self.put_back(side, &aside, target, relative);
@@ -1795,38 +1816,89 @@ impl<'a> Executor<'a> {
     /// A free name for the destination's version of `key`: `notes/plan.txt` → `notes/plan
     /// (conflict 2026-10-16 16.20).txt`, numbered when that name is taken on either side.
     /// Returns its key; the run remembers how it is spelled on each side.
+    ///
+    /// Where the path to that name is too long for either side's drive, the name is
+    /// shortened until it fits. Where not even one letter of the original name fits, both
+    /// versions can't be kept: the step is refused with `Refusal::ConflictCopy` on that
+    /// side, and the looks after leave the item as it is, with a note, until it changes.
     fn free_conflict_name(&self, key: &str) -> Result<String> {
         // In the NFC form most systems write: a name made on a Mac drive can come decomposed.
         let on_destination = self.spellings.disk(Side::Destination, key);
         let name: String = Keys::name(&on_destination).nfc().collect();
-        let folder_on = |side: Side| Keys::parent(key).map(|parent| self.spellings.disk(side, parent));
-        let (folder_destination, folder_source) = (folder_on(Side::Destination), folder_on(Side::Source));
-        let join = |folder: &Option<String>, name: &str| match folder {
-            Some(folder) => format!("{folder}/{name}"),
-            None => name.to_string(),
+        let place = |side: Side, candidate: &str| match Keys::parent(key) {
+            Some(parent) => format!("{}/{candidate}", self.spellings.disk(side, parent)),
+            None => candidate.to_string(),
         };
         for n in 1..1000 {
-            let candidate = Self::conflict_name(&name, n);
-            let (destination, source) = (join(&folder_destination, &candidate), join(&folder_source, &candidate));
-            let taken = Self::look(&self.shores.destination.join(&destination))?.is_some() || Self::look(&self.shores.source.join(&source))?.is_some();
-            if !taken {
+            let mut candidate = Self::conflict_name(&name, n);
+            'fitting: loop {
+                let mut taken = false;
+                for side in [Side::Destination, Side::Source] {
+                    match Self::spot(&self.shores.root(side).join(place(side, &candidate)))? {
+                        Spot::Free => {}
+                        Spot::Taken => taken = true,
+                        Spot::TooLong => match Self::conflict_name_within(&name, n, candidate.len() - 1) {
+                            Some(shorter) => {
+                                candidate = shorter;
+                                continue 'fitting;
+                            }
+                            None => return Err(Error::Refused { path: self.path(side, key), why: Refusal::ConflictCopy }),
+                        },
+                    }
+                }
+                if taken {
+                    break;
+                }
+                let destination = place(Side::Destination, &candidate);
                 let conflict_key = self.spellings.key_for(&destination);
                 self.spellings.learn(Side::Destination, &conflict_key, destination);
-                self.spellings.learn(Side::Source, &conflict_key, source);
+                self.spellings.learn(Side::Source, &conflict_key, place(Side::Source, &candidate));
                 return Ok(conflict_key);
             }
         }
         Err(Error::Invalid("no free name for the conflict copy".into()))
     }
 
+    /// What is at the place of a conflict copy's name on one side.
+    fn spot(path: &Path) -> Result<Spot> {
+        match Self::look(path) {
+            Ok(None) => Ok(Spot::Free),
+            Ok(Some(_)) => Ok(Spot::Taken),
+            Err(Error::Refused { why: Refusal::TooLong, .. }) => Ok(Spot::TooLong),
+            Err(e) => Err(e),
+        }
+    }
+
     /// `plan.txt` → `plan (conflict 2026-10-16 16.20).txt` (`… 16.20 2).txt` for n = 2),
     /// shortened to fit the drive's limit on name length.
     pub fn conflict_name(name: &str, n: u32) -> String {
+        let (stem, tail) = Self::conflict_parts(name, n);
+        names::fit(stem, &tail)
+    }
+
+    /// `conflict_name` in at most `bytes` bytes, keeping at least one letter of the name;
+    /// `None` when that doesn't fit.
+    fn conflict_name_within(name: &str, n: u32, bytes: usize) -> Option<String> {
+        let (stem, tail) = Self::conflict_parts(name, n);
+        names::shorten(stem, &tail, bytes, 1)
+    }
+
+    /// The part of a conflict copy's name taken from the original (`plan`), and what follows
+    /// it (` (conflict 2026-10-16 16.20).txt`).
+    fn conflict_parts(name: &str, n: u32) -> (&str, String) {
         let stamp = Local::now().format("%Y-%m-%d %H.%M");
         let (stem, extension) = names::split_extension(name);
         let number = if n > 1 { format!(" {n}") } else { String::new() };
-        names::fit(stem, &format!(" (conflict {stamp}{number}){extension}"))
+        (stem, format!(" (conflict {stamp}{number}){extension}"))
     }
+}
+
+/// What a conflict copy's name meets on one side (see `Executor::free_conflict_name`).
+enum Spot {
+    Free,
+    Taken,
+    /// The path to it is too long for the drive.
+    TooLong,
 }
 
 #[cfg(test)]
@@ -1965,7 +2037,7 @@ mod tests {
         let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
         let target = shores.destination.join("notes.txt");
         write(&target, "old", 1_600_000_000);
-        let aside = Executor::move_aside(&target).unwrap().unwrap();
+        let aside = Executor::move_aside(&target, &shores.destination).unwrap().unwrap();
         write(&target, "newer", 1_700_000_000);
         executor.put_back(Side::Destination, &aside, &target, "notes.txt");
         assert_eq!(fs::read_to_string(&target).unwrap(), "newer");
@@ -2205,6 +2277,28 @@ mod tests {
         }
         // A folder that is simply new since the scan is the person's own: it's taken.
         assert!(matches!(executor.create_dir(Side::Destination, "photos"), Ok(Done::Created)));
+    }
+
+    #[test]
+    fn a_refused_name_is_remembered_with_the_place_the_drive_refused() {
+        let (_tmp, shores) = shores();
+        let report = Entry::file(4, 1_600_000_000_000);
+        let mut source = Snapshot::new();
+        source.insert("REPORT~1.PDF", report);
+        let destination = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel);
+        let action = Action::copy(Side::Destination, "REPORT~1.PDF", report, None);
+        // The drive finds another item ("Report final.pdf") at the copy's place.
+        let at = shores.destination.join("REPORT~1.PDF");
+        let (mut outcome, mut holds) = (Outcome::default(), Holds::default());
+        let refused = Err(Error::Refused { path: at.clone(), why: Refusal::TakenName });
+        assert!(executor.record(&mut outcome, &mut holds, &action, refused).is_continue());
+        let expected = Refused { side: Side::Destination, key: "REPORT~1.PDF".into(), why: Refusal::TakenName, item: report, at };
+        assert_eq!(outcome.refused, vec![expected]);
+        assert_eq!(outcome.left_out.len(), 1);
+        let removal = Action::Delete { side: Side::Destination, path: "old.txt".into(), item: EntryKind::File, entry: Entry::file(1, 1), other: None };
+        assert!(matches!(holds.of(&removal), Some(Held::Failed)), "the run keeps its removals there");
     }
 
     #[test]

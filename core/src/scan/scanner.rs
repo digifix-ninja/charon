@@ -124,8 +124,18 @@ impl<'a> Scanner<'a> {
                             snapshot.reserve(&key, &disk);
                             snapshot.occupy_folders_of(&key);
                         }
+                    } else if Self::is_link_leftover(name, file_type) {
+                        // A link copy Charon was making, or a link it had moved aside to remove
+                        // or replace it, when a sync was interrupted: Charon's own, tidied
+                        // like a half-copied file.
+                        if let Some(link) = Self::link_of(item.path()) {
+                            snapshot.facts_mut().partials.push((disk.clone(), link));
+                        }
+                        snapshot.reserve(&key, &disk);
+                        snapshot.occupy_folders_of(&key);
                     } else if is_partial(name) {
-                        // A folder or link only named like a file Charon is copying.
+                        // A folder only named like a file Charon is copying, or a link named
+                        // like one of Charon 0.2's (which never carried links).
                         snapshot.leave_out(disk, Some(&key), "named like a file Charon is copying, so Charon leaves it alone (if it's yours, rename it)");
                     } else if (name == MARKER_FOLDER || name == TRASH_FOLDER) && !Self::looks_like_charons(item.path(), name, file_type.is_dir()) {
                         // The person's own item, only named like one of Charon's folders:
@@ -333,6 +343,27 @@ impl<'a> Scanner<'a> {
             snapshot.facts_mut().spellings.insert(key.clone(), disk);
         }
         snapshot.insert(key, entry);
+    }
+
+    /// Whether an item is a link under one of Charon 0.3's temporary names: Charon makes
+    /// link copies under such a name, and moves links aside under one before it removes or
+    /// replaces them. Only on macOS and Linux, where Charon carries links.
+    fn is_link_leftover(name: &str, file_type: fs::FileType) -> bool {
+        cfg!(unix) && file_type.is_symlink() && is_partial(name) && !is_legacy_partial(name)
+    }
+
+    /// The link at `path`, as the look right before it's tidied away sees it.
+    #[cfg(unix)]
+    fn link_of(path: &Path) -> Option<Entry> {
+        use std::os::unix::ffi::OsStrExt;
+        let target = fs::read_link(path).ok()?;
+        let meta = fs::symlink_metadata(path).ok()?;
+        Some(Entry::link(target.as_os_str().as_bytes(), Self::modified_ms(&meta)))
+    }
+
+    #[cfg(not(unix))]
+    fn link_of(_path: &Path) -> Option<Entry> {
+        None
     }
 
     /// Links are carried as links on macOS and Linux. Windows links and junctions are left
@@ -607,6 +638,24 @@ mod tests {
         assert!(s.skipped().iter().all(|skipped| skipped.reason.contains("rename it")));
         assert_eq!(s.partials().len(), 2, "only files count as leftovers");
         assert!(s.get("b.charon-partial/inside.txt").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn charons_own_leftover_links_are_tidied_like_half_copied_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Left by a sync interrupted while it made a link copy, or removed a link.
+        write(&tmp.path().join("a/keep.txt"), "x");
+        std::os::unix::fs::symlink("../elsewhere", tmp.path().join("a/.charon-0011223344556677.part")).unwrap();
+        // Charon 0.2 never carried links: a link named like its half-copied files isn't its own.
+        std::os::unix::fs::symlink("notes.txt", tmp.path().join("notes.charon-partial")).unwrap();
+        let s = scan(tmp.path(), &[]);
+        let leftovers: Vec<&str> = s.partials().iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(leftovers, vec!["a/.charon-0011223344556677.part"]);
+        assert!(s.partials()[0].1.is_link());
+        let noted: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
+        assert_eq!(noted, vec!["notes.charon-partial"], "Charon's own link isn't told to the person as theirs");
+        assert!(s.is_occupied("a"), "its folder isn't empty until it's tidied away");
     }
 
     #[cfg(unix)]

@@ -294,6 +294,16 @@ mod tests {
     }
 
     #[test]
+    fn patterns_ignore_case_in_every_alphabet_when_a_drive_does() {
+        let f = ExcludeFilter::new(&["Entwürfe".to_string(), "/Δοκιμές/*.TMP".to_string()], true).unwrap();
+        assert!(f.excludes("Projekte/ENTWÜRFE"));
+        assert!(f.excludes("Projekte/entwürfe"));
+        assert!(f.excludes("ΔΟΚΙΜΈΣ/notes.tmp"), "the final sigma too");
+        assert!(!f.excludes("Projekte/Entwurf"));
+        assert!(!filter(&["Entwürfe"]).excludes("Projekte/ENTWÜRFE"), "patterns match case exactly where both drives do");
+    }
+
+    #[test]
     fn drive_folders_are_known() {
         assert!(is_system_folder("System Volume Information"));
         assert!(is_system_folder("$RECYCLE.BIN"));

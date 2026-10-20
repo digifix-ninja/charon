@@ -6,6 +6,11 @@
 //! away (the next look picks the file up again). Only a complete copy, with the original's
 //! modification time, permissions and chosen extended attributes, takes the real name
 //! (`commit_new` here, or `Executor::replace` when it replaces an older version).
+//!
+//! A target with a short name deep down has a temporary name longer than its own, whose
+//! path may be too long for the drive where the target's fits. Then the temporary name goes
+//! into the nearest folder above where it fits (see `Copier::temporary`): only the target
+//! itself must fit.
 
 use crate::error::{Error, Result};
 use crate::run::durable;
@@ -13,7 +18,7 @@ use crate::run::rename::rename_new;
 use crate::scan::{new_partial_name, Contents, Entry, Refusal, Scanner};
 use std::collections::BTreeSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -39,11 +44,21 @@ pub struct Copier<'a> {
     attributes: bool,
     /// The source's drive keeps times in steps of a second or more (see `Volume::coarse_times`).
     coarse_source: bool,
+    /// The highest folder a temporary copy may go in when the path next to its target is too
+    /// long (see `temporary`): the job's folder on the target's side.
+    top: Option<&'a Path>,
 }
 
 impl<'a> Copier<'a> {
     pub fn new(cancel: &'a AtomicBool) -> Self {
-        Self { cancel, attributes: true, coarse_source: false }
+        Self { cancel, attributes: true, coarse_source: false, top: None }
+    }
+
+    /// Lets temporary copies go up to the folder `top` where the path next to the target is
+    /// too long for the drive. Without it, they only ever go next to the target.
+    pub fn within(mut self, top: &'a Path) -> Self {
+        self.top = Some(top);
+        self
     }
 
     /// Leaves extended attributes out (the target drive can't really hold them).
@@ -59,12 +74,12 @@ impl<'a> Copier<'a> {
         self
     }
 
-    /// Copies the file `from` (which must still be `expected`) to a new temporary file next
-    /// to `to`, reporting bytes as they go. Returns the temporary file, ready for a commit.
-    /// Fails with `Error::Refused` when the drive can't hold the file there (too big, or a
-    /// path too long for it).
+    /// Copies the file `from` (which must still be `expected`) to a new temporary file for
+    /// `to` (see `temporary`), reporting bytes as they go. Returns the temporary file, ready
+    /// for a commit. Fails with `Error::Refused` when the file is too big for the drive.
     pub fn file(&self, from: &Path, to: &Path, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<Written> {
-        let (partial, writer) = Self::create_partial(to)?;
+        let top = self.top.or(to.parent()).unwrap_or(to);
+        let (partial, writer) = Self::create_partial(to, top)?;
         match self.write_partial(from, &partial, writer, expected, on_bytes) {
             Ok(unkept) => Ok(Written { partial, unkept }),
             Err(e) => {
@@ -81,11 +96,11 @@ impl<'a> Copier<'a> {
     }
 
     /// Makes a link like the one at `from` (which must still be `expected`) under a
-    /// temporary name next to `to`. macOS and Linux only; Windows plans never hold links.
-    /// Fails with `Error::NoLinks` when the target drive can't hold links; `vague`: the
-    /// target drive may say so with "permission denied" or "invalid argument" too (see
-    /// `Volume::answers_links_vaguely`).
-    pub fn link(from: &Path, to: &Path, expected: &Entry, vague: bool) -> Result<PathBuf> {
+    /// temporary name for `to` (see `temporary`, with `top` as the highest folder it may go
+    /// in). macOS and Linux only; Windows plans never hold links. Fails with
+    /// `Error::NoLinks` only when the drive says it can't hold links at all; an answer that
+    /// may only be about this folder fails with what the drive said (see `may_refuse_links`).
+    pub fn link(from: &Path, to: &Path, expected: &Entry, top: &Path) -> Result<PathBuf> {
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
@@ -95,35 +110,88 @@ impl<'a> Copier<'a> {
             if !now.unchanged(expected) {
                 return Err(Error::Changed("changed since the scan".into()));
             }
-            let mut tries = 0;
-            loop {
-                let partial = Self::partial_path(to);
-                match std::os::unix::fs::symlink(&target, &partial) {
-                    Ok(()) => {
-                        let times = filetime::FileTime::from_last_modification_time(&meta);
-                        let _ = filetime::set_symlink_file_times(&partial, times, times);
-                        return Ok(partial);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 5 => tries += 1,
-                    Err(e) if Self::refuses_links(&e, vague) => return Err(Error::NoLinks),
-                    Err(e) => return Err(Error::file(&partial, e)),
+            match Self::temporary(to, top, |partial| std::os::unix::fs::symlink(&target, partial)) {
+                Ok((partial, ())) => {
+                    let times = filetime::FileTime::from_last_modification_time(&meta);
+                    let _ = filetime::set_symlink_file_times(&partial, times, times);
+                    Ok(partial)
                 }
+                Err((_, e)) if Self::refuses_links(&e) => Err(Error::NoLinks),
+                Err((partial, e)) => Err(Error::file(partial, e)),
             }
         }
         #[cfg(not(unix))]
         {
-            let _ = (from, to, expected, vague);
+            let _ = (from, to, expected, top);
             Err(Error::NoLinks)
         }
     }
 
     /// Whether the error from creating a link says the drive can't hold links at all.
     #[cfg(unix)]
-    fn refuses_links(error: &std::io::Error, vague: bool) -> bool {
-        match error.raw_os_error() {
-            Some(code) if code == libc::EPERM || code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS => true,
-            Some(code) if vague => code == libc::EACCES || code == libc::EINVAL,
-            _ => false,
+    fn refuses_links(error: &io::Error) -> bool {
+        matches!(error.raw_os_error(), Some(code) if code == libc::ENOTSUP || code == libc::EOPNOTSUPP || code == libc::ENOSYS)
+    }
+
+    /// Whether the error from creating a link may mean the drive can't hold links, though it
+    /// may just as well be about the one folder the link was to go in: "operation not
+    /// permitted" (drives without links answer that, and so does a locked folder), and on
+    /// a drive that answers vaguely (`vague`, see `Volume::answers_links_vaguely`) also
+    /// "permission denied" or "invalid argument". Only asking the drive at the top of the
+    /// job's folder tells which (see `drive_holds_links`).
+    pub fn may_refuse_links(error: &Error, vague: bool) -> bool {
+        matches!(error, Error::File { source, .. } if Self::may_mean_no_links(source, vague))
+    }
+
+    /// `may_refuse_links`, for the drive's own answer.
+    fn may_mean_no_links(error: &io::Error, vague: bool) -> bool {
+        #[cfg(unix)]
+        {
+            match error.raw_os_error() {
+                Some(code) if code == libc::EPERM => true,
+                Some(code) if code == libc::EACCES || code == libc::EINVAL => vague,
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (error, vague);
+            false
+        }
+    }
+
+    /// Asks the drive of `folder` (the top of a job's folder) whether it holds links: makes
+    /// one there under a temporary name, and removes it at once. `Some(false)` only when the
+    /// drive refuses the link where it takes a file; `None` when it can't tell (the folder
+    /// takes neither, or the drive failed otherwise). A probe an interruption leaves behind
+    /// is tidied away like any half-copied file.
+    pub fn drive_holds_links(folder: &Path) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let probe = Self::partial_in(folder);
+            match std::os::unix::fs::symlink("charon-link-probe", &probe) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&probe);
+                    Some(true)
+                }
+                Err(e) if Self::refuses_links(&e) || Self::may_mean_no_links(&e, true) => {
+                    let file = Self::partial_in(folder);
+                    let takes_files = OpenOptions::new().write(true).create_new(true).open(&file).is_ok();
+                    if takes_files {
+                        Self::discard(&file);
+                    }
+                    takes_files.then_some(false)
+                }
+                Err(e) => {
+                    log::info!("couldn't ask {} whether it holds links: {e}", folder.display());
+                    None
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = folder;
+            None
         }
     }
 
@@ -148,30 +216,49 @@ impl<'a> Copier<'a> {
         let _ = fs::remove_file(partial);
     }
 
-    /// A fresh temporary name in the folder of `to`: `.charon-0123456789abcdef.part`. The
-    /// first 8 hex digits are the time it was made, in seconds: a copy that takes long is
-    /// never mistaken for the leftover of an interrupted sync because of the old time it
-    /// carries at the end (see `scan::partial_started`).
+    /// A fresh temporary name in the folder of `to` (see `partial_in`).
     pub fn partial_path(to: &Path) -> PathBuf {
-        to.with_file_name(new_partial_name())
+        Self::partial_in(to.parent().unwrap_or(Path::new("")))
     }
 
-    /// Creates the temporary file: always a new file, never an existing one and never
-    /// through a link (`create_new`).
-    fn create_partial(to: &Path) -> Result<(PathBuf, File)> {
-        let mut tries = 0;
+    /// A fresh temporary name in `folder` (see `scan::new_partial_name`): its time tells a
+    /// copy that takes long from the leftover of an interrupted sync, whatever old time the
+    /// copy carries at the end (see `scan::partial_started`).
+    pub fn partial_in(folder: &Path) -> PathBuf {
+        folder.join(new_partial_name())
+    }
+
+    /// Makes something under a fresh temporary name for `to` with `make`, which must fail
+    /// when the name is taken, and returns that name with what `make` returned. The name
+    /// goes next to `to`. Where that path is too long for the drive (a short name deep down
+    /// has a temporary name longer than its own), it goes into the nearest folder above,
+    /// up to `top`, where it fits; it's renamed into place from there, on the same drive.
+    /// When `make` fails otherwise, its error comes back with the name it was tried under.
+    pub fn temporary<T>(to: &Path, top: &Path, mut make: impl FnMut(&Path) -> io::Result<T>) -> std::result::Result<(PathBuf, T), (PathBuf, io::Error)> {
+        let mut folder = to.parent().unwrap_or(Path::new(""));
         loop {
-            let partial = Self::partial_path(to);
-            match OpenOptions::new().write(true).create_new(true).open(&partial) {
-                Ok(file) => return Ok((partial, file)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && tries < 5 => tries += 1,
-                // The temporary name is short: only the path to it can be too long.
-                Err(e) if Refusal::of_naming(&e) == Some(Refusal::TooLong) => {
-                    return Err(Error::Refused { path: to.to_path_buf(), why: Refusal::TooLong })
+            let mut tries = 0;
+            let (partial, error) = loop {
+                let partial = Self::partial_in(folder);
+                match make(&partial) {
+                    Ok(made) => return Ok((partial, made)),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && tries < 5 => tries += 1,
+                    Err(e) => break (partial, e),
                 }
-                Err(e) => return Err(Error::file(&partial, e)),
+            };
+            let too_long = Refusal::of_naming(&error) == Some(Refusal::TooLong);
+            match folder.parent() {
+                Some(above) if too_long && folder != top && above.starts_with(top) => folder = above,
+                _ => return Err((partial, error)),
             }
         }
+    }
+
+    /// Creates the temporary file for `to` (see `temporary`): always a new file, never an
+    /// existing one and never through a link (`create_new`). A temporary path too long even
+    /// in `top` is a failure, not a refusal of the target: the target's own path fits.
+    fn create_partial(to: &Path, top: &Path) -> Result<(PathBuf, File)> {
+        Self::temporary(to, top, |partial| OpenOptions::new().write(true).create_new(true).open(partial)).map_err(|(partial, e)| Error::file(partial, e))
     }
 
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
@@ -588,21 +675,62 @@ mod tests {
         std::os::unix::fs::symlink("../somewhere/else", &from).unwrap();
         let meta = fs::symlink_metadata(&from).unwrap();
         let expected = Entry::link(b"../somewhere/else", Scanner::modified_ms(&meta));
-        let partial = Copier::link(&from, &to, &expected, false).unwrap();
+        let partial = Copier::link(&from, &to, &expected, tmp.path()).unwrap();
         Copier::commit_new(&partial, &to).unwrap();
         assert_eq!(fs::read_link(&to).unwrap(), Path::new("../somewhere/else"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn shares_may_refuse_links_with_vaguer_answers() {
+    fn only_a_drive_that_says_so_refuses_links_by_itself() {
         let error = std::io::Error::from_raw_os_error;
-        assert!(Copier::refuses_links(&error(libc::EOPNOTSUPP), false));
-        // On a local drive, "permission denied" is a problem to report, not a drive without links.
-        assert!(!Copier::refuses_links(&error(libc::EACCES), false));
-        assert!(Copier::refuses_links(&error(libc::EACCES), true));
-        assert!(Copier::refuses_links(&error(libc::EINVAL), true));
-        assert!(!Copier::refuses_links(&error(libc::EIO), true));
+        assert!(Copier::refuses_links(&error(libc::EOPNOTSUPP)));
+        // A locked folder answers "operation not permitted" too: the drive is asked first.
+        assert!(!Copier::refuses_links(&error(libc::EPERM)));
+        assert!(Copier::may_refuse_links(&Error::file("/x", error(libc::EPERM)), false));
+        // So is "permission denied" from a share, which may be one folder that can't be written to.
+        assert!(!Copier::refuses_links(&error(libc::EACCES)));
+        assert!(Copier::may_refuse_links(&Error::file("/x", error(libc::EACCES)), true));
+        assert!(Copier::may_refuse_links(&Error::file("/x", error(libc::EINVAL)), true));
+        assert!(!Copier::may_refuse_links(&Error::file("/x", error(libc::EACCES)), false), "a local drive means just that");
+        assert!(!Copier::may_refuse_links(&Error::file("/x", error(libc::EIO)), true));
+        assert!(!Copier::may_refuse_links(&Error::NoLinks, true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_drive_asked_about_links_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(Copier::drive_holds_links(tmp.path()), Some(true));
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 0);
+        assert_eq!(Copier::drive_holds_links(&tmp.path().join("missing")), None, "a folder that isn't there can't tell");
+    }
+
+    /// A short name deep down, where the drive's limit on whole paths leaves room for the
+    /// name but not for the longer temporary name next to it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_temporary_name_too_long_next_to_its_target_goes_a_folder_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Paths on Linux end at 4,096 bytes: a folder whose path is 4,070 bytes long.
+        let mut deep = tmp.path().to_path_buf();
+        while deep.as_os_str().len() + 201 < 4070 {
+            deep.push("d".repeat(200));
+        }
+        deep.push("e".repeat(4070 - deep.as_os_str().len() - 1));
+        fs::create_dir_all(&deep).unwrap();
+        let to = deep.join("f.txt");
+        assert!(to.as_os_str().len() < 4095 && Copier::partial_path(&to).as_os_str().len() > 4095);
+        let from = tmp.path().join("a.txt");
+        fs::write(&from, "copy").unwrap();
+        let never = AtomicBool::new(false);
+        // Only next to the target, it can't be written: a failure, not a refusal of the target.
+        let alone = Copier::new(&never).file(&from, &to, &entry_of(&from), &mut |_| {});
+        assert!(matches!(alone, Err(Error::File { .. })), "{alone:?}");
+        let written = Copier::new(&never).within(tmp.path()).file(&from, &to, &entry_of(&from), &mut |_| {}).unwrap();
+        assert_eq!(written.partial.parent(), deep.parent());
+        Copier::commit_new(&written.partial, &to).unwrap();
+        assert_eq!(fs::read_to_string(&to).unwrap(), "copy");
     }
 
     #[cfg(unix)]

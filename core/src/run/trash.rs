@@ -18,12 +18,16 @@
 //!
 //! The trash folder must be a real folder: if `.charon-trash` is a link or a file, nothing
 //! is moved into it and nothing is cleared out of it.
+//!
+//! In the trash an item's path is 42 bytes longer than its own (`.charon-trash/<run time>_<run
+//! id>/`). Where that is too long for the drive, the item goes in under its own name at the
+//! top of the dated folder instead of failing on every sync.
 
 use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_partial, Scanner, TRASH_FOLDER};
+use crate::scan::{is_partial, Keys, Refusal, Scanner, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -114,40 +118,55 @@ impl Trash {
     /// Moves the item at `from` (in `root`'s folder) into the trash as `relative`: an item
     /// Charon had moved aside under a temporary name goes in under its own.
     pub fn put_from(&self, from: &Path, root: &Path, relative: &str) -> io::Result<PathBuf> {
-        let base = self.dated(root, relative)?;
-        // The same path removed twice in one run (replaced, then replaced again): number it.
-        for n in 1..=1000 {
-            let name = Self::numbered(relative, n);
-            match move_to_new_name(from, &base.join(&name)) {
-                Ok(()) => return Ok(self.list(root, &base, &name)),
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free name in the trash"))
+        let base = self.dated(root)?;
+        self.keep(root, &base, relative, |place| move_to_new_name(from, place))
     }
 
     /// Copies the file `root/relative` into the trash, leaving it where it is. On drives that
     /// support it (APFS, Btrfs) the copy is a clone: instant, and it takes no room.
     pub fn preserve(&self, root: &Path, relative: &str) -> io::Result<PathBuf> {
         let from = root.join(relative);
-        let base = self.dated(root, relative)?;
-        // Written under a temporary name first: a half-written copy never takes a name, and
-        // nothing already in the trash is ever written over.
-        let temp = Copier::partial_path(&base.join(relative));
+        let base = self.dated(root)?;
+        // Written under a temporary name at the top of the dated folder first: a half-written
+        // copy never takes a name, and nothing already in the trash is ever written over.
+        let temp = Copier::partial_in(&base);
         Self::copy_file(&from, &temp)?;
+        let kept = self.keep(root, &base, relative, |place| rename_new(&temp, place));
+        if kept.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        kept
+    }
+
+    /// Gives an item a place in the dated folder `base` of `root`'s trash with `make`, which
+    /// must fail when the place is taken: `relative`, with the folders above it, numbered
+    /// when the same path went into the trash before in this run (replaced, then replaced
+    /// again). Where that path is too long for the drive, the item goes in under its own
+    /// name at the top of `base`. Returns where it is.
+    fn keep(&self, root: &Path, base: &Path, relative: &str, mut make: impl FnMut(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
+        match self.keep_as(root, base, relative, &mut make) {
+            Err(e) if Refusal::of_naming(&e) == Some(Refusal::TooLong) && relative.contains('/') => {
+                let name = Keys::name(relative);
+                log::info!("{relative} went into the trash as {name}, at the top of {}: with its folders the path was too long for the drive", base.display());
+                self.keep_as(root, base, name, &mut make)
+            }
+            kept => kept,
+        }
+    }
+
+    /// `keep`, at `relative` in `base` only.
+    fn keep_as(&self, root: &Path, base: &Path, relative: &str, make: &mut impl FnMut(&Path) -> io::Result<()>) -> io::Result<PathBuf> {
+        if let Some(parent) = base.join(relative).parent() {
+            fs::create_dir_all(parent)?;
+        }
         for n in 1..=1000 {
             let name = Self::numbered(relative, n);
-            match rename_new(&temp, &base.join(&name)) {
-                Ok(()) => return Ok(self.list(root, &base, &name)),
+            match make(&base.join(&name)) {
+                Ok(()) => return Ok(self.list(root, base, &name)),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    let _ = fs::remove_file(&temp);
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
-        let _ = fs::remove_file(&temp);
         Err(io::Error::new(io::ErrorKind::AlreadyExists, "no free name in the trash"))
     }
 
@@ -172,14 +191,13 @@ impl Trash {
         self.folders.borrow().iter().cloned().collect()
     }
 
-    /// The dated folder of this run in `root`'s trash, with the folders above `relative`
-    /// in it.
-    fn dated(&self, root: &Path, relative: &str) -> io::Result<PathBuf> {
+    /// The dated folder of this run in `root`'s trash (created when missing).
+    fn dated(&self, root: &Path) -> io::Result<PathBuf> {
         let base = Self::real_trash(root, true)?.join(&self.folder);
-        if let Some(parent) = base.join(relative).parent() {
-            fs::create_dir_all(parent)?;
+        match fs::create_dir(&base) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(base),
         }
-        Ok(base)
     }
 
     /// Notes how the item `name` landed in `base` (a copy's time may have been refused by

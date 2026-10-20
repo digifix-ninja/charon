@@ -63,12 +63,18 @@ impl Keys {
 
     /// One character's folded form: the lower case of its upper case, so both lower-case
     /// forms of a letter meet. A letter whose upper case is more than one letter (ß, the
-    /// ligatures) keeps its own lower case, and the Turkish dotless ı stays apart from i,
-    /// as Unicode's case folding has it.
+    /// ligatures) keeps its own lower case.
+    ///
+    /// The Turkish dotless ı meets i too. Windows and the drives made for it (NTFS, exFAT,
+    /// FAT, most network shares) compare names by their upper case, where ı is I: there
+    /// "Fiyatlar" and "Fıyatlar" are one folder. Apple's drives keep ı apart, so two items
+    /// named that way side by side are left alone there, as twins, which is safe; treating
+    /// one name as two would make a rename on one side look like everything removed and
+    /// added again, on a drive that can't hold both.
     fn fold_char(c: char) -> std::char::ToLowercase {
         let mut upper = c.to_uppercase();
         match (upper.next(), upper.next()) {
-            (Some(single), None) if c != 'ı' => single.to_lowercase(),
+            (Some(single), None) => single.to_lowercase(),
             _ => c.to_lowercase(),
         }
     }
@@ -112,8 +118,16 @@ mod tests {
         assert_eq!(Keys::fold("\u{3d1}"), Keys::fold("\u{398}"));
         assert_eq!(Keys::fold("\u{1e9e}"), "\u{df}", "capital ẞ is ß, never ss");
         assert_ne!(Keys::fold("stra\u{df}e"), Keys::fold("strasse"));
-        assert_ne!(Keys::fold("k\u{131}sa"), Keys::fold("kisa"), "the dotless ı is its own letter");
-        assert_eq!(Keys::fold("I\u{131}"), "i\u{131}");
         assert_eq!(Keys::fold("\u{212a}elvin"), "kelvin");
+    }
+
+    #[test]
+    fn the_dotless_i_meets_i_as_on_drives_that_compare_upper_case() {
+        // NTFS, exFAT and FAT find "Fıyatlar" under "Fiyatlar" and "FIYATLAR".
+        assert_eq!(Keys::fold("F\u{131}yatlar/teklif.pdf"), Keys::fold("Fiyatlar/teklif.pdf"));
+        assert_eq!(Keys::fold("F\u{131}yatlar"), Keys::fold("FIYATLAR"));
+        assert_eq!(Keys::fold("I\u{131}"), "ii");
+        // The capital İ is I with a dot above, apart from I there too.
+        assert_ne!(Keys::fold("\u{130}stanbul"), Keys::fold("Istanbul"));
     }
 }

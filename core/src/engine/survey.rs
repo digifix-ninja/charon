@@ -8,15 +8,17 @@ use crate::engine::{runs, Engine, EngineEvent};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
-use crate::run::{Copier, Found, Markers, Room, Trash, TrashLook, Unread};
+use crate::run::{Copier, Found, Markers, Refused, Room, Trash, TrashLook, Unread};
 use crate::scan::{
-    is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot,
+    is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, Scanner, Snapshot,
     Volume,
 };
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
+use std::fs;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
@@ -778,13 +780,29 @@ impl Engine {
     /// Notes in the scans what a drive refused in an earlier sync of this session (see
     /// `run::Refused`), while the item it refused and the drive are still the same: the plan
     /// then leaves it out, with the reason, instead of trying it again on every sync.
+    ///
+    /// A name the drive found another item under is refused only while that item is there.
+    /// Once it's gone (the sync removed it, or the person renamed it), the refusal lapses and
+    /// the next sync carries the item: it would otherwise stay out for the whole session
+    /// while the job looks in sync. Likewise, a conflict copy that couldn't be made only
+    /// matters while both versions are there.
     fn apply_refusals(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) {
         let refusals: Vec<_> = self.change_runtime(&job.id, |rt| rt.refused.values().cloned().collect());
+        let mut lapsed = Vec::new();
         for (refused, drive) in refusals {
             let (from, here) = match refused.side {
                 Side::Source => (&*destination, &mut *source),
                 Side::Destination => (&*source, &mut *destination),
             };
+            let over = match refused.why {
+                Refusal::TakenName => Self::name_freed(&refused, here),
+                Refusal::ConflictCopy => !here.contains(&refused.key),
+                _ => false,
+            };
+            if over {
+                lapsed.push(refused);
+                continue;
+            }
             let same_item = from.get(&refused.key).is_some_and(|now| now.unchanged(&refused.item));
             let same_drive = match (&drive, here.volume()) {
                 (Some(before), Some(now)) => Self::same_drive(before, now),
@@ -793,6 +811,30 @@ impl Engine {
             if same_item && same_drive {
                 here.refuse(&refused.key, refused.why);
             }
+        }
+        if !lapsed.is_empty() {
+            self.change_runtime(&job.id, |rt| {
+                for refused in lapsed {
+                    let place = (refused.side, refused.key.clone());
+                    // Only the refusal looked at here: a sync may have recorded a newer one since.
+                    if rt.refused.get(&place).is_some_and(|(stored, _)| *stored == refused) {
+                        rt.refused.remove(&place);
+                    }
+                }
+            });
+        }
+    }
+
+    /// Whether the name a drive found another item under is free again: nothing is at the
+    /// place it was refused any more, or the item is now there under its own name. A place
+    /// that can't be looked at keeps the refusal.
+    fn name_freed(refused: &Refused, here: &Snapshot) -> bool {
+        if here.contains(&refused.key) {
+            return true;
+        }
+        match fs::symlink_metadata(&refused.at) {
+            Ok(_) => false,
+            Err(e) => matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory),
         }
     }
 
@@ -972,6 +1014,67 @@ mod tests {
             lines,
             vec!["Also moves “docs/report.txt” into .charon-trash on the source: an interrupted sync left it there, empty, to hold the name for a copy."]
         );
+    }
+
+    #[test]
+    fn a_name_taken_by_another_item_is_free_again_once_that_item_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(src.join("REPORT~1.PDF"), "ours").unwrap();
+        let theirs = dst.join("Report final.pdf");
+        fs::write(&theirs, "theirs").unwrap();
+        let engine = Engine::open(tmp.path().join("data"), std::sync::Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: String::new(),
+            source: src.clone(),
+            destination: dst.clone(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: crate::model::ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        let job = engine.stored_job(&id).unwrap();
+        let cancel = AtomicBool::new(false);
+        let first = engine.survey(&job, &cancel, Purpose::Review).unwrap();
+        // What a sync records when the destination's drive finds "Report final.pdf" under the
+        // short name REPORT~1.PDF. This test's drive has no short names: the refused place
+        // is that other item's own.
+        let refused = Refused {
+            side: Side::Destination,
+            key: "REPORT~1.PDF".into(),
+            why: Refusal::TakenName,
+            item: *first.source.get("REPORT~1.PDF").unwrap(),
+            at: theirs.clone(),
+        };
+        let remember = |refused: &Refused| {
+            let drive = first.destination.volume().cloned();
+            engine.change_runtime(&id, |rt| rt.refused.insert((refused.side, refused.key.clone()), (refused.clone(), drive)));
+        };
+        let copies = |survey: &Survey| {
+            survey.plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Destination, path, .. } if path == "REPORT~1.PDF"))
+        };
+        remember(&refused);
+
+        let held = engine.survey(&job, &cancel, Purpose::Review).unwrap();
+        assert!(!copies(&held), "{:?}", held.plan.actions);
+        assert!(held.plan.notes.iter().any(|n| n.path == "REPORT~1.PDF" && n.reason.contains("finds another item under its name")), "{:?}", held.plan.notes);
+
+        // The other item goes (a sync removed it, or the person renamed it): the name is free.
+        fs::rename(&theirs, dst.join("Report final (old).pdf")).unwrap();
+        let free = engine.survey(&job, &cancel, Purpose::Check).unwrap();
+        assert!(copies(&free), "{:?}", free.plan.actions);
+        assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()), "the refusal lapsed for good");
+
+        // Nor does it hold once the item is there under its own name.
+        remember(&Refused { at: dst.join("Report final (old).pdf"), ..refused });
+        fs::write(dst.join("REPORT~1.PDF"), "ours").unwrap();
+        engine.survey(&job, &cancel, Purpose::Check).unwrap();
+        assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()));
     }
 
     #[test]

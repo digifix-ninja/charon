@@ -77,6 +77,9 @@ pub enum Refusal {
     TooLong,
     /// The file is too big for the drive.
     TooBig,
+    /// A conflict copy can't be made next to the item: the path to even the shortest name
+    /// for it is too long for the drive. Both versions stay as they are.
+    ConflictCopy,
 }
 
 impl Refusal {
@@ -89,6 +92,9 @@ impl Refusal {
             Refusal::Name => format!("the {drive} refused its name"),
             Refusal::TooLong => format!("its name, or the path to it, is too long for the {drive}"),
             Refusal::TooBig => format!("it's too big for the {drive}"),
+            Refusal::ConflictCopy => format!(
+                "the path to a conflict copy next to it would be too long for the {drive}, so both versions stay as they are until you rename or move one"
+            ),
         }
     }
 
