@@ -20,7 +20,7 @@ use crate::run::durable;
 use crate::run::names;
 use crate::run::rename::{rename_new, swap};
 use crate::run::{Copier, ProgressMeter, Room, Trash};
-use crate::scan::{is_clutter, Entry, EntryKind, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
+use crate::scan::{is_clutter, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Refusal, RootId, Scanner, Snapshot, Volume};
 use chrono::Local;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -378,6 +378,9 @@ pub struct Executor<'a> {
     cancel: &'a AtomicBool,
     /// The folders the plan was made for, as found by its scans.
     roots: (Option<RootId>, Option<RootId>),
+    /// The job's exclude filter, as the scans used it: a folder it excludes is never taken
+    /// for one a step creates (see `not_left_alone`).
+    filter: ExcludeFilter,
     /// Folders already checked to be real folders during this run.
     real_folders: RefCell<HashSet<PathBuf>>,
     /// Folders whose list of names this run changed (flushed to the drive at the end).
@@ -402,6 +405,7 @@ impl<'a> Executor<'a> {
             care,
             cancel,
             roots: (source.root(), destination.root()),
+            filter: ExcludeFilter::none(),
             real_folders: RefCell::new(HashSet::new()),
             touched: RefCell::new(BTreeSet::new()),
             removed_folders: RefCell::default(),
@@ -410,6 +414,13 @@ impl<'a> Executor<'a> {
             destroyed: RefCell::default(),
             unkept: RefCell::default(),
         }
+    }
+
+    /// The same executor, for a job whose scans left out what `filter` excludes (without
+    /// one, only Charon's own items count as excluded).
+    pub fn excluding(mut self, filter: ExcludeFilter) -> Self {
+        self.filter = filter;
+        self
     }
 
     /// The side whose spelling of a step's path the person sees in the progress line: the
@@ -1639,7 +1650,7 @@ impl<'a> Executor<'a> {
 
     /// The folder `key` on `side` is a real folder afterwards (created if missing), or this
     /// fails. A name the drive refuses, or takes for another item's (see `not_taken`), fails
-    /// with `Error::Refused`.
+    /// with `Error::Refused`; a folder Charon leaves alone fails too (see `not_left_alone`).
     fn ensure_folder(&self, side: Side, key: &str) -> Result<()> {
         let path = self.path(side, key);
         if self.real_folders.borrow().contains(&path) {
@@ -1647,7 +1658,8 @@ impl<'a> Executor<'a> {
         }
         match fs::symlink_metadata(&path) {
             Ok(meta) => {
-                if !self.spellings.snapshot(side).contains(key) {
+                let scanned = self.spellings.snapshot(side).contains(key);
+                if !scanned {
                     self.not_taken(side, key)?;
                 }
                 if meta.file_type().is_symlink() {
@@ -1655,6 +1667,9 @@ impl<'a> Executor<'a> {
                 }
                 if !meta.is_dir() {
                     return Err(Error::Invalid(format!("a file named {} is in the way", path.display())));
+                }
+                if !scanned {
+                    self.not_left_alone(side, key, &path)?;
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => match fs::create_dir(&path) {
@@ -1700,26 +1715,57 @@ impl<'a> Executor<'a> {
         Ok(())
     }
 
+    /// A folder found at `key` on `side`, where the scan saw no item, is never taken for the
+    /// step's folder when Charon leaves it alone: the scan left that name out, or the name
+    /// it has on disk is excluded (by the job's patterns, or as one of Charon's own, like
+    /// its trash made during this run), however a drive that ignores case spells the step's.
+    /// Writing into it would put the other side's items where no sync looks, and the next
+    /// sync would find them gone there.
+    fn not_left_alone(&self, side: Side, key: &str, path: &Path) -> Result<()> {
+        let folder = Keys::parent(key).map(|parent| self.spellings.disk(side, parent));
+        let excluded = |name: &String| {
+            let disk = match &folder {
+                Some(folder) => format!("{folder}/{name}"),
+                None => name.clone(),
+            };
+            self.filter.excludes(&Keys::normalize(&disk))
+        };
+        if self.spellings.snapshot(side).leaves_alone(key) || self.listed_names(side, key).is_some_and(|names| names.iter().any(excluded)) {
+            return Err(Error::Invalid(format!(
+                "{} is a folder Charon leaves alone (excluded, or kept for Charon's own use), so Charon doesn't write into it",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Whether the folder that holds `key` on `side` lists a name with `key`'s name. A
     /// folder that can't be listed counts as listing it.
     fn listed(&self, side: Side, key: &str) -> bool {
+        self.listed_names(side, key).is_none_or(|names| !names.is_empty())
+    }
+
+    /// The names, as written on disk, in the folder that holds `key` on `side` whose key is
+    /// `key`'s name. `None` when the folder can't be listed.
+    fn listed_names(&self, side: Side, key: &str) -> Option<Vec<String>> {
         let path = self.path(side, key);
-        let Some(folder) = path.parent() else { return true };
+        let folder = path.parent()?;
         let items = match fs::read_dir(folder) {
             Ok(items) => items,
             Err(e) => {
                 log::info!("couldn't list {}: {e}", folder.display());
-                return true;
+                return None;
             }
         };
         let name = Keys::name(key);
+        let mut names = Vec::new();
         for item in items {
-            let Ok(item) = item else { return true };
-            if item.file_name().to_str().is_some_and(|listed| self.spellings.key_for(listed) == name) {
-                return true;
+            let item = item.ok()?;
+            if let Some(listed) = item.file_name().to_str().filter(|listed| self.spellings.key_for(listed) == name) {
+                names.push(listed.to_string());
             }
         }
-        false
+        Some(names)
     }
 
     // ---------------------------------------------------------------- conflict names
@@ -2109,6 +2155,33 @@ mod tests {
         assert!(executor.may_answer_from_cache(Side::Destination, Duration::from_secs(5)));
         assert!(!executor.may_answer_from_cache(Side::Destination, Duration::from_secs(120)));
         assert!(!executor.may_answer_from_cache(Side::Source, Duration::from_secs(5)));
+    }
+
+    /// A folder already at the place of a new one is only taken for it when Charon doesn't
+    /// leave it alone: never a folder the scan left out, one whose name the drive keeps for
+    /// itself, one the job excludes, or Charon's own trash made during the run.
+    #[test]
+    fn a_folder_charon_leaves_alone_is_never_written_into() {
+        let (_tmp, shores) = shores();
+        let source = Snapshot::new();
+        let mut destination = Snapshot::new();
+        destination.leave_out("lost+found".into(), Some("lost+found"), "named like a folder drives keep for themselves, so Charon leaves it alone");
+        destination.reserve(".Trashes", ".Trashes");
+        let cancel = AtomicBool::new(false);
+        let filter = ExcludeFilter::new(&["Entw\u{fc}rfe".to_string()], true).unwrap();
+        let executor = Executor::new(&shores, &source, &destination, KEEP, &cancel).excluding(filter);
+        // "Entwürfe" and ".charon-trash" weren't there at the scan: the person made the one,
+        // and the run made the other, for something it replaced.
+        let left_alone = ["lost+found", ".Trashes", "Entw\u{fc}rfe", crate::scan::TRASH_FOLDER];
+        for name in left_alone.iter().chain(&["photos"]) {
+            fs::create_dir(shores.source.join(name)).unwrap();
+            fs::create_dir(shores.destination.join(name)).unwrap();
+        }
+        for name in left_alone {
+            assert!(matches!(executor.create_dir(Side::Destination, name), Err(Error::Invalid(_))), "{name}");
+        }
+        // A folder that is simply new since the scan is the person's own: it's taken.
+        assert!(matches!(executor.create_dir(Side::Destination, "photos"), Ok(Done::Created)));
     }
 
     #[test]

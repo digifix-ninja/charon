@@ -48,6 +48,13 @@ pub fn is_legacy_partial(name: &str) -> bool {
     name.ends_with(PARTIAL_SUFFIX)
 }
 
+/// Whether `name` is the name of one of Charon's own folders written in other upper and
+/// lower case (`.Charon-Trash`). On a drive that ignores case, such an item is where
+/// Charon's own folder goes; wherever keys are folded, it has that folder's key.
+pub fn is_charon_folder_in_other_case(name: &str) -> bool {
+    name != TRASH_FOLDER && name != MARKER_FOLDER && [TRASH_FOLDER, MARKER_FOLDER].contains(&Keys::fold(name).as_str())
+}
+
 /// Files the operating system scatters into folders by itself (Finder and Explorer
 /// settings, thumbnail caches, custom folder icons, macOS metadata on non-Mac drives).
 /// They never keep a folder from being removed: when everything else in a folder is gone,
@@ -81,16 +88,24 @@ pub fn is_system_folder(name: &str) -> bool {
 /// Patterns without a `/` match an item's name anywhere in the tree (`node_modules`,
 /// `*.tmp`); patterns with a `/` match its path from the folder's root (`build/cache`). A
 /// pattern starting with `/` only matches from the root (`/Photos Library`).
+///
+/// When keys are folded (one of the drives ignores upper and lower case), patterns match
+/// the folded key, built the same way as the plan's keys (see `Keys::fold`): every letter
+/// then counts the same in either case, "ü" and "Ü" as much as "a" and "A". An item and
+/// its other spelling on the other side have one key, so a pattern leaves out both or
+/// neither, and Charon never writes into a folder the person excluded on the other side.
 #[derive(Debug, Clone)]
 pub struct ExcludeFilter {
     names: GlobSet,
     paths: GlobSet,
+    /// Patterns match folded keys (see `Keys::fold`).
+    folded: bool,
 }
 
 impl ExcludeFilter {
     /// Builds a filter from the job's patterns. Charon's own files are always excluded.
-    /// `ignore_case`: one of the drives ignores upper and lower case, so patterns do too.
-    pub fn new(patterns: &[String], ignore_case: bool) -> Result<Self> {
+    /// `folded`: one of the drives ignores upper and lower case, so patterns do too.
+    pub fn new(patterns: &[String], folded: bool) -> Result<Self> {
         let mut names = GlobSetBuilder::new();
         let mut paths = GlobSetBuilder::new();
         for pattern in patterns {
@@ -103,10 +118,8 @@ impl ExcludeFilter {
             if body.is_empty() {
                 continue;
             }
-            let glob = GlobBuilder::new(&body)
-                .case_insensitive(ignore_case)
-                .build()
-                .map_err(|_| Error::Pattern(pattern.into()))?;
+            let body = if folded { Keys::fold(&body) } else { body };
+            let glob = GlobBuilder::new(&body).build().map_err(|_| Error::Pattern(pattern.into()))?;
             if anchored || body.contains('/') {
                 paths.add(glob);
             } else {
@@ -116,7 +129,22 @@ impl ExcludeFilter {
         Ok(Self {
             names: names.build().map_err(|e| Error::Pattern(e.to_string()))?,
             paths: paths.build().map_err(|e| Error::Pattern(e.to_string()))?,
+            folded,
         })
+    }
+
+    /// Checks that every pattern works whether or not the job's drives ignore case (a
+    /// pattern is folded for drives that do, which can change what it says).
+    pub fn check(patterns: &[String]) -> Result<()> {
+        Self::new(patterns, false)?;
+        Self::new(patterns, true)?;
+        Ok(())
+    }
+
+    /// Whether patterns match folded keys: one of the job's drives ignores upper and lower
+    /// case, and keys are folded for both sides.
+    pub fn folds(&self) -> bool {
+        self.folded
     }
 
     /// A filter that only hides Charon's own files.
@@ -129,10 +157,18 @@ impl ExcludeFilter {
         format!("/{}", globset::escape(path.trim_matches('/')))
     }
 
-    /// Whether the item at `path` (relative, `/`-separated) is left alone.
+    /// Whether the item at `path` (relative, `/`-separated, NFC) is left alone.
     pub fn excludes(&self, path: &str) -> bool {
-        let name = path.rsplit('/').next().unwrap_or(path);
-        Self::is_internal(path, name) || Self::is_apple_double(name) || self.names.is_match(name) || self.paths.is_match(path)
+        let name = Keys::name(path);
+        if Self::is_internal(path, name) || Self::is_apple_double(name) {
+            return true;
+        }
+        if self.folded {
+            let key = Keys::fold(path);
+            self.names.is_match(Keys::name(&key)) || self.paths.is_match(&key)
+        } else {
+            self.names.is_match(name) || self.paths.is_match(path)
+        }
     }
 
     /// On a Mac, `._report.pdf` next to `report.pdf` on a drive that isn't a Mac drive
@@ -205,6 +241,39 @@ mod tests {
         assert!(!filter(&["*.TMP"]).excludes("a/notes.tmp"));
     }
 
+    /// Keys fold every letter, so patterns must too: otherwise "ENTWÜRFE" would be synced
+    /// into the folder "Entwürfe" the person excluded, which a drive that ignores case
+    /// takes for the same folder.
+    #[test]
+    fn folded_patterns_ignore_the_case_of_every_letter() {
+        let patterns = ["Entw\u{fc}rfe", "R\u{e9}sum\u{e9}*", "/Fotos/\u{c4}lter"].map(String::from);
+        let folded = ExcludeFilter::new(&patterns, true).unwrap();
+        for spelling in ["Entw\u{fc}rfe", "ENTW\u{dc}RFE", "entw\u{fc}rfe", "notes/ENTW\u{dc}RFE"] {
+            assert!(folded.excludes(spelling), "{spelling}");
+        }
+        assert!(folded.excludes("R\u{c9}SUM\u{c9}.pdf"));
+        assert!(folded.excludes("FOTOS/\u{e4}LTER"), "anchored patterns too");
+        assert!(!folded.excludes("old/Fotos/\u{c4}lter"), "and they stay anchored");
+        assert!(!folded.excludes("Entw\u{fc}rfe.txt"));
+        assert!(!folded.excludes("Lebenslauf.pdf"));
+        let decomposed = ExcludeFilter::new(&["Re\u{301}sume\u{301}*".to_string()], true).unwrap();
+        assert!(decomposed.excludes("R\u{c9}SUM\u{c9}.pdf"), "a pattern typed decomposed");
+
+        let exact = ExcludeFilter::new(&patterns, false).unwrap();
+        assert!(exact.excludes("Entw\u{fc}rfe"));
+        assert!(!exact.excludes("ENTW\u{dc}RFE"), "drives that tell case apart keep the names apart");
+    }
+
+    #[test]
+    fn a_pattern_must_work_in_both_cases() {
+        let fine = ["*.TMP", "[A-Z]*", "Entw\u{fc}rfe"].map(String::from);
+        assert!(ExcludeFilter::check(&fine).is_ok());
+        // From Z to a is a range; folded it would run backwards, from z to a.
+        let backwards = ["[Z-a]".to_string()];
+        assert!(ExcludeFilter::new(&backwards, false).is_ok());
+        assert!(matches!(ExcludeFilter::check(&backwards), Err(Error::Pattern(_))));
+    }
+
     #[test]
     fn drive_folders_are_known() {
         assert!(is_system_folder("System Volume Information"));
@@ -244,5 +313,16 @@ mod tests {
         assert!(!f.excludes("docs/.charon-notes.part"));
         assert!(!f.excludes("docs/.charon-trash-notes.txt"));
         assert!(!f.excludes("docs/.charon.txt"));
+    }
+
+    #[test]
+    fn charons_folder_names_are_told_in_other_case() {
+        assert!(is_charon_folder_in_other_case(".Charon-Trash"));
+        assert!(is_charon_folder_in_other_case(".CHARON"));
+        assert!(is_charon_folder_in_other_case(".charon-tra\u{17f}h"), "the long s is an s where case is folded");
+        assert!(!is_charon_folder_in_other_case(TRASH_FOLDER), "Charon's own names as they are written");
+        assert!(!is_charon_folder_in_other_case(MARKER_FOLDER));
+        assert!(!is_charon_folder_in_other_case(".Charon-Notes"));
+        assert!(!is_charon_folder_in_other_case("Charon"));
     }
 }

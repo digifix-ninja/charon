@@ -12,7 +12,7 @@ impl Engine {
     /// person's OK.
     pub fn add_job(&self, mut setup: JobSetup) -> Result<JobView> {
         setup.validate()?;
-        ExcludeFilter::new(&setup.excludes, false)?;
+        ExcludeFilter::check(&setup.excludes)?;
         let job = Job::new(setup);
         let id = job.id.clone();
         let automation = job.setup.full_automation;
@@ -38,7 +38,7 @@ impl Engine {
     /// Charon forget what it remembers of the last sync.
     pub fn update_job(&self, id: &JobId, mut setup: JobSetup) -> Result<JobView> {
         setup.validate()?;
-        ExcludeFilter::new(&setup.excludes, false)?;
+        ExcludeFilter::check(&setup.excludes)?;
         let (old, name) = {
             let state = self.state();
             let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
@@ -187,7 +187,7 @@ impl Engine {
             return Err(Error::Invalid("Choose a place inside the job's folders.".into()));
         }
         let pattern = ExcludeFilter::pattern_for(path);
-        ExcludeFilter::new(std::slice::from_ref(&pattern), false)?;
+        ExcludeFilter::check(std::slice::from_ref(&pattern))?;
         let name = self.stored_job(id)?.setup.name;
         self.with_job_at_rest(id, &format!("Wait until “{name}” finishes syncing."), |state, rt| {
             let job = state.jobs.iter_mut().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;

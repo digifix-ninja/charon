@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Progress, ReviewKind, RunSummary};
 use crate::plan::{Action, Baseline, NoteKind, Side};
 use crate::run::{Care, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
-use crate::scan::never_download_on_this_thread;
+use crate::scan::{never_download_on_this_thread, ExcludeFilter};
 use crate::store::{Landings, Memory};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -388,7 +388,7 @@ impl Engine {
         let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving, two_way };
         let observer = |progress: &Progress| self.report_progress(id, progress);
         let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
-        let executor = Executor::new(&shores, &survey.source, &survey.destination, care, cancel);
+        let executor = Executor::new(&shores, &survey.source, &survey.destination, care, cancel).excluding(survey.filter.clone());
         let mut outcome = executor.run(&survey.plan, &mut meter);
 
         // The housekeeping the list named, only after a run that went all the way.
@@ -864,6 +864,7 @@ impl Survey {
             source: Default::default(),
             destination: Default::default(),
             folded: false,
+            filter: ExcludeFilter::none(),
             markers: Markers { source: Found::Missing, destination: Found::Missing },
             memory: None,
             trusted: false,

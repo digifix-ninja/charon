@@ -477,6 +477,63 @@ mod tests {
         assert_eq!(dst.spelling("invoices/a.pdf"), "Invoices/a.pdf", "the destination keeps its own spelling");
     }
 
+    /// A pipe on the destination where the source has a file: no copy is planned into its
+    /// place (it would fail on every sync and hold back every removal there), and the
+    /// removal the source asks for still goes ahead.
+    #[test]
+    fn a_left_out_item_keeps_its_name_out_of_the_plan_and_nothing_else() {
+        let kept = file(1, 10_000);
+        let gone = file(2, 10_000);
+        let b = base(&[("keep.txt", kept), ("gone.txt", gone)]);
+        let src = snap(&[("keep.txt", kept), ("channel", file(4, 20_000))]);
+        let mut dst = snap(&[("keep.txt", kept), ("gone.txt", gone)]);
+        dst.leave_out("channel".into(), Some("channel"), "isn't a file or a folder (a socket, pipe or device)");
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &b);
+        assert_eq!(plan.actions, vec![Action::delete(Side::Destination, "gone.txt", gone, None)]);
+        assert_eq!(plan.notes.len(), 1, "one note for the name: {:?}", plan.notes);
+        assert_eq!((plan.notes[0].kind, plan.notes[0].side, plan.notes[0].path.as_str()), (NoteKind::LeftOut, Some(Side::Destination), "channel"));
+    }
+
+    /// A Windows junction where the other side has a real folder: the folder and everything
+    /// in it stay as they are, on both sides. Without the junction's contents in the scan,
+    /// they would otherwise look removed on the Windows side.
+    #[test]
+    fn a_folder_whose_name_is_left_out_on_the_other_side_is_neither_filled_nor_emptied() {
+        let song = file(9, 10_000);
+        let b = base(&[("music", Entry::dir()), ("music/song.mp3", song)]);
+        let src = snap(&[("music", Entry::dir()), ("music/song.mp3", song), ("music/new.mp3", file(3, 20_000))]);
+        let mut dst = snap(&[]);
+        dst.leave_out("music".into(), Some("music"), "is a link or junction; Charon leaves those alone on Windows");
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        let after = Baseline::after_run(&b, &src, &dst, &plan, &[]);
+        assert_eq!(after.get("music/song.mp3"), b.get("music/song.mp3"), "the record stays for when the folder is back");
+    }
+
+    /// The source tells upper and lower case apart and holds the person's own folder
+    /// ".CHARON-TRASH"; the destination ignores case and holds Charon's trash. Nothing of the
+    /// person's folder goes into the trash, and nothing in it is taken for removed. (A scan
+    /// with folded keys leaves such a folder out itself; the plan leaves it alone anyway.)
+    #[test]
+    fn a_name_differing_only_in_case_from_charons_trash_is_left_alone() {
+        let notes = file(1, 10_000);
+        let mut src = snap(&[(".CHARON-TRASH", Entry::dir()), (".CHARON-TRASH/notes.txt", notes), ("a.txt", notes)]);
+        let mut dst = snap(&[("a.txt", notes)]);
+        dst.reserve(".charon-trash", ".charon-trash");
+        src.fold();
+        dst.fold();
+        let b = base(&[("a.txt", notes)]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert_eq!(plan.notes.len(), 1, "{:?}", plan.notes);
+        let note = &plan.notes[0];
+        assert_eq!((note.kind, note.side, note.path.as_str()), (NoteKind::LeftOut, Some(Side::Source), ".CHARON-TRASH"));
+        assert!(note.reason.contains("“.charon-trash” on the destination"), "{}", note.reason);
+        // Without a name like it on the other side, a reserved name needs no note.
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&dst, &dst, &b);
+        assert!(plan.notes.is_empty() && plan.actions.is_empty());
+    }
+
     #[test]
     fn excluded_items_keep_a_removed_folder() {
         let b = base(&[("f", Entry::dir()), ("f/a.txt", file(1, 10_000))]);

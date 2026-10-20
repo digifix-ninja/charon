@@ -155,6 +155,8 @@ pub(crate) struct Survey {
     pub destination: Snapshot,
     /// Whether keys ignore upper and lower case (one of the drives does).
     pub folded: bool,
+    /// The job's exclude filter, as the scans used it.
+    pub filter: ExcludeFilter,
     /// The job's markers in both folders, read before the scans. A sync records nothing
     /// unless they are still the same when it's done.
     pub markers: Markers,
@@ -474,6 +476,7 @@ impl Engine {
             source,
             destination,
             folded,
+            filter,
             markers,
             memory,
             trusted,

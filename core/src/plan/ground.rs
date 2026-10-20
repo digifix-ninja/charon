@@ -3,14 +3,15 @@
 
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::scan::{Entry, EntryKind, Keys, Snapshot, Volume};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
 pub(crate) struct Ground<'a> {
     source: &'a Snapshot,
     destination: &'a Snapshot,
     /// Places nothing may touch on either side: unreadable on one side, names written two
-    /// ways, items the receiving drive can't hold. Everything inside them is off-limits too.
+    /// ways, names one side leaves out, items the receiving drive can't hold. Everything
+    /// inside them is off-limits too.
     frozen: BTreeSet<String>,
     /// Places a planning decision put off-limits (a file meeting a folder), with everything inside.
     blocked: BTreeSet<String>,
@@ -30,7 +31,16 @@ impl<'a> Ground<'a> {
             }
             for skipped in snapshot.skipped() {
                 plan.note(NoteKind::LeftOut, Some(side), skipped.path.clone(), skipped.reason.clone());
+                // Its name is left alone on both sides, under this one note: a copy into its
+                // place would fail on every sync and hold back every removal on that side.
+                if let Some(key) = &skipped.key {
+                    ground.frozen.insert(key.clone());
+                }
             }
+        }
+        for (side, key, reason) in ground.taken_for_reserved() {
+            plan.note(NoteKind::LeftOut, Some(side), ground.side(side).spelling(&key), reason);
+            ground.frozen.insert(key);
         }
         for &to in receiving {
             for (key, reason) in ground.unholdable(to) {
@@ -45,6 +55,38 @@ impl<'a> Ground<'a> {
     /// The same ground, without notes (for working out a baseline).
     pub fn quiet(source: &'a Snapshot, destination: &'a Snapshot, receiving: &[Side]) -> Self {
         Self::new(source, destination, receiving, &mut Plan::default())
+    }
+
+    /// Items on either side whose key is a name one of the sides keeps for Charon's or the
+    /// drive's own use (see `Snapshot::reserved`), with the side they are on and the reason
+    /// they are left alone. Such names are matched as they are written, so the same name
+    /// written another way has the key of the one kept, and a drive that ignores case would
+    /// take it for that one. The scans already leave out the names of Charon's folders and
+    /// the drive's in other upper and lower case; this catches any other spelling of a name
+    /// one side keeps.
+    fn taken_for_reserved(&self) -> Vec<(Side, String, String)> {
+        let mut reserved: BTreeMap<&String, (Side, &String)> = BTreeMap::new();
+        for side in [Side::Source, Side::Destination] {
+            for (key, disk) in self.side(side).reserved() {
+                reserved.entry(key).or_insert((side, disk));
+            }
+        }
+        let mut found = Vec::new();
+        for (key, (side, disk)) in reserved {
+            if self.is_frozen(key) {
+                continue;
+            }
+            for holder in [Side::Source, Side::Destination] {
+                if self.side(holder).contains(key) {
+                    let reason = format!(
+                        "left out: its name differs only in upper and lower case from “{disk}” on the {}, a name Charon or the drive keeps for itself",
+                        side.word()
+                    );
+                    found.push((holder, key.clone(), reason));
+                }
+            }
+        }
+        found
     }
 
     /// Items on the other side that side `to`'s drive can't hold: names it can't take, files
@@ -215,6 +257,30 @@ mod tests {
         assert!(!ground.is_off_limits("fine.txt"));
         assert_eq!(plan.notes.len(), 2, "{:?}", plan.notes);
         assert!(plan.notes.iter().all(|n| n.kind == NoteKind::LeftOut && n.reason.starts_with("left out: an earlier sync found that")));
+    }
+
+    #[test]
+    fn a_name_left_out_on_one_side_is_off_limits_on_both_under_one_note() {
+        let source = snap(
+            &[
+                ("channel", Entry::file(1, 1)),
+                ("music", Entry::dir()),
+                ("music/a.mp3", Entry::file(1, 1)),
+                ("fine.txt", Entry::file(1, 1)),
+            ],
+            FsKind::Ext,
+        );
+        let mut destination = snap(&[], FsKind::Ext);
+        destination.leave_out("channel".into(), Some("channel"), "isn't a file or a folder (a socket, pipe or device)");
+        destination.leave_out("music".into(), Some("music"), "is a link or junction; Charon leaves those alone on Windows");
+        destination.leave_out("b\u{fffd}d".into(), None, "its name isn't valid Unicode, so Charon can't carry it");
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Source, Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("channel"));
+        assert!(ground.is_off_limits("music/a.mp3"), "with everything inside");
+        assert!(!ground.is_off_limits("fine.txt"));
+        assert_eq!(plan.notes.len(), 3, "one note for each item left out: {:?}", plan.notes);
+        assert!(plan.notes.iter().all(|n| n.kind == NoteKind::LeftOut && n.side == Some(Side::Destination)));
     }
 
     #[test]

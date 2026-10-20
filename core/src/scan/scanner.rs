@@ -5,7 +5,8 @@
 use crate::error::{Error, Result};
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Skipped, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_clutter, is_legacy_partial, is_partial, is_system_folder, Entry, ExcludeFilter, Keys, RootId, Snapshot, Volume, MARKER_FOLDER,
+    TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -79,7 +80,7 @@ impl<'a> Scanner<'a> {
                 if file_type.is_dir() {
                     walker.skip_current_dir();
                 }
-                Self::leave_out(root, item.path(), "its name isn't valid Unicode, so Charon can't carry it", &mut snapshot);
+                Self::leave_out_unnamed(root, item.path(), "its name isn't valid Unicode, so Charon can't carry it", &mut snapshot);
                 continue;
             };
             let key = Keys::normalize(&disk);
@@ -89,16 +90,18 @@ impl<'a> Scanner<'a> {
                 if file_type.is_dir() {
                     walker.skip_current_dir();
                 }
-                // Below the top of a drive it's the person's own item, only named like one
-                // of the drive's folders: left alone too, and said so.
-                if !drive_top {
-                    snapshot.facts_mut().skipped.push(Skipped {
-                        path: disk,
-                        reason: "named like a folder drives keep for themselves, so Charon leaves it alone".into(),
-                    });
+                // At the top of a drive it's the drive's own. Below the top it's the person's
+                // own item, only named like one of the drive's folders: left alone too, and
+                // said so.
+                if drive_top {
+                    snapshot.reserve(&key, &disk);
+                } else {
+                    snapshot.leave_out(disk, Some(&key), "named like a folder drives keep for themselves, so Charon leaves it alone");
                 }
                 continue;
             }
+            // When keys are folded, the filter matches the folded key: every spelling of a
+            // name is excluded alike, on both sides.
             if self.filter.excludes(&key) {
                 if file_type.is_dir() {
                     walker.skip_current_dir();
@@ -112,34 +115,46 @@ impl<'a> Scanner<'a> {
                             snapshot.facts_mut().partials.push((disk.clone(), Entry::file(meta.len(), Self::modified_ms(&meta)).changed_at(changed)));
                         }
                         if is_legacy_partial(name) {
-                            snapshot.facts_mut().skipped.push(Skipped {
-                                path: disk.clone(),
-                                reason: "named like a half-copied file of Charon 0.2, so Charon doesn't sync it (if it's yours, rename it)".into(),
-                            });
+                            snapshot.leave_out(
+                                disk,
+                                Some(&key),
+                                "named like a half-copied file of Charon 0.2, so Charon doesn't sync it (if it's yours, rename it)",
+                            );
+                        } else {
+                            snapshot.reserve(&key, &disk);
+                            snapshot.occupy_folders_of(&key);
                         }
-                        snapshot.occupy_folders_of(&key);
                     } else if is_partial(name) {
                         // A folder or link only named like a file Charon is copying.
-                        snapshot.facts_mut().skipped.push(Skipped {
-                            path: disk.clone(),
-                            reason: "named like a file Charon is copying, so Charon leaves it alone (if it's yours, rename it)".into(),
-                        });
-                        snapshot.occupy_folders_of(&key);
+                        snapshot.leave_out(disk, Some(&key), "named like a file Charon is copying, so Charon leaves it alone (if it's yours, rename it)");
                     } else if (name == MARKER_FOLDER || name == TRASH_FOLDER) && !Self::looks_like_charons(item.path(), name, file_type.is_dir()) {
                         // The person's own item, only named like one of Charon's folders:
                         // left alone, and said so.
-                        snapshot.facts_mut().skipped.push(Skipped {
-                            path: disk.clone(),
-                            reason: "named like one of Charon's own folders, so Charon leaves it alone".into(),
-                        });
-                        snapshot.occupy_folders_of(&key);
-                    } else if Keys::parent(&key).is_some() {
-                        // Another job's trash or marker inside this folder: never removed.
-                        snapshot.occupy_folders_of(&key);
+                        snapshot.leave_out(disk, Some(&key), "named like one of Charon's own folders, so Charon leaves it alone");
+                    } else {
+                        snapshot.reserve(&key, &disk);
+                        if Keys::parent(&key).is_some() {
+                            // Another job's trash or marker inside this folder: never removed.
+                            snapshot.occupy_folders_of(&key);
+                        }
                     }
                 } else if !is_clutter(name) {
                     snapshot.occupy_folders_of(&key);
                 }
+                continue;
+            }
+            if self.filter.folds() && is_charon_folder_in_other_case(name) {
+                // Where a drive ignores case, Charon's own folder is this item, and on the
+                // other side its key is that folder's: synced, the other side's copy would
+                // become Charon's folder there. Left alone on both sides, and said so.
+                if file_type.is_dir() {
+                    walker.skip_current_dir();
+                }
+                snapshot.leave_out(
+                    disk,
+                    Some(&key),
+                    "named like one of Charon's own folders, only in other upper and lower case (one of the drives doesn't tell them apart), so Charon leaves it alone",
+                );
                 continue;
             }
             if cfg!(windows) {
@@ -147,8 +162,7 @@ impl<'a> Scanner<'a> {
                     if file_type.is_dir() {
                         walker.skip_current_dir();
                     }
-                    snapshot.facts_mut().skipped.push(Skipped { path: disk, reason: format!("{reason}, which Windows can't handle safely") });
-                    snapshot.occupy_folders_of(&key);
+                    snapshot.leave_out(disk, Some(&key), format!("{reason}, which Windows can't handle safely"));
                     continue;
                 }
             }
@@ -176,8 +190,7 @@ impl<'a> Scanner<'a> {
             } else if file_type.is_symlink() {
                 Self::add_link(&mut snapshot, item.path(), key, disk);
             } else {
-                snapshot.facts_mut().skipped.push(Skipped { path: disk, reason: "isn't a file or a folder (a socket, pipe or device)".into() });
-                snapshot.occupy_folders_of(&key);
+                snapshot.leave_out(disk, Some(&key), "isn't a file or a folder (a socket, pipe or device)");
             }
         }
         if let Some(counter) = self.counter {
@@ -329,14 +342,13 @@ impl<'a> Scanner<'a> {
 
     #[cfg(not(unix))]
     fn add_link(snapshot: &mut Snapshot, _path: &Path, key: String, disk: String) {
-        snapshot.facts_mut().skipped.push(Skipped { path: disk, reason: "is a link or junction; Charon leaves those alone on Windows".into() });
-        snapshot.occupy_folders_of(&key);
+        snapshot.leave_out(disk, Some(&key), "is a link or junction; Charon leaves those alone on Windows");
     }
 
     /// An item that can't be named: noted, and its folder is kept.
-    fn leave_out(root: &Path, path: &Path, reason: &str, snapshot: &mut Snapshot) {
+    fn leave_out_unnamed(root: &Path, path: &Path, reason: &str, snapshot: &mut Snapshot) {
         let shown = path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned();
-        snapshot.facts_mut().skipped.push(Skipped { path: shown, reason: reason.into() });
+        snapshot.leave_out(shown, None, reason);
         let parent = path.parent().and_then(|p| Self::relative(root, p)).map(|p| Keys::normalize(&p));
         if let Some(parent) = parent {
             snapshot.occupy(&parent);
@@ -599,6 +611,77 @@ mod tests {
         assert!(s.get("Notes.pdf").is_some());
         let s = scan(tmp.path(), &["Re\u{301}sume\u{301}*"]);
         assert!(s.get("R\u{e9}sum\u{e9}.pdf").is_none(), "and the other way round");
+    }
+
+    /// On a drive that tells case apart, "ENTWÜRFE" is a folder of its own; when the other
+    /// drive ignores case, it is the excluded "Entwürfe" there, and must be excluded here too.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_folded_filter_leaves_out_every_spelling_of_an_excluded_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("ENTW\u{dc}RFE/plan.txt"), "x");
+        write(&tmp.path().join("R\u{c9}SUM\u{c9}.pdf"), "x");
+        write(&tmp.path().join("notes.txt"), "x");
+        let patterns = ["Entw\u{fc}rfe", "R\u{e9}sum\u{e9}*"].map(String::from);
+        let folded = ExcludeFilter::new(&patterns, true).unwrap();
+        let mut s = Scanner::new(&folded).scan(tmp.path(), Volume::of(tmp.path())).unwrap();
+        s.fold();
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["notes.txt"]);
+        let exact = ExcludeFilter::new(&patterns, false).unwrap();
+        let s = Scanner::new(&exact).scan(tmp.path(), Volume::of(tmp.path())).unwrap();
+        assert!(s.contains("ENTW\u{dc}RFE/plan.txt"), "where both drives tell case apart, so do patterns");
+    }
+
+    #[test]
+    fn names_kept_for_charons_own_use_are_remembered() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".charon-trash/2026-01-01_00-00-00/a.txt"), "x");
+        write(&tmp.path().join("inner/.charon/job.json"), "{}");
+        write(&tmp.path().join("a/.charon-00112233445566ff.part"), "half");
+        write(&tmp.path().join("node_modules/x.js"), "x");
+        write(&tmp.path().join("b.charon-partial/inside.txt"), "x");
+        let s = scan(tmp.path(), &["node_modules"]);
+        let reserved: Vec<&str> = s.reserved().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(reserved, vec![".charon-trash", "a/.charon-00112233445566ff.part", "inner/.charon"]);
+        assert!(s.leaves_alone("b.charon-partial"), "left out with a note");
+        assert!(!s.leaves_alone("node_modules"), "patterns match keys alike on both sides, so they need no record");
+    }
+
+    /// Where one of the drives ignores case, ".CHARON-TRASH" has the key of Charon's trash:
+    /// it's left out with a note, under that key. Where neither does, it's an item like any
+    /// other.
+    #[test]
+    fn charons_folder_names_in_other_case_are_left_out_where_keys_are_folded() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join(".CHARON-TRASH/notes.txt"), "x");
+        write(&tmp.path().join("inner/.Charon/settings.txt"), "x");
+        write(&tmp.path().join("photos/a.jpg"), "x");
+        let folded = ExcludeFilter::new(&[], true).unwrap();
+        let mut s = Scanner::new(&folded).scan(tmp.path(), Volume::of(tmp.path())).unwrap();
+        s.fold();
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["inner", "photos", "photos/a.jpg"]);
+        assert!(s.leaves_alone(".charon-trash") && s.leaves_alone("inner/.charon"));
+        assert!(s.is_occupied("inner"), "the folder around it stays");
+        let mut left_out: Vec<&str> = s.skipped().iter().map(|skipped| skipped.path.as_str()).collect();
+        left_out.sort();
+        assert_eq!(left_out, vec![".CHARON-TRASH", "inner/.Charon"], "noted as they are written");
+        let s = scan(tmp.path(), &[]);
+        assert!(s.contains(".CHARON-TRASH/notes.txt") && s.contains("inner/.Charon/settings.txt"));
+        assert!(s.skipped().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_files_are_left_out_under_their_own_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("run")).unwrap();
+        let _socket = std::os::unix::net::UnixListener::bind(tmp.path().join("run/app.sock")).unwrap();
+        let s = scan(tmp.path(), &[]);
+        assert!(!s.contains("run/app.sock"));
+        assert!(s.leaves_alone("run/app.sock"), "nothing of its name is touched");
+        assert!(s.is_occupied("run"), "and its folder stays");
+        assert_eq!(s.skipped().len(), 1);
+        assert_eq!(s.skipped()[0].path, "run/app.sock");
     }
 
     #[test]

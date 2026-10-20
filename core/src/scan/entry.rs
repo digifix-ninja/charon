@@ -190,6 +190,9 @@ impl Entry {
 pub struct Skipped {
     /// The path as it is on disk (shown to the person).
     pub path: String,
+    /// Its key, when its name can be read. Nothing of that name is touched on either side:
+    /// a copy into its place would fail on every sync.
+    pub key: Option<String>,
     pub reason: String,
 }
 
@@ -209,6 +212,12 @@ pub struct ScanFacts {
     pub(crate) clashes: BTreeSet<String>,
     /// Items left out (not readable as a name, special files, links on Windows).
     pub(crate) skipped: Vec<Skipped>,
+    /// Items left out without a note because their names are kept for Charon's own use
+    /// (its trash, its marker, its half-copied files) or for the drive's (its folders at the
+    /// top): key → the path as spelled on disk. Those names are matched as they are written,
+    /// not by key, so an item whose key is the same but whose name is written in another
+    /// case is left alone too, on either side.
+    pub(crate) reserved: BTreeMap<String, String>,
     /// Leftover half-copied files from an interrupted run: on-disk path, size and time.
     pub(crate) partials: Vec<(String, Entry)>,
     /// Which folder was scanned (see `RootId`).
@@ -331,6 +340,18 @@ impl Snapshot {
         &self.facts.skipped
     }
 
+    /// The items left out because their names are kept for Charon's or the drive's own use
+    /// (see `ScanFacts::reserved`): key → path as spelled on disk.
+    pub fn reserved(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.facts.reserved.iter()
+    }
+
+    /// Whether the scan left out an item with the key `key` here: with a note (see
+    /// `skipped`), or because its name is kept for Charon's or the drive's own use.
+    pub fn leaves_alone(&self, key: &str) -> bool {
+        self.facts.reserved.contains_key(key) || self.facts.skipped.iter().any(|skipped| skipped.key.as_deref() == Some(key))
+    }
+
     /// Leftover half-copied files: on-disk path and what they looked like.
     pub fn partials(&self) -> &[(String, Entry)] {
         &self.facts.partials
@@ -413,6 +434,12 @@ impl Snapshot {
         self.facts.occupied = std::mem::take(&mut self.facts.occupied).iter().map(|key| Keys::fold(key)).collect();
         self.facts.clashes = std::mem::take(&mut self.facts.clashes).iter().map(|key| Keys::fold(key)).collect();
         self.facts.refused = std::mem::take(&mut self.facts.refused).into_iter().map(|(key, why)| (Keys::fold(&key), why)).collect();
+        for (key, disk) in std::mem::take(&mut self.facts.reserved) {
+            self.facts.reserved.entry(Keys::fold(&key)).or_insert(disk);
+        }
+        for skipped in &mut self.facts.skipped {
+            skipped.key = skipped.key.as_deref().map(Keys::fold);
+        }
         for twin in twins {
             self.freeze(&twin, "another item in this folder has the same name in different upper/lower case, and one of the drives can't hold both, so Charon leaves them alone");
             self.facts.clashes.insert(twin);
@@ -434,6 +461,21 @@ impl Snapshot {
         self.facts.frozen.entry(key.to_string()).or_insert_with(|| reason.into());
         self.occupy_folders_of(key);
         self.facts.occupied.insert(key.to_string());
+    }
+
+    /// Notes an item the scan leaves out, with the reason (`disk`: its path as spelled on
+    /// disk; `key`: its key, when its name can be read). Its folders can't be removed.
+    pub(crate) fn leave_out(&mut self, disk: String, key: Option<&str>, reason: impl Into<String>) {
+        if let Some(key) = key {
+            self.occupy_folders_of(key);
+        }
+        self.facts.skipped.push(Skipped { path: disk, key: key.map(str::to_string), reason: reason.into() });
+    }
+
+    /// Notes an item left out because its name is kept for Charon's or the drive's own use
+    /// (see `ScanFacts::reserved`).
+    pub(crate) fn reserve(&mut self, key: &str, disk: &str) {
+        self.facts.reserved.insert(key.to_string(), disk.to_string());
     }
 
     /// Marks `folder` (and the folders around it) as holding something Charon leaves alone.
@@ -534,6 +576,21 @@ mod tests {
         assert!(s.frozen("readme.md").is_some());
         assert!(s.is_clash("readme.md"));
         assert_eq!(s.key_for("PHOTOS/a.JPG"), "photos/a.jpg");
+    }
+
+    #[test]
+    fn folding_keeps_what_the_scan_left_out_under_its_folded_key() {
+        let mut s = Snapshot::new();
+        s.leave_out("Music/Channel".into(), Some("Music/Channel"), "isn't a file or a folder (a socket, pipe or device)");
+        s.leave_out("bad\u{fffd}name".into(), None, "its name isn't valid Unicode, so Charon can't carry it");
+        s.reserve(".charon-trash", ".charon-trash");
+        s.fold();
+        assert!(s.leaves_alone("music/channel"));
+        assert!(s.leaves_alone(".charon-trash"));
+        assert!(!s.leaves_alone("music"));
+        assert!(s.is_occupied("music"), "the folder around a left-out item stays");
+        assert_eq!(s.skipped()[0].path, "Music/Channel", "the note keeps the name as written");
+        assert_eq!(s.reserved().collect::<Vec<_>>(), vec![(&".charon-trash".to_string(), &".charon-trash".to_string())]);
     }
 
     #[test]
