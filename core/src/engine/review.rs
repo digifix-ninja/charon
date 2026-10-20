@@ -821,11 +821,12 @@ impl Engine {
         let look = Look::of(survey);
         let at = look.at;
         let has_work = look.has_work();
+        let needs_a_list = look.needs_a_list();
         let recorded = self.change_known_runtime(&job.id, |rt| {
             if epoch.is_some_and(|epoch| epoch != rt.epoch || rt.is_running()) {
                 return false;
             }
-            if !has_work && !held {
+            if !needs_a_list && !held {
                 rt.reminder.count = 0;
             }
             rt.problem = None;
@@ -837,7 +838,8 @@ impl Engine {
         if recorded != Some(true) {
             return false;
         }
-        // Saved only when the wait begins or ends.
+        // Saved only when the wait begins or ends. Files not compared yet aren't changes known
+        // to wait: after a restart, the row waits for a look to say what's in them.
         let since = self.stored_job(&job.id).ok().and_then(|stored| stored.waiting_since);
         let wanted = if has_work || held { since.or(Some(at)) } else { None };
         if wanted != since {
@@ -894,6 +896,7 @@ impl Look {
             not_synced,
             not_synced_count,
             volumes,
+            uncompared: survey.uncompared.len() as u64,
         }
     }
 }

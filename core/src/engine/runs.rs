@@ -917,7 +917,7 @@ impl Engine {
         let setup = &survey.setup;
         let now = Markers::read(&setup.source, &setup.destination, id);
         if let Some(side) = now.changed_since(&survey.markers) {
-            let _ = self.inner.baselines.forget(id);
+            self.forget_memory(id);
             return Err(format!(
                 "Charon's marker in the {} folder changed during the sync, so it may be another drive under the same name. \
                  Charon recorded nothing of this sync: its next look compares both folders afresh and waits for your OK.",
@@ -955,7 +955,7 @@ impl Engine {
         };
         let fail = |what: String| {
             // Without both markers and the memory, the next look starts afresh (it removes nothing).
-            let _ = self.inner.baselines.forget(id);
+            self.forget_memory(id);
             format!("The changes were synced, but Charon {what}, so it won't remember this sync: its next look compares both folders afresh and waits for your OK.")
         };
         for (side, token) in [(Side::Source, &tokens.0), (Side::Destination, &tokens.1)] {
@@ -972,6 +972,13 @@ impl Engine {
         let unsettled = found.into_iter().filter(|key| !next.contains(key)).collect();
         let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None, earlier: Default::default(), unsettled };
         self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
+    }
+
+    /// Forgets the two-way memory of the job's last sync, and the files found identical with
+    /// it (see `store::SameContents`): the next look compares both folders afresh.
+    fn forget_memory(&self, id: &JobId) {
+        let _ = self.inner.baselines.forget(id);
+        let _ = self.inner.same_contents.forget(id);
     }
 
     /// After an item was settled while Charon couldn't trust its memory (see `remember`):
@@ -1361,6 +1368,7 @@ impl Survey {
             left_for_later: Default::default(),
             agreed: 0,
             different: BTreeSet::new(),
+            uncompared: BTreeSet::new(),
             refusal: None,
             warnings: Vec::new(),
             holds: Vec::new(),

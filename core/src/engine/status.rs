@@ -78,7 +78,8 @@ impl Engine {
         // couldn't be saved to say so: the row, the tray and Sync all go by the same rule.
         let runs_by_itself = job.runs_by_itself() && !must_ask;
 
-        let work = look.as_ref().filter(|look| look.items > 0);
+        // Files a look couldn't compare yet may differ: never "In sync" while there are any.
+        let work = look.as_ref().filter(|look| look.items > 0 || look.uncompared > 0);
         // A list the person confirmed no longer waits for an OK, only for another sync to end:
         // its changes are queued (and the row says what it waits for).
         let confirmed = confirmed && !running;
@@ -91,6 +92,7 @@ impl Engine {
                 replacements: look.replacements,
                 conflicts: look.conflicts.len() as u64,
                 held: held.clone(),
+                uncompared: look.uncompared,
                 since: waiting_since.unwrap_or(look.at),
                 counted: true,
             }),
@@ -101,6 +103,7 @@ impl Engine {
                 replacements: Default::default(),
                 conflicts: look.as_ref().map_or(0, |l| l.conflicts.len() as u64),
                 held: Some(held.clone()),
+                uncompared: 0,
                 since: waiting_since.or(job.last_scheduled).unwrap_or_else(Utc::now),
                 counted: look.is_some(),
             }),
@@ -114,13 +117,14 @@ impl Engine {
                 replacements: Default::default(),
                 conflicts: 0,
                 held: None,
+                uncompared: 0,
                 since,
                 counted: false,
             }),
             _ => None,
         };
         let pending = match work {
-            Some(look) if waiting.is_none() => Some(Pending { items: look.items, bytes: look.bytes, checked_at: look.at }),
+            Some(look) if waiting.is_none() => Some(Pending { items: look.items, bytes: look.bytes, uncompared: look.uncompared, checked_at: look.at }),
             _ => None,
         };
         let conflicts = look.as_ref().map(|look| look.conflicts.clone()).unwrap_or_default();

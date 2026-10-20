@@ -342,23 +342,57 @@ fn nothing_changes_by_itself_without_full_automation() {
     assert!(!b.join("doc.txt").exists());
 }
 
+/// When the large test files were last modified: `seconds` after a fixed moment.
+fn vault_time(seconds: i64) -> filetime::FileTime {
+    filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0)
+}
+
+/// Puts “vault.hc” into each of `folders`: the same on every side, more than a background
+/// look reads (1 GiB), and taking no room. False where the drive can't hold such a file.
+fn vaults(folders: &[&Path]) -> bool {
+    for folder in folders {
+        fs::create_dir_all(folder).unwrap();
+        let vault = fs::File::create(folder.join("vault.hc")).unwrap();
+        if vault.set_len((1 << 30) + 4096).is_err() {
+            return false;
+        }
+        drop(vault);
+        filetime::set_file_mtime(folder.join("vault.hc"), vault_time(0)).unwrap();
+    }
+    true
+}
+
+/// Writes inside “vault.hc” in `folder`, keeping its size, and gives it the time `seconds`
+/// (an encrypted container may put its old time back).
+fn edit_vault(folder: &Path, seconds: i64) {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut vault = fs::OpenOptions::new().write(true).open(folder.join("vault.hc")).unwrap();
+    vault.seek(SeekFrom::Start(4096)).unwrap();
+    vault.write_all(b"secret").unwrap();
+    drop(vault);
+    filetime::set_file_mtime(folder.join("vault.hc"), vault_time(seconds)).unwrap();
+}
+
+/// Whether the drive of `folder` keeps a change time for each file: only there does a change
+/// of a file's details alone show, and only there is what a read found kept.
+fn keeps_change_times(folder: &Path) -> bool {
+    let keeps = charon_core::scan::Volume::of(folder).keeps_change_times();
+    if !keeps {
+        eprintln!("{} keeps no change times: a change of a file's details alone doesn't show there", folder.display());
+    }
+    keeps
+}
+
 /// A background look reads at most 1 GiB of files to compare them, and what it leaves
 /// unread never shows as in sync: a large file edited inside, its size the same and its
-/// time moved by a second only (an encrypted container may keep its time altogether),
-/// waits in the row for the person.
+/// time moved by a second only (an encrypted container may keep its time altogether), is
+/// not compared yet, and the row says so.
 #[test]
 fn a_large_file_a_background_look_leaves_unread_never_shows_as_in_sync() {
     let tmp = tempfile::tempdir().unwrap();
     let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
-    let at = |seconds: i64| filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0);
-    for side in [&a, &b] {
-        fs::create_dir_all(side).unwrap();
-        // More than a background look reads, taking no room.
-        let vault = fs::File::create(side.join("vault.hc")).unwrap();
-        if vault.set_len((1 << 30) + 4096).is_err() {
-            return;
-        }
-        filetime::set_file_mtime(side.join("vault.hc"), at(0)).unwrap();
+    if !vaults(&[&a, &b]) {
+        return;
     }
     let engine = engine(&data);
     let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
@@ -366,18 +400,195 @@ fn a_large_file_a_background_look_leaves_unread_never_shows_as_in_sync() {
     look(&engine, &id);
     assert_eq!(engine.job(&id).unwrap().status, JobStatus::InSync);
 
-    {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut vault = fs::OpenOptions::new().write(true).open(a.join("vault.hc")).unwrap();
-        vault.seek(SeekFrom::Start(4096)).unwrap();
-        vault.write_all(b"secret").unwrap();
-    }
-    filetime::set_file_mtime(a.join("vault.hc"), at(1)).unwrap();
+    edit_vault(&a, 1);
     look(&engine, &id);
     let view = engine.job(&id).unwrap();
-    assert!(matches!(view.status, JobStatus::Review | JobStatus::Pending), "{:?}", view.status);
-    let items = view.waiting.as_ref().map(|waiting| waiting.items).or(view.pending.as_ref().map(|pending| pending.items));
-    assert_eq!(items, Some(1));
+    assert_eq!(view.status, JobStatus::Review);
+    let waiting = view.waiting.unwrap();
+    assert_eq!((waiting.items, waiting.uncompared), (0, 1), "not compared yet, which is no change the look knows of");
+    // The list reads it: the edit crosses.
+    assert_eq!(engine.prepare_review(&id).unwrap().total_steps, 1);
+}
+
+/// A large file whose details alone changed on one side (a permission, a tag, an app noting
+/// that it was opened) isn't compared by a background look. Once a list has read it and found
+/// both sides identical, the job is in sync, also after Charon starts again: what the list
+/// found holds while neither file changes.
+#[cfg(unix)]
+#[test]
+fn a_large_file_whose_details_alone_changed_keeps_no_job_waiting_after_a_restart() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    look(&first, &id);
+    assert_eq!(first.job(&id).unwrap().status, JobStatus::InSync);
+
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    look(&first, &id);
+    let view = first.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Review, "without reading it, nothing tells what changed");
+    let waiting = view.waiting.unwrap();
+    assert_eq!((waiting.items, waiting.uncompared), (0, 1), "not compared yet, which is no change to confirm");
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+    look(&first, &id);
+    assert_eq!(first.job(&id).unwrap().status, JobStatus::InSync);
+    drop(first);
+
+    let again = engine(&data);
+    look(&again, &id);
+    assert_eq!(again.job(&id).unwrap().status, JobStatus::InSync, "the row says a change waits, and the list it opens has none");
+}
+
+/// What a list found about a large file holds only while neither side changes: an edit that
+/// keeps the file's size and time (an encrypted container does) is never taken for in sync,
+/// before or after a restart, and the list carries it.
+#[cfg(unix)]
+#[test]
+fn a_large_file_edited_after_a_list_found_it_identical_never_shows_as_in_sync() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let first = engine(&data);
+    let id = first.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&first, &id);
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(first.prepare_review(&id).unwrap().total_steps, 0, "found identical");
+
+    edit_vault(&a, 0);
+    let not_compared = |engine: &Engine| {
+        look(engine, &id);
+        let view = engine.job(&id).unwrap();
+        assert_eq!(view.status, JobStatus::Review);
+        let waiting = view.waiting.unwrap();
+        assert_eq!((waiting.items, waiting.uncompared), (0, 1));
+    };
+    not_compared(&first);
+    drop(first);
+    let again = engine(&data);
+    not_compared(&again);
+    assert_eq!(again.prepare_review(&id).unwrap().total_steps, 1, "the list reads it: the edit crosses");
+}
+
+/// A large file whose details changed on both sides is no conflict before anything has
+/// compared it: the row says it isn't compared yet.
+#[cfg(unix)]
+#[test]
+fn a_large_file_touched_on_both_sides_is_no_conflict_before_it_is_compared() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    for side in [&a, &b] {
+        fs::set_permissions(side.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Review);
+    assert!(view.conflicts.is_empty(), "{:?}", view.conflicts);
+    let waiting = view.waiting.unwrap();
+    assert_eq!((waiting.items, waiting.conflicts, waiting.uncompared), (0, 0, 1));
+}
+
+/// A large file a list read and found to differ, though it looks alike on both sides, and
+/// that was left for the person, is still a conflict for the background looks after a
+/// restart, which can't read it again: never "not compared", nor in sync.
+#[test]
+fn a_large_file_found_to_differ_and_left_for_the_person_stays_a_conflict_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) {
+        return;
+    }
+    {
+        let engine = engine(&data);
+        let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+        confirm(&engine, &id);
+    }
+    // Charon stopped in the middle of the next sync, so both folders are compared afresh,
+    // and one side's file was edited inside, its time moved by a second only.
+    let state_path = data.join("charon-state.json");
+    let text = fs::read_to_string(&state_path).unwrap();
+    fs::write(&state_path, text.replace("\"runInProgress\": false", "\"runInProgress\": true")).unwrap();
+    edit_vault(&a, 1);
+    {
+        let engine = engine(&data);
+        let id = engine.jobs()[0].job.id.clone();
+        let review = confirm(&engine, &id);
+        assert_eq!(review.tally.conflicts, 1, "the list read it and found it different");
+        assert_eq!(engine.job(&id).unwrap().status, JobStatus::Conflict);
+    }
+    let engine = engine(&data);
+    let id = engine.jobs()[0].job.id.clone();
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Conflict);
+    assert_eq!(view.conflicts.len(), 1);
+}
+
+/// A job that syncs by itself compares what its background look couldn't: the look starts a
+/// sync, which reads the file.
+#[test]
+fn a_large_file_a_background_look_leaves_unread_starts_a_sync_of_a_job_that_syncs_by_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) {
+        return;
+    }
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+    edit_vault(&a, 1);
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Pending);
+    let pending = view.pending.unwrap();
+    assert_eq!((pending.items, pending.uncompared), (0, 1));
+    assert!(engine.has_pending(&id), "its sync reads the file");
+}
+
+/// What reads found identical goes with the job's memory: when its folders or its mode
+/// change, and when it's removed.
+#[test]
+fn files_found_identical_are_forgotten_with_the_jobs_memory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for (side, seconds) in [(&a, 0), (&b, 60)] {
+        write(&side.join("same.txt"), "same");
+        filetime::set_file_mtime(side.join("same.txt"), vault_time(seconds)).unwrap();
+    }
+    if !keeps_change_times(&a) {
+        return;
+    }
+    let engine = engine(&data);
+    let two_way = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    let id = engine.add_job(two_way.clone()).unwrap().job.id;
+    let record = data.join("same-contents").join(format!("{id}.json"));
+    engine.prepare_review(&id).unwrap();
+    assert!(record.is_file(), "the list read both files and found them identical");
+
+    engine.update_job(&id, JobSetup { mode: SyncMode::Mirror, ..two_way.clone() }).unwrap();
+    assert!(!record.exists(), "the job's mode changed");
+    engine.update_job(&id, two_way).unwrap();
+    engine.prepare_review(&id).unwrap();
+    assert!(record.is_file());
+    engine.remove_job(&id).unwrap();
+    assert!(!record.exists(), "the job was removed");
 }
 
 #[test]

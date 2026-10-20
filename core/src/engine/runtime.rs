@@ -512,12 +512,22 @@ pub(crate) struct Look {
     pub not_synced: Vec<Place>,
     pub not_synced_count: u64,
     pub volumes: Option<(VolumeLabel, VolumeLabel)>,
+    /// Files a background look couldn't compare by their contents, and knows nothing about:
+    /// they may differ, so the job isn't in sync while there are any. Not among `items`: a
+    /// list reads them, and so does every run.
+    pub uncompared: u64,
 }
 
 impl Look {
     /// Whether the look found anything waiting for the person: changes or conflicts.
     pub fn has_work(&self) -> bool {
         self.items > 0 || !self.conflicts.is_empty()
+    }
+
+    /// Whether the look found anything for a list to show or settle: changes, conflicts, or
+    /// files it couldn't compare yet.
+    pub fn needs_a_list(&self) -> bool {
+        self.has_work() || self.uncompared > 0
     }
 }
 

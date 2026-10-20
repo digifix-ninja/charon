@@ -1,13 +1,14 @@
 //! What Charon keeps on disk, all inside the app's data folder.
 //!
-//! * `state_file.rs` – `StateFile`: settings and jobs (`charon-state.json`), saved atomically
-//! * `baselines.rs`  – `Baselines`: the two-way memory of each job
-//! * `landings.rs`   – `Landings`: Mirror and Backup copies whose dates didn't stick
-//! * `unattended.rs` – `Unattended`: what automatic runs changed since the last confirmed list
-//! * `absences.rs`   – `Absences`: items found missing on a share or cloud drive, and since when
-//! * `journal.rs`    – `Journal`: one activity log per job
-//! * `lock.rs`       – `DataLock`: only one Charon works with the data folder at a time
-//! * `atomic.rs`     – writing a file so a crash never leaves it half-written
+//! * `state_file.rs`    – `StateFile`: settings and jobs (`charon-state.json`), saved atomically
+//! * `baselines.rs`     – `Baselines`: the two-way memory of each job
+//! * `landings.rs`      – `Landings`: Mirror and Backup copies whose dates didn't stick
+//! * `unattended.rs`    – `Unattended`: what automatic runs changed since the last confirmed list
+//! * `absences.rs`      – `Absences`: items found missing on a share or cloud drive, and since when
+//! * `same_contents.rs` – `SameContents`: two-way pairs of files a full read found identical
+//! * `journal.rs`       – `Journal`: one activity log per job
+//! * `lock.rs`          – `DataLock`: only one Charon works with the data folder at a time
+//! * `atomic.rs`        – writing a file so a crash never leaves it half-written
 
 mod absences;
 pub(crate) mod atomic;
@@ -15,6 +16,7 @@ mod baselines;
 mod journal;
 mod landings;
 mod lock;
+mod same_contents;
 mod state_file;
 mod unattended;
 
@@ -23,6 +25,7 @@ pub use baselines::{Baselines, Memory};
 pub use journal::{Journal, LogLine};
 pub use landings::Landings;
 pub use lock::DataLock;
+pub use same_contents::SameContents;
 pub use state_file::{StateFile, StoredState};
 pub use unattended::Unattended;
 
@@ -70,6 +73,11 @@ impl DataFolder {
     /// Items found missing on a drive that may show changes late (see `Absences`).
     pub fn absences(&self) -> PathBuf {
         self.root.join("absences")
+    }
+
+    /// Two-way: pairs of files a full read found identical (see `SameContents`).
+    pub fn same_contents(&self) -> PathBuf {
+        self.root.join("same-contents")
     }
 
     pub fn logs(&self) -> PathBuf {

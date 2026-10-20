@@ -76,6 +76,9 @@ impl Progress {
 pub struct Pending {
     pub items: u64,
     pub bytes: u64,
+    /// Files the check couldn't compare by their contents yet (they may differ): the next
+    /// sync reads them. Not among `items`.
+    pub uncompared: u64,
     pub checked_at: DateTime<Utc>,
 }
 
@@ -335,6 +338,9 @@ pub struct Waiting {
     pub conflicts: u64,
     /// Why a run nobody looked at was held back for a look, if one was.
     pub held: Option<String>,
+    /// Files the last look couldn't compare by their contents yet (they may differ): the list
+    /// reads them. Not among `items`.
+    pub uncompared: u64,
     /// Since when changes have been waiting.
     pub since: DateTime<Utc>,
     /// False when the numbers above aren't known yet: changes waited for an OK when Charon

@@ -259,6 +259,8 @@ pub struct WaitingJob {
     pub removals: u64,
     /// Items changed on both sides, waiting for the person to choose.
     pub conflicts: u64,
+    /// Files the last look couldn't compare by their contents yet: the list reads them.
+    pub uncompared: u64,
     /// The job looks when its drive is connected: the person may be about to eject it.
     pub drive_connected: bool,
 }

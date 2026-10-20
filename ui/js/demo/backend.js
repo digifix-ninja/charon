@@ -431,7 +431,8 @@ export class DemoBackend {
     j.waiting = known && (!j.runsByItself || w.held) ? this.waitingOf(j, w, changes)
       : !checked && waited && !j.runsByItself ? { ...this.waitingOf(j, w, []), conflicts: 0, held: null, counted: false }
       : null;
-    j.pending = known && !j.waiting ? { items: changes.length, bytes: changes.reduce((n, s) => n + s.bytes, 0), checkedAt: now() } : null;
+    // The demo's looks compare every file, so none is left "not compared yet".
+    j.pending = known && !j.waiting ? { items: changes.length, bytes: changes.reduce((n, s) => n + s.bytes, 0), uncompared: 0, checkedAt: now() } : null;
     const places = checked && w.looked ? w.notes.filter(n => NOT_SYNCED.includes(n.kind) && n.side) : [];
     j.notSynced = places.slice(0, 100).map(({ kind, side, path, reason }) => ({ kind, side, path, reason, privacy: false }));
     j.notSyncedCount = places.length;
@@ -475,6 +476,7 @@ export class DemoBackend {
       replacements: { source: count("replace", "source"), destination: count("replace", "destination") },
       conflicts: w.steps.filter(s => s.kind === "conflict").length,
       held: w.held ?? null,
+      uncompared: 0,
       since: w.since ?? now(),
       counted: true,
     };

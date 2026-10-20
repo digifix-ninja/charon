@@ -204,13 +204,24 @@ export class Format {
   /**
    * "23 changes wait for your OK · 3 removals", or why a full-automation run was held.
    * Right after Charon starts, before its first look, it knows changes wait but not how many.
+   * Files a look couldn't compare yet aren't changes: "1 file not compared yet".
    */
   static waiting(waiting) {
     if (waiting.held) return `Held for your OK: ${waiting.held}`;
     if (waiting.counted === false) return "Changes wait for your OK";
-    const text = waiting.items === 1 ? "1 change waits for your OK" : `${Format.count(waiting.items)} changes wait for your OK`;
+    const parts = [];
+    if (waiting.items || !waiting.uncompared) {
+      parts.push(waiting.items === 1 ? "1 change waits for your OK" : `${Format.count(waiting.items)} changes wait for your OK`);
+    }
     const removals = (waiting.removals?.source || 0) + (waiting.removals?.destination || 0);
-    return removals ? `${text} · ${Format.plural(removals, "removal")}` : text;
+    if (removals) parts.push(Format.plural(removals, "removal"));
+    if (waiting.uncompared) parts.push(Format.uncompared(waiting.uncompared));
+    return parts.join(" · ");
+  }
+
+  /** "1 file not compared yet": files a look couldn't compare by their contents, which may differ. */
+  static uncompared(count) {
+    return `${Format.plural(count, "file")} not compared yet`;
   }
 
   /**

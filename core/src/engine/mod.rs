@@ -15,10 +15,11 @@
 //! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
 //! the same order, the stored state before the live state. Nothing that looks at a job's
 //! folders or tells the window happens while either is held (saving in the app's own data
-//! folder does: the state file, so a change counts only once it's saved, and what looks
-//! found missing, so two saves never come in the wrong order). What the autopilot and the
-//! rows ask about the jobs' folders is asked with a time limit (see `reach.rs`), so a share
-//! that doesn't answer holds up neither the other jobs nor the window.
+//! folder does: the state file, so a change counts only once it's saved, what looks found
+//! missing, so two saves never come in the wrong order, and the files looks found identical,
+//! so a job removed or edited meanwhile keeps nothing of its old folders). What the autopilot
+//! and the rows ask about the jobs' folders is asked with a time limit (see `reach.rs`), so a
+//! share that doesn't answer holds up neither the other jobs nor the window.
 
 mod checks;
 mod jobs;
@@ -37,7 +38,7 @@ use crate::error::{Error, Result};
 use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, UpgradeNotice, WaitingJob};
 use crate::plan::Side;
 use crate::run::BusyWatch;
-use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState, Unattended};
+use crate::store::{Absences, Baselines, DataFolder, DataLock, Journal, Landings, LogLine, SameContents, StateFile, StoredState, Unattended};
 pub(crate) use reach::{Presence, Whereabouts};
 use reach::Reach;
 pub(crate) use runtime::Moment;
@@ -93,6 +94,9 @@ struct Inner {
     unattended: Unattended,
     /// Items found missing on a drive that may show changes late (see `Missing`).
     absences: Absences,
+    /// Two-way: pairs of files a full read found identical, for the background looks after
+    /// it, even after a restart.
+    same_contents: SameContents,
     journal: Journal,
     state: Mutex<StoredState>,
     runtime: Mutex<HashMap<JobId, JobRuntime>>,
@@ -154,6 +158,7 @@ impl Engine {
                 landings: Landings::new(folder.landings()),
                 unattended: Unattended::new(folder.unattended()),
                 absences,
+                same_contents: SameContents::new(folder.same_contents()),
                 journal: Journal::new(folder.logs()),
                 state: Mutex::new(state),
                 runtime: Mutex::new(runtime),

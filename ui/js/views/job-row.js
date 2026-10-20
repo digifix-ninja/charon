@@ -102,7 +102,11 @@ export class JobRow {
         parts.push("Looking for changes…", synced);
         break;
       case "pending":
-        parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`, synced);
+        if (job.pending?.items || !job.pending?.uncompared) {
+          parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`);
+        }
+        if (job.pending?.uncompared) parts.push(html`<span class="warn">${Format.uncompared(job.pending.uncompared)}</span>`);
+        parts.push(synced);
         break;
       case "conflict": {
         // Conflicts show first, but a failed last run still says what went wrong.
