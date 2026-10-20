@@ -3,12 +3,15 @@
 //!
 //! The plan only touches the conflict's own item (and, for a folder, what's inside it), and
 //! goes through the same review and the same checks as any sync. Places Charon can't read
-//! or must leave alone stay as they are, with a note.
+//! or must leave alone stay as they are, with a note. An app library or a database (see
+//! `plan::units`) is settled as a whole: the other side's copy becomes the chosen one, file
+//! by file, and what it replaces or removes goes to .charon-trash.
 
 use crate::model::ConflictChoice;
 use crate::plan::ground::Ground;
-use crate::plan::{Action, Plan, Side};
+use crate::plan::{Action, Plan, Side, Unit};
 use crate::scan::{Entry, Keys, Snapshot};
+use std::collections::BTreeSet;
 
 pub struct Resolution;
 
@@ -33,6 +36,11 @@ impl Resolution {
         let mut plan = Plan { notes, ..Plan::default() };
         if ground.is_off_limits(key) {
             return Err("Charon can't settle this item: it's in a place it leaves alone (see the notes).".into());
+        }
+        let unit = Unit::of(key, |k| source.contains(k) || destination.contains(k))
+            .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
+        if let Some(unit) = unit {
+            return Self::settle_unit(plan, ground, &unit, choice);
         }
         let (s, d) = (source.get(key), destination.get(key));
         match choice {
@@ -70,6 +78,83 @@ impl Resolution {
             }
         }
         Ok(plan)
+    }
+
+    /// Settles a whole app library or database: the other side's copy becomes the chosen one.
+    fn settle_unit(mut plan: Plan, ground: Ground, unit: &Unit, choice: ConflictChoice) -> Result<Plan, String> {
+        let spelling = {
+            let side = if ground.side(Side::Source).contains(unit.key()) { Side::Source } else { Side::Destination };
+            ground.side(side).spelling(unit.key()).to_string()
+        };
+        let winner = match choice {
+            ConflictChoice::KeepSource => Side::Source,
+            ConflictChoice::KeepDestination => Side::Destination,
+            ConflictChoice::KeepBoth => {
+                return Err(format!(
+                    "“{spelling}” is {}: its files only work together, so it can't be kept twice. \
+                     Choose one side's version; what it replaces goes to .charon-trash.",
+                    unit.describe()
+                ))
+            }
+        };
+        let keys = Self::unit_keys(&ground, unit);
+        if keys.iter().any(|key| ground.is_off_limits(key)) {
+            return Err(format!(
+                "Charon can't settle “{spelling}” as a whole: some of its files are in places it leaves alone (see the notes)."
+            ));
+        }
+        Self::follow(&mut plan, &ground, &keys, winner);
+        ground.finish(&mut plan);
+        Ok(plan)
+    }
+
+    /// Every key of the unit on either side, in order (a folder before what's inside it).
+    fn unit_keys(ground: &Ground, unit: &Unit) -> BTreeSet<String> {
+        let (source, destination) = (ground.side(Side::Source), ground.side(Side::Destination));
+        match unit {
+            Unit::Package(folder) => std::iter::once(folder.clone())
+                .chain(source.inside(folder).map(|(key, _)| key.clone()))
+                .chain(destination.inside(folder).map(|(key, _)| key.clone()))
+                .filter(|key| source.contains(key) || destination.contains(key))
+                .collect(),
+            Unit::Database(database) => {
+                Unit::database_files(database).into_iter().filter(|key| source.contains(key) || destination.contains(key)).collect()
+            }
+        }
+    }
+
+    /// Makes every one of `keys` on the loser's side what it is on `winner`'s side.
+    fn follow(plan: &mut Plan, ground: &Ground, keys: &BTreeSet<String>, winner: Side) {
+        let loser = winner.opposite();
+        // Items settled with everything inside them (removed, or brought over whole).
+        let mut whole: Vec<&str> = Vec::new();
+        for key in keys {
+            if whole.iter().any(|top| Keys::is_within(key, top)) {
+                continue;
+            }
+            let (from, here) = (ground.side(winner), ground.side(loser));
+            match (from.get(key).copied(), here.get(key).copied()) {
+                (Some(wanted), Some(existing)) if wanted.kind == existing.kind => {
+                    if !wanted.is_dir() && !existing.same_as(&wanted) {
+                        plan.push(Action::copy(loser, key, wanted, Some(existing)).settling(true));
+                    }
+                }
+                (Some(wanted), Some(existing)) => {
+                    Self::remove(plan, ground, loser, key, existing, Some(wanted));
+                    Self::bring(plan, ground, loser, key, wanted);
+                    whole.push(key);
+                }
+                (Some(wanted), None) => {
+                    Self::bring(plan, ground, loser, key, wanted);
+                    whole.push(key);
+                }
+                (None, Some(existing)) => {
+                    Self::remove(plan, ground, loser, key, existing, None);
+                    whole.push(key);
+                }
+                (None, None) => {}
+            }
+        }
     }
 
     /// Makes the other side match `winner`'s version of `key`.
@@ -188,5 +273,37 @@ mod tests {
         destination.occupy("x"); // cache.tmp, excluded, is in there too
         let refused = Resolution::plan(&source, &destination, "x", ConflictChoice::KeepSource).unwrap_err();
         assert!(refused.contains("“x”"), "{refused}");
+    }
+
+    #[test]
+    fn a_library_is_settled_as_a_whole() {
+        let lib = "Lib.photoslibrary";
+        let source = snap(&[(lib, Entry::dir()), ("Lib.photoslibrary/a.jpg", Entry::file(5, 20_000)), ("Lib.photoslibrary/new.jpg", Entry::file(7, 20_000))]);
+        let destination = snap(&[
+            (lib, Entry::dir()),
+            ("Lib.photoslibrary/a.jpg", Entry::file(1, 10_000)),
+            ("Lib.photoslibrary/old", Entry::dir()),
+            ("Lib.photoslibrary/old/b.jpg", Entry::file(6, 20_000)),
+        ]);
+        let plan = Resolution::plan(&source, &destination, lib, ConflictChoice::KeepSource).unwrap();
+        // a.jpg replaced, new.jpg copied, old/b.jpg and old removed.
+        assert_eq!(plan.actions.len(), 4, "{:?}", plan.actions);
+        assert!(plan.actions.iter().all(|a| match a {
+            Action::Copy { to, .. } | Action::CreateDir { side: to, .. } | Action::Delete { side: to, .. } => *to == Side::Destination,
+            _ => false,
+        }));
+        assert!(plan.actions.contains(&Action::copy(Side::Destination, "Lib.photoslibrary/a.jpg", Entry::file(5, 20_000), Some(Entry::file(1, 10_000))).settling(true)));
+        assert!(Resolution::plan(&source, &destination, lib, ConflictChoice::KeepBoth).is_err(), "a library is never kept twice");
+    }
+
+    #[test]
+    fn a_database_is_settled_with_its_journals() {
+        let source = snap(&[("data.db", Entry::file(8, 20_000)), ("data.db-wal", Entry::file(0, 20_000))]);
+        let destination = snap(&[("data.db", Entry::file(4, 10_000)), ("data.db-wal", Entry::file(3, 30_000)), ("data.db-shm", Entry::file(1, 30_000))]);
+        let plan = Resolution::plan(&source, &destination, "data.db", ConflictChoice::KeepSource).unwrap();
+        let mut paths: Vec<&str> = plan.actions.iter().map(|a| a.path()).collect();
+        paths.sort();
+        assert_eq!(paths, vec!["data.db", "data.db-shm", "data.db-wal"]);
+        assert!(Resolution::plan(&source, &destination, "data.db", ConflictChoice::KeepBoth).is_err());
     }
 }

@@ -7,6 +7,7 @@
 //! * `baseline.rs` – `Baseline`: that last synced state, as each side had it
 //! * `guard.rs`   – `Guard`: plans that must not run, or need a person's look first
 //! * `resolve.rs` – `Resolution`: settling one conflict the way the person chose
+//! * `units.rs`   – `Unit`: app libraries and databases, whose files only work together
 
 mod action;
 mod baseline;
@@ -15,6 +16,7 @@ mod guard;
 mod one_way;
 mod resolve;
 mod two_way;
+mod units;
 
 pub use action::{Action, Note, NoteKind, Plan, PlanSummary, Side};
 pub use baseline::{Baseline, Pair, Settled};
@@ -22,6 +24,7 @@ pub use guard::{Guard, Recent};
 pub use one_way::OneWayPlanner;
 pub use resolve::Resolution;
 pub use two_way::TwoWayPlanner;
+pub use units::Unit;
 
 use crate::model::JobSetup;
 use crate::scan::Snapshot;

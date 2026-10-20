@@ -1,7 +1,7 @@
 //! What the window receives: one row per job, live progress and run summaries.
 
 use crate::model::{Job, JobId};
-use crate::plan::{NoteKind, Side};
+use crate::plan::{NoteKind, Side, Unit};
 use crate::scan::{Entry, EntryKind, Volume};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,10 @@ pub struct ConflictItem {
     pub destination_modified: Option<i64>,
     pub source_size: Option<u64>,
     pub destination_size: Option<u64>,
+    /// "an app library or document" or "a database": the item's files only work together,
+    /// so one side's copy is kept as a whole (never both).
+    #[serde(default)]
+    pub whole: Option<String>,
 }
 
 impl ConflictItem {
@@ -104,7 +108,14 @@ impl ConflictItem {
             destination_modified: destination.map(|e| e.modified),
             source_size: source.map(|e| e.size),
             destination_size: destination.map(|e| e.size),
+            whole: None,
         }
+    }
+
+    /// The same conflict, about a whole app library or database (see `plan::Unit`).
+    pub fn whole(mut self, unit: Option<&Unit>) -> Self {
+        self.whole = unit.map(|unit| unit.describe().to_string());
+        self
     }
 }
 

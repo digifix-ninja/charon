@@ -7,11 +7,12 @@
 use crate::engine::{runs, Engine, EngineEvent};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, Job, JobSetup, Warning};
-use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side};
+use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
 use crate::run::{Expired, Found, Markers, Trash};
 use crate::scan::{never_download_on_this_thread, Contents, Entry, EntryKind, ExcludeFilter, Scanner, Snapshot, Volume};
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 
 /// Half-copied files from an interrupted sync are tidied away once they're this old (a
@@ -89,7 +90,7 @@ struct Compared {
     /// Pairs found identical, now recorded as in sync.
     agreed: u64,
     /// Pairs that both changed and look alike, but whose contents differ.
-    different: std::collections::BTreeSet<String>,
+    different: BTreeSet<String>,
 }
 
 /// Both folders now, the plan, and what deserves a look.
@@ -332,6 +333,9 @@ impl Engine {
                 if undated == 1 { "it" } else { "them" }
             )));
         }
+        if let Some(text) = Self::units_warning(&setup, &plan, &source, &destination) {
+            warnings.push(Warning::caution(text));
+        }
         let links = plan.actions.iter().filter(|a| matches!(a, Action::Copy { item: EntryKind::Link, .. })).count() as u64;
         if links > 0 {
             warnings.push(Warning::info(format!(
@@ -362,6 +366,36 @@ impl Engine {
             housekeeping,
             made_at: Utc::now(),
         })
+    }
+
+    /// App libraries and databases this sync changes: copied while their app writes to them,
+    /// they may arrive half-written.
+    fn units_warning(setup: &JobSetup, plan: &Plan, source: &Snapshot, destination: &Snapshot) -> Option<String> {
+        let exists = |key: &str| source.contains(key) || destination.contains(key);
+        let units: BTreeSet<Unit> = plan.work().filter_map(|action| Unit::of(action.path(), exists)).collect();
+        let names: Vec<String> = units
+            .iter()
+            .map(|unit| {
+                let side = if source.contains(unit.key()) { source } else { destination };
+                format!("“{}”", side.spelling(unit.key()))
+            })
+            .collect();
+        let computers = if setup.mode.is_two_way() { " (on both computers)" } else { "" };
+        match names.as_slice() {
+            [] => None,
+            [name] => Some(format!(
+                "{name} is {}. Close the app that uses it before you confirm{computers}, or it may be copied while it's half-written.",
+                units.first().map_or("", Unit::describe)
+            )),
+            _ => {
+                let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+                let more = if names.len() > 3 { format!(" and {} more", human_count(names.len() as u64 - 3)) } else { String::new() };
+                Some(format!(
+                    "{} app libraries or databases change in this sync: {shown}{more}. Close the apps that use them before you confirm{computers}, or they may be copied while they're half-written.",
+                    human_count(names.len() as u64)
+                ))
+            }
+        }
     }
 
     /// Scans both folders at once (they're usually on different drives), each on its own

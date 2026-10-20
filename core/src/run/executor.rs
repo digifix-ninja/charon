@@ -14,7 +14,7 @@
 //! what really happened.
 
 use crate::error::{Error, Result};
-use crate::plan::{Action, Pair, Plan, Settled, Side};
+use crate::plan::{Action, Pair, Plan, Settled, Side, Unit};
 use crate::run::durable;
 use crate::run::names;
 use crate::run::rename::rename_new;
@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_normalization::UnicodeNormalization;
@@ -88,6 +89,18 @@ enum Done {
     Nothing,
     Skipped(String),
     Kept,
+}
+
+/// A copy written next to its target, waiting to take its place (see `Executor::stage`).
+struct Staged {
+    to: Side,
+    key: String,
+    from: Entry,
+    existing: Option<Entry>,
+    settles: bool,
+    relative: String,
+    target: PathBuf,
+    partial: PathBuf,
 }
 
 /// What the folders above an item are.
@@ -194,13 +207,16 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Runs every step of `plan` in order.
+    /// Runs every step of `plan` in order. The files of a database are carried together,
+    /// when the first of them comes up (see `carry_database`).
     pub fn run(&self, plan: &Plan, meter: &mut ProgressMeter) -> Outcome {
         let mut outcome = Outcome::default();
         // A side where copies failed keeps everything this run would remove there: the
         // removal could take the last copy of something that didn't arrive.
         let mut copies_failed: HashSet<Side> = HashSet::new();
-        for (action, makes_room) in plan.ordered_steps() {
+        let databases = self.databases(plan);
+        let mut carried: HashSet<String> = HashSet::new();
+        'steps: for (action, makes_room) in plan.ordered_steps() {
             if self.cancel.load(Ordering::Relaxed) {
                 outcome.cancelled = true;
                 break;
@@ -211,6 +227,16 @@ impl<'a> Executor<'a> {
             if let Err(reason) = self.check_roots() {
                 outcome.stopped = Some(reason);
                 break;
+            }
+            if let Some((database, steps)) = self.database_of(action, makes_room).and_then(|database| databases.get_key_value(&database)) {
+                if carried.insert(database.clone()) {
+                    for (step, result) in self.carry_database(steps, &copies_failed, meter) {
+                        if self.record(&mut outcome, &mut copies_failed, step, result).is_break() {
+                            break 'steps;
+                        }
+                    }
+                }
+                continue;
             }
             meter.start(&self.spellings.disk(Self::shown_side(action), action.path()));
             let result = match action {
@@ -223,48 +249,8 @@ impl<'a> Executor<'a> {
                 }
                 _ => self.apply(action, meter),
             };
-            match result {
-                Ok(Done::Copied(files, bytes)) => {
-                    outcome.copied += files;
-                    outcome.bytes += bytes;
-                }
-                Ok(Done::Deleted) => outcome.deleted += 1,
-                Ok(Done::Created | Done::Nothing) => {}
-                Ok(Done::Skipped(reason)) => {
-                    log::info!("skipped {}: {reason}", action.path());
-                    outcome.skipped.push((action.path().to_string(), reason));
-                }
-                Ok(Done::Kept) => outcome.kept.push(action.path().to_string()),
-                Err(Error::Cancelled) => {
-                    outcome.cancelled = true;
-                    break;
-                }
-                Err(Error::LandedElsewhere(reason)) => {
-                    outcome.stopped = Some(reason);
-                    break;
-                }
-                Err(Error::Changed(reason)) => outcome.skipped.push((action.path().to_string(), reason)),
-                Err(Error::NoLinks) => {
-                    if let Action::Copy { to, .. } = action {
-                        if !outcome.no_links.contains(to) {
-                            outcome.no_links.push(*to);
-                        }
-                        outcome.skipped.push((action.path().to_string(), format!("left out: the {}'s drive can't hold symbolic links", to.word())));
-                    }
-                }
-                Err(e) => {
-                    log::warn!("{}: {e}", action.path());
-                    match action {
-                        Action::Copy { to, .. } => {
-                            copies_failed.insert(*to);
-                        }
-                        Action::KeepBoth { .. } => {
-                            copies_failed.extend([Side::Source, Side::Destination]);
-                        }
-                        _ => {}
-                    }
-                    outcome.failed.push((action.path().to_string(), e.to_string()));
-                }
+            if self.record(&mut outcome, &mut copies_failed, action, result).is_break() {
+                break;
             }
             meter.finish_item();
         }
@@ -272,6 +258,180 @@ impl<'a> Executor<'a> {
         outcome.settled = self.settled.take();
         outcome.destroyed = self.destroyed.take();
         outcome
+    }
+
+    /// Adds what one step did to the outcome. `Break` when the whole run stops there.
+    fn record(&self, outcome: &mut Outcome, copies_failed: &mut HashSet<Side>, action: &Action, result: Result<Done>) -> ControlFlow<()> {
+        match result {
+            Ok(Done::Copied(files, bytes)) => {
+                outcome.copied += files;
+                outcome.bytes += bytes;
+            }
+            Ok(Done::Deleted) => outcome.deleted += 1,
+            Ok(Done::Created | Done::Nothing) => {}
+            Ok(Done::Skipped(reason)) => {
+                log::info!("skipped {}: {reason}", action.path());
+                outcome.skipped.push((action.path().to_string(), reason));
+            }
+            Ok(Done::Kept) => outcome.kept.push(action.path().to_string()),
+            Err(Error::Cancelled) => {
+                outcome.cancelled = true;
+                return ControlFlow::Break(());
+            }
+            Err(Error::LandedElsewhere(reason)) => {
+                outcome.stopped = Some(reason);
+                return ControlFlow::Break(());
+            }
+            Err(Error::Changed(reason)) => outcome.skipped.push((action.path().to_string(), reason)),
+            Err(Error::NoLinks) => {
+                if let Action::Copy { to, .. } = action {
+                    if !outcome.no_links.contains(to) {
+                        outcome.no_links.push(*to);
+                    }
+                    outcome.skipped.push((action.path().to_string(), format!("left out: the {}'s drive can't hold symbolic links", to.word())));
+                }
+            }
+            Err(e) => {
+                log::warn!("{}: {e}", action.path());
+                match action {
+                    Action::Copy { to, .. } => {
+                        copies_failed.insert(*to);
+                    }
+                    Action::KeepBoth { .. } => {
+                        copies_failed.extend([Side::Source, Side::Destination]);
+                    }
+                    _ => {}
+                }
+                outcome.failed.push((action.path().to_string(), e.to_string()));
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    // ---------------------------------------------------------------- databases
+
+    /// The database a step's file belongs to, when the step can be carried with the rest of
+    /// the database: copies and plain removals of files.
+    fn database_of(&self, action: &Action, makes_room: bool) -> Option<String> {
+        let groupable = match action {
+            Action::Copy { item: EntryKind::File, .. } => true,
+            Action::Delete { item: EntryKind::File, other: None, .. } => !makes_room,
+            _ => false,
+        };
+        let exists = |key: &str| self.spellings.snapshot(Side::Source).contains(key) || self.spellings.snapshot(Side::Destination).contains(key);
+        groupable.then(|| Unit::database_of(action.path(), exists)).flatten()
+    }
+
+    /// The databases with more than one file to carry in this plan, with their steps.
+    fn databases<'p>(&self, plan: &'p Plan) -> HashMap<String, Vec<&'p Action>> {
+        let mut databases: HashMap<String, Vec<&'p Action>> = HashMap::new();
+        for (action, makes_room) in plan.ordered_steps() {
+            if let Some(database) = self.database_of(action, makes_room) {
+                databases.entry(database).or_default().push(action);
+            }
+        }
+        databases.retain(|_, steps| steps.len() > 1);
+        databases
+    }
+
+    /// Carries the files of one database (an SQLite file and its journals) together. Its
+    /// journals only fit the database they were written with, so a mix of two versions can
+    /// damage it: every new version is written next to its target first, then everything
+    /// is checked again, and only then do the old journals go and the new files take their
+    /// places, one right after the other. If any file can't be carried or changed meanwhile,
+    /// none is, and the next sync tries again.
+    fn carry_database<'p>(&self, steps: &[&'p Action], copies_failed: &HashSet<Side>, meter: &mut ProgressMeter) -> Vec<(&'p Action, Result<Done>)> {
+        let all_wait = |why: &str| steps.iter().map(|step| (*step, Ok(Done::Skipped(why.to_string())))).collect::<Vec<_>>();
+        let removals: Vec<&Action> = steps.iter().copied().filter(|step| matches!(step, Action::Delete { .. })).collect();
+        if removals.iter().any(|step| matches!(step, Action::Delete { side, .. } if copies_failed.contains(side))) {
+            return all_wait("kept for now: other copies failed in this run, and a database's files are only synced together");
+        }
+
+        // Every new version, written and checked next to its target.
+        let mut staged: Vec<(&Action, Staged)> = Vec::new();
+        for step in steps {
+            let Action::Copy { to, path, from, existing, settles_conflict, .. } = step else { continue };
+            meter.start(&self.spellings.disk(to.opposite(), path));
+            let result = self.stage(*to, path, from, existing.as_ref(), *settles_conflict, meter);
+            meter.finish_item();
+            match result {
+                Ok(Some(ready)) => staged.push((*step, ready)),
+                failed => {
+                    Self::discard_all(staged);
+                    let failed = failed.map(|_| Done::Skipped(format!("changed on the {} side since the scan", to.word())));
+                    return Self::one_failed(steps, step, failed);
+                }
+            }
+        }
+
+        // Nothing may have changed while the others were written.
+        let unchanged = staged.iter().all(|(_, ready)| {
+            let source = self.path(ready.to.opposite(), &ready.key);
+            matches!(self.look_fresh(ready.to.opposite(), &source), Ok(now) if Entry::still(now.as_ref(), Some(&ready.from)))
+                && matches!(self.look_fresh(ready.to, &ready.target), Ok(now) if Entry::still(now.as_ref(), ready.existing.as_ref()))
+        }) && removals.iter().all(|step| match step {
+            Action::Delete { side, path, entry, .. } => {
+                let (here, there) = (self.path(*side, path), self.path(side.opposite(), path));
+                matches!(self.look_fresh(*side, &here), Ok(now) if Entry::still(now.as_ref(), Some(entry)))
+                    && matches!(self.look_fresh(side.opposite(), &there), Ok(None))
+            }
+            _ => true,
+        });
+        if !unchanged {
+            Self::discard_all(staged);
+            return all_wait("left for the next sync: a file of its database changed while the others were being copied");
+        }
+
+        // The old journals go first, then the new files take their places.
+        let mut results: Vec<(&Action, Result<Done>)> = Vec::new();
+        let mut broken = false;
+        for step in removals {
+            meter.start(&self.spellings.disk(Self::shown_side(step), step.path()));
+            let result = if broken { Ok(Done::Skipped(Self::NOT_MIXED.into())) } else { self.apply(step, meter) };
+            meter.finish_item();
+            broken |= !matches!(result, Ok(Done::Deleted | Done::Nothing));
+            results.push((step, result));
+        }
+        for (step, ready) in staged {
+            if broken {
+                Copier::discard(&ready.partial);
+                results.push((step, Ok(Done::Skipped(Self::NOT_MIXED.into()))));
+                continue;
+            }
+            let (to, key, from) = (ready.to, ready.key.clone(), ready.from);
+            let result = match self.commit(ready) {
+                Ok(Some((bytes, landed))) => {
+                    self.settle(&key, Some(Self::pair(to, landed, from)));
+                    Ok(Done::Copied(1, bytes))
+                }
+                Ok(None) => Ok(Done::Skipped(format!("changed on the {} side since the scan", to.word()))),
+                Err(e) => Err(e),
+            };
+            broken |= !matches!(result, Ok(Done::Copied(..)));
+            results.push((step, result));
+        }
+        results
+    }
+
+    /// Why a database file waits when another file of it couldn't be carried.
+    const NOT_MIXED: &'static str = "left for the next sync: another file of its database couldn't be synced, and a database's files only go together";
+
+    /// `failing`'s own result, and every other step of its database waiting (the failing
+    /// one last, so a stop of the whole run comes after the others are counted).
+    fn one_failed<'p>(steps: &[&'p Action], failing: &&'p Action, result: Result<Done>) -> Vec<(&'p Action, Result<Done>)> {
+        let mut results: Vec<(&Action, Result<Done>)> = steps
+            .iter()
+            .filter(|step| !std::ptr::eq(**step, *failing))
+            .map(|step| (*step, Ok(Done::Skipped(Self::NOT_MIXED.into()))))
+            .collect();
+        results.push((*failing, result));
+        results
+    }
+
+    fn discard_all(staged: Vec<(&Action, Staged)>) {
+        for (_, ready) in staged {
+            Copier::discard(&ready.partial);
+        }
     }
 
     /// Moves leftover half-copied files from interrupted runs into the trash, each only if
@@ -378,6 +538,15 @@ impl<'a> Executor<'a> {
     /// scan. The replaced version goes to the trash with safe deletes, in two-way jobs, and
     /// always when the copy settles a conflict.
     fn copy(&self, to: Side, key: &str, from: &Entry, existing: Option<&Entry>, settles: bool, meter: &mut ProgressMeter) -> Result<Option<(u64, Entry)>> {
+        match self.stage(to, key, from, existing, settles, meter)? {
+            Some(staged) => self.commit(staged),
+            None => Ok(None),
+        }
+    }
+
+    /// The first half of a copy: the new version, written and checked next to its target.
+    /// `None` when the target changed since the scan.
+    fn stage(&self, to: Side, key: &str, from: &Entry, existing: Option<&Entry>, settles: bool, meter: &mut ProgressMeter) -> Result<Option<Staged>> {
         let from_path = self.path(to.opposite(), key);
         let relative = self.spellings.disk(to, key);
         let root = self.shores.root(to);
@@ -409,6 +578,14 @@ impl<'a> Executor<'a> {
             Copier::discard(&partial);
             return Ok(None);
         }
+        Ok(Some(Staged { to, key: key.to_string(), from: *from, existing: existing.copied(), settles, relative, target, partial }))
+    }
+
+    /// The second half of a copy: the new version takes the target's place. Returns the
+    /// bytes carried and the item as it landed, or `None` when the target changed meanwhile.
+    fn commit(&self, staged: Staged) -> Result<Option<(u64, Entry)>> {
+        let Staged { to, key, from, existing, settles, relative, target, partial } = staged;
+        let root = self.shores.root(to);
         let keep_old = self.care.safe_delete || self.care.keep_replaced || settles;
         match existing {
             None => Copier::commit_new(&partial, &target)?,
@@ -426,7 +603,7 @@ impl<'a> Executor<'a> {
                     }
                 };
                 self.touch(&kept);
-                if !Entry::still(self.look_fresh(to, &target)?.as_ref(), existing) {
+                if !Entry::still(self.look_fresh(to, &target)?.as_ref(), existing.as_ref()) {
                     let _ = fs::remove_file(&kept);
                     Copier::discard(&partial);
                     return Ok(None);
@@ -451,7 +628,7 @@ impl<'a> Executor<'a> {
             }
         }
         if existing.is_some() {
-            self.destroyed_on(to, key);
+            self.destroyed_on(to, &key);
         }
         let landed = Self::look(&target)?.ok_or_else(|| Error::Invalid(format!("{} vanished right after it was copied", target.display())))?;
         self.on_its_drive(to, &target)?;

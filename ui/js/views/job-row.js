@@ -199,11 +199,12 @@ export class JobRow {
         <div>
           <div class="path">${c.path}</div>
           <div class="versions">${version("Source", c.sourceKind, c.sourceModified, c.sourceSize)} · ${version("Destination", c.destinationKind, c.destinationModified, c.destinationSize)}</div>
+          ${raw(c.whole ? html`<div class="versions">This is ${c.whole}: its files only work together, so one side's copy is kept as a whole, and what it replaces goes to .charon-trash.</div>` : "")}
         </div>
         <div class="choices">
           <button class="btn" data-action="resolve" data-key="${c.key}" data-choice="keep-source">Keep source</button>
           <button class="btn" data-action="resolve" data-key="${c.key}" data-choice="keep-destination">Keep destination</button>
-          ${raw(c.sourceKind === "file" && c.destinationKind === "file" ? html`<button class="btn" data-action="resolve" data-key="${c.key}" data-choice="keep-both">Keep both</button>` : "")}
+          ${raw(!c.whole && c.sourceKind === "file" && c.destinationKind === "file" ? html`<button class="btn" data-action="resolve" data-key="${c.key}" data-choice="keep-both">Keep both</button>` : "")}
         </div>
       </div>`).join("")}</div>`;
   }

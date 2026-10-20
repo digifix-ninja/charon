@@ -714,3 +714,104 @@ fn full_automation_counts_each_file_once_a_day_and_the_list_shows_the_day() {
     }
     assert_eq!(run(&engine), None);
 }
+
+#[test]
+fn a_database_and_its_journal_cross_together() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write(&a.join("app/data.db"), "db 1");
+    write(&a.join("app/data.db-wal"), "wal 1");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    write(&a.join("app/data.db"), "db 2 checkpointed");
+    write(&a.join("app/data.db-wal"), "wal 2 after the checkpoint");
+    confirm(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join("app/data.db")).unwrap(), "db 2 checkpointed");
+    assert_eq!(fs::read_to_string(b.join("app/data.db-wal")).unwrap(), "wal 2 after the checkpoint");
+}
+
+#[test]
+fn a_database_whose_journal_changes_mid_sync_isnt_half_copied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write(&a.join("data.db"), "db 1");
+    write(&a.join("data.db-wal"), "wal 1");
+    fs::create_dir_all(&b).unwrap();
+    // The app writes to the journal as soon as Charon starts copying the database.
+    let hook: Arc<Mutex<Option<Hook>>> = Arc::default();
+    let armed = hook.clone();
+    let engine = Engine::open(
+        &data,
+        Arc::new(move |event: EngineEvent| {
+            if let EngineEvent::Progress { progress, .. } = &event {
+                if progress.current.is_some() {
+                    if let Some(hook) = armed.lock().unwrap().take() {
+                        hook();
+                    }
+                }
+            }
+        }),
+    )
+    .unwrap();
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    write(&a.join("data.db"), "db 2 checkpointed");
+    write(&a.join("data.db-wal"), "wal 2");
+    let wal = a.join("data.db-wal");
+    *hook.lock().unwrap() = Some(Box::new(move || fs::write(&wal, "wal 3, written by the app meanwhile").unwrap()));
+    thread::sleep(Duration::from_millis(200)); // live progress reaches the window at most this often
+    confirm(&engine, &id);
+    assert!(hook.lock().unwrap().is_none(), "the app wrote during the sync");
+    assert_eq!(fs::read_to_string(b.join("data.db")).unwrap(), "db 1", "the database waits for its journal");
+    assert_eq!(fs::read_to_string(b.join("data.db-wal")).unwrap(), "wal 1");
+    assert_eq!(engine.job(&id).unwrap().job.last_run.unwrap().skipped, 2);
+    // The next sync carries both, as they are now.
+    confirm(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join("data.db")).unwrap(), "db 2 checkpointed");
+    assert_eq!(fs::read_to_string(b.join("data.db-wal")).unwrap(), "wal 3, written by the app meanwhile");
+}
+
+#[test]
+fn a_library_changed_on_both_sides_is_kept_whole_from_one_side() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    let lib = "Photos Library.photoslibrary";
+    write(&a.join(lib).join("originals/one.jpg"), "one");
+    write(&a.join(lib).join("database/Photos.sqlite"), "db 1");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::NewestWins)).unwrap().job.id;
+    confirm(&engine, &id);
+
+    // Photos used on both computers before a sync.
+    write(&a.join(lib).join("originals/two.jpg"), "two");
+    write(&a.join(lib).join("database/Photos.sqlite"), "db 2 from a");
+    write(&b.join(lib).join("originals/three.jpg"), "three");
+    write(&b.join(lib).join("database/Photos.sqlite"), "db 2 from b, longer");
+    let review = confirm(&engine, &id);
+    assert_eq!(review.tally.conflicts, 1);
+    assert!(review.warnings.iter().all(|w| !w.text.contains("half-written")), "nothing of the library moves");
+    assert!(!b.join(lib).join("originals/two.jpg").exists() && !a.join(lib).join("originals/three.jpg").exists());
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.conflicts.len(), 1);
+    let conflict = view.conflicts[0].clone();
+    assert_eq!(conflict.path, lib);
+    assert!(conflict.whole.is_some());
+    assert!(engine.prepare_resolution(&id, &conflict, ConflictChoice::KeepBoth).is_err());
+
+    // Keeping the source's library makes the destination's exactly that.
+    let review = engine.prepare_resolution(&id, &conflict, ConflictChoice::KeepSource).unwrap();
+    engine.approve(&id, &review.review_id, review.needs_tick).unwrap();
+    wait(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join(lib).join("database/Photos.sqlite")).unwrap(), "db 2 from a");
+    assert!(b.join(lib).join("originals/two.jpg").exists());
+    assert!(!b.join(lib).join("originals/three.jpg").exists());
+    let trashed = walk(&b.join(".charon-trash"));
+    assert!(trashed.iter().any(|p| p.ends_with("three.jpg")), "the destination's version is in the trash: {trashed:?}");
+    assert!(trashed.iter().any(|p| p.ends_with("Photos.sqlite")));
+    let next = engine.prepare_review(&id).unwrap();
+    assert_eq!(next.total_steps, 0, "{:?}", next.steps);
+    assert_eq!(next.tally.conflicts, 0);
+}

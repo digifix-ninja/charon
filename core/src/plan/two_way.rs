@@ -27,10 +27,13 @@
 //!
 //! Without a baseline (the first sync, or a memory Charon can't trust) every difference is
 //! a conflict or a copy: nothing is ever deleted.
+//!
+//! An app library or a database whose files changed on both sides is never mixed: the
+//! whole unit becomes one conflict (see `plan::units`).
 
 use crate::model::ConflictRule;
 use crate::plan::ground::Ground;
-use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
+use crate::plan::{Action, Baseline, NoteKind, Plan, Side, Unit};
 use crate::scan::{Entry, Snapshot};
 use std::collections::BTreeSet;
 
@@ -57,22 +60,26 @@ impl TwoWayPlanner {
         let mut plan = Plan::default();
         let mut ground = Ground::new(source, destination, &[Side::Source, Side::Destination], &mut plan);
         let all_paths: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(baseline.paths()).collect();
+        let exists = |key: &str| source.contains(key) || destination.contains(key);
+        let split = self.split_units(&all_paths, source, destination, baseline, &ground);
 
         for path in all_paths {
             if ground.is_off_limits(path) {
                 continue;
             }
+            if let Some(unit) = Unit::of(path, exists).filter(|unit| split.contains(unit)) {
+                Self::ask_unit(&mut plan, &mut ground, &unit, path, source, destination);
+                continue;
+            }
             let s = source.get(path);
             let d = destination.get(path);
-            let source_changed = !Entry::still_on(s, baseline.side(path, Side::Source), source.shifts_times());
-            let destination_changed = !Entry::still_on(d, baseline.side(path, Side::Destination), destination.shifts_times());
+            let (source_changed, destination_changed) = self.changes(path, source, destination, baseline);
 
             match (source_changed, destination_changed) {
                 // Both sides are as the last sync left them, even if they look different (a
-                // drive that doesn't keep times, or contents found identical).
+                // drive that doesn't keep times, or contents found identical), or both
+                // changed (or there's no record yet) and now look alike: nothing to do.
                 (false, false) => {}
-                // Both changed (or there's no record yet) and now look alike: nothing to do.
-                (true, true) if Entry::same(s, d) && !self.different.contains(path.as_str()) => {}
                 // One side changed since the last sync: that change crosses, even when the two
                 // sides happen to look alike within the 2 seconds some drives round times to.
                 // Its time moved, so its contents may have too.
@@ -90,6 +97,53 @@ impl TwoWayPlanner {
         }
         ground.finish(&mut plan);
         plan
+    }
+
+    /// Whether each side changed `path` since the last sync. Both sides changing it the same
+    /// way (or both having it alike without a record) counts as no change.
+    fn changes(&self, path: &str, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> (bool, bool) {
+        let (s, d) = (source.get(path), destination.get(path));
+        let source_changed = !Entry::still_on(s, baseline.side(path, Side::Source), source.shifts_times());
+        let destination_changed = !Entry::still_on(d, baseline.side(path, Side::Destination), destination.shifts_times());
+        if source_changed && destination_changed && Entry::same(s, d) && !self.different.contains(path) {
+            return (false, false);
+        }
+        (source_changed, destination_changed)
+    }
+
+    /// The app libraries and databases with files changed on both sides: syncing them file
+    /// by file would mix two versions.
+    fn split_units(&self, paths: &BTreeSet<&String>, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, ground: &Ground) -> BTreeSet<Unit> {
+        let exists = |key: &str| source.contains(key) || destination.contains(key);
+        let mut changed: std::collections::BTreeMap<Unit, (bool, bool)> = std::collections::BTreeMap::new();
+        for path in paths {
+            if ground.is_off_limits(path) {
+                continue;
+            }
+            let Some(unit) = Unit::of(path, exists) else { continue };
+            let (on_source, on_destination) = self.changes(path, source, destination, baseline);
+            let sides = changed.entry(unit).or_default();
+            sides.0 |= on_source;
+            sides.1 |= on_destination;
+        }
+        changed.into_iter().filter(|(_, (on_source, on_destination))| *on_source && *on_destination).map(|(unit, _)| unit).collect()
+    }
+
+    /// Leaves a whole app library or database for the person to decide: one conflict for
+    /// the unit, and none of its files moves.
+    fn ask_unit(plan: &mut Plan, ground: &mut Ground, unit: &Unit, path: &str, source: &Snapshot, destination: &Snapshot) {
+        match unit {
+            Unit::Package(folder) => Self::ask(plan, ground, folder, source.get(folder), destination.get(folder)),
+            Unit::Database(database) => {
+                // The conflict is named after the database file, or after the first of its
+                // files still there when the database itself is gone from both sides.
+                let key = if source.contains(database) || destination.contains(database) { database.as_str() } else { path };
+                Self::ask(plan, ground, key, source.get(key), destination.get(key));
+                for file in Unit::database_files(database) {
+                    ground.block(&file);
+                }
+            }
+        }
     }
 
     /// Whether a file's time is now older than the one recorded at the last sync.
@@ -394,5 +448,41 @@ mod tests {
         let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert_eq!(plan.actions, vec![Action::delete(Side::Destination, "f/a.txt", file(1, 10_000), None)]);
         assert_eq!(plan.notes[0].kind, NoteKind::KeptFolder);
+    }
+
+    #[test]
+    fn a_database_changed_on_both_sides_is_one_conflict_and_nothing_moves() {
+        let (db, wal) = (file(4096, 10_000), file(100, 10_000));
+        let baseline = base(&[("app", Entry::dir()), ("app/data.db", db), ("app/data.db-wal", wal)]);
+        // The source checkpointed into the database; the destination added to the journal.
+        let source = snap(&[("app", Entry::dir()), ("app/data.db", file(8192, 20_000)), ("app/data.db-wal", file(0, 20_000))]);
+        let destination = snap(&[("app", Entry::dir()), ("app/data.db", db), ("app/data.db-wal", file(300, 30_000))]);
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&source, &destination, &baseline);
+            assert_eq!(plan.actions, vec![Action::Conflict { path: "app/data.db".into(), source: Some(file(8192, 20_000)), destination: Some(db) }], "{rule:?}");
+        }
+        // Changed on one side only: its files cross as usual.
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&source, &snap(&[("app", Entry::dir()), ("app/data.db", db), ("app/data.db-wal", wal)]), &baseline);
+        assert_eq!(plan.summary().to_destination, 2);
+    }
+
+    #[test]
+    fn a_library_changed_on_both_sides_is_one_conflict_at_its_folder() {
+        let lib = "Photos Library.photoslibrary";
+        let item = |name: &str| format!("{lib}/{name}");
+        let baseline = base(&[
+            (lib, Entry::dir()),
+            (&item("a.jpg"), file(1, 10_000)),
+            (&item("b.jpg"), file(2, 10_000)),
+            ("notes.txt", file(3, 10_000)),
+        ]);
+        let source = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(5, 20_000)), (&item("b.jpg"), file(2, 10_000)), ("notes.txt", file(4, 20_000))]);
+        let destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.jpg"), file(6, 20_000)), ("notes.txt", file(3, 10_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&source, &destination, &baseline);
+        let conflicts: Vec<&str> = plan.conflicts().iter().map(|(path, ..)| *path).collect();
+        assert_eq!(conflicts, vec![lib]);
+        // Nothing inside the library moves; the rest of the job syncs.
+        assert!(plan.work().all(|action| action.path() == "notes.txt"), "{:?}", plan.actions);
+        assert_eq!(plan.summary().to_destination, 1);
     }
 }

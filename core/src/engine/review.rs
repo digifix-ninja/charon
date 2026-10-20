@@ -14,9 +14,9 @@ use crate::model::{
     Cluster, ConflictChoice, ConflictItem, JobId, Level, ReviewKind, Review, ReviewNote, ReviewStep, Shore, StepFilter, StepKind,
     Tally, VolumeLabel, Warning,
 };
-use crate::plan::{Action, NoteKind, Resolution, Side};
+use crate::plan::{Action, NoteKind, Resolution, Side, Unit};
 use crate::run::Markers;
-use crate::scan::{EntryKind, Keys, RootId};
+use crate::scan::{Entry, EntryKind, Keys, RootId};
 use chrono::{DateTime, Duration, Utc};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -193,8 +193,11 @@ impl Engine {
         self.end_look(id, &stop);
         let mut survey = survey?;
         let key = conflict.key.as_str();
-        let now = ConflictItem::new(key, &survey.spelling(key), survey.source.get(key).copied(), survey.destination.get(key).copied());
-        if &now != conflict {
+        let now = Self::conflict_item(&survey, key, survey.source.get(key).copied(), survey.destination.get(key).copied());
+        // Still a conflict now, and the same one (for an app library or a database, a
+        // conflict means its files still changed on both sides).
+        let still_open = survey.plan.conflicts().iter().any(|(path, ..)| *path == key);
+        if &now != conflict || !still_open {
             self.note_look(&job, &survey);
             self.publish(id);
             return Err(Error::ReviewOutdated("It changed since you saw it. Look again.".into()));
@@ -261,6 +264,14 @@ impl Engine {
                 rt.preparing = None;
             }
         });
+    }
+
+    /// A conflict as the window shows it, saying when it's about a whole app library or
+    /// database.
+    fn conflict_item(survey: &Survey, key: &str, source: Option<Entry>, destination: Option<Entry>) -> ConflictItem {
+        let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
+            .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
+        ConflictItem::new(key, &survey.spelling(key), source, destination).whole(unit.as_ref())
     }
 
     fn gone() -> Error {
@@ -511,8 +522,14 @@ impl Engine {
                 },
                 danger: false,
             },
-            Action::Conflict { source, destination, .. } => {
+            Action::Conflict { source, destination, path: key } => {
+                let unit = Unit::of(key, |k| survey.source.contains(k) || survey.destination.contains(k))
+                    .filter(|unit| matches!(unit, Unit::Database(_)) || unit.key() == key);
                 let reason = match (source, destination) {
+                    _ if unit.is_some() => format!(
+                        "{} whose files changed on both sides: left for you to decide which side's copy to keep as a whole",
+                        unit.as_ref().map_or("", Unit::describe)
+                    ),
                     (Some(s), Some(d)) if s.kind != d.kind => {
                         format!("{} in the source, {} in the destination: left for you to decide", Self::a(s.kind), Self::a(d.kind))
                     }
@@ -593,7 +610,7 @@ impl Look {
         let conflicts = plan
             .conflicts()
             .into_iter()
-            .map(|(key, source, destination)| ConflictItem::new(key, &survey.spelling(key), source, destination))
+            .map(|(key, source, destination)| Engine::conflict_item(survey, key, source, destination))
             .collect();
         let places = |kinds: &[NoteKind]| -> Vec<crate::model::Place> {
             plan.notes
