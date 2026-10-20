@@ -13,7 +13,12 @@
 //! | changed            | changed (differently)   | conflict, settled by the job's rule |
 //!
 //! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
-//! deletion, the edit wins: Charon never throws away work. An item one side changed into
+//! deletion, the edit wins: Charon never throws away work. A file whose details alone
+//! changed on one side (a tag, a permission, an app noting that it was opened: its size and
+//! time are as recorded) doesn't stand against a real edit on the other side: that edit
+//! crosses, and the version it replaces goes to the trash, like every version a two-way
+//! job replaces. Against a deletion it is an edit, and wins: an edit can put a file's old
+//! time back. An item one side changed into
 //! another kind (a folder that became a file) crosses like any change, unless the folder it
 //! replaces holds changes or items Charon leaves alone; a file meeting a folder that both
 //! sides changed, and a link taking the place of a file or folder, are a question for the
@@ -76,7 +81,7 @@ impl TwoWayPlanner {
             }
             let s = source.get(path);
             let d = destination.get(path);
-            let (source_changed, destination_changed) = self.changes(path, source, destination, baseline);
+            let (source_changed, destination_changed) = self.changes_that_cross(path, source, destination, baseline);
 
             match (source_changed, destination_changed) {
                 // Both sides are as the last sync left them, even if they look different (a
@@ -115,8 +120,29 @@ impl TwoWayPlanner {
         (source_changed, destination_changed)
     }
 
+    /// `changes`, for deciding what crosses: when only the details of a file changed on one
+    /// side, a real edit of it on the other side is a change of that side alone.
+    fn changes_that_cross(&self, path: &str, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> (bool, bool) {
+        let changes = self.changes(path, source, destination, baseline);
+        if changes != (true, true) || self.different.contains(path) {
+            return changes;
+        }
+        let (s, d) = (source.get(path), destination.get(path));
+        let only_details = |now: Option<&Entry>, side: Side| {
+            now.zip(baseline.side(path, side)).is_some_and(|(now, before)| now.is_file() && now.changed_at(0).unchanged(before))
+        };
+        let edited = |now: Option<&Entry>, side: Side| now.is_some_and(Entry::is_file) && !only_details(now, side);
+        if only_details(s, Side::Source) && edited(d, Side::Destination) {
+            (false, true)
+        } else if only_details(d, Side::Destination) && edited(s, Side::Source) {
+            (true, false)
+        } else {
+            changes
+        }
+    }
+
     /// The app libraries and databases with files changed on both sides: syncing them file
-    /// by file would mix two versions.
+    /// by file would mix two versions. Any change counts here, details too.
     fn split_units(&self, paths: &BTreeSet<&String>, source: &Snapshot, destination: &Snapshot, baseline: &Baseline, ground: &Ground) -> BTreeSet<Unit> {
         let mut changed: std::collections::BTreeMap<Unit, (bool, bool)> = std::collections::BTreeMap::new();
         for path in paths {
@@ -332,6 +358,40 @@ mod tests {
         let dst = snap(&[("a.txt", file(5, 90_000))]);
         let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert!(matches!(&plan.actions[0], Action::Copy { to: Side::Source, .. }));
+    }
+
+    /// A tag, a permission or an app noting that a file was opened moves only its change
+    /// time. A real edit on the other side then crosses, by every rule, instead of meeting
+    /// it as a conflict. A removal on the other side doesn't: the details may hide an edit
+    /// that put the old time back, and an edit beats a removal.
+    #[test]
+    fn a_change_of_details_yields_to_a_real_edit_on_the_other_side() {
+        let synced = file(1000, 10_000).changed_at(7);
+        let touched = synced.changed_at(8);
+        let edited = file(1200, 90_000).changed_at(9);
+        let b = base(&[("report.docx", synced)]);
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", touched)]), &snap(&[("report.docx", edited)]), &b);
+            assert_eq!(plan.actions, vec![Action::copy(Side::Source, "report.docx", edited, Some(touched))], "{rule:?}");
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("report.docx", edited)]), &snap(&[("report.docx", touched)]), &b);
+            assert_eq!(plan.actions, vec![Action::copy(Side::Destination, "report.docx", edited, Some(touched))], "{rule:?}");
+        }
+        let ask = TwoWayPlanner::new(ConflictRule::Ask);
+        let plan = ask.plan(&snap(&[("report.docx", touched)]), &snap(&[]), &b);
+        assert_eq!(plan.actions, vec![Action::copy(Side::Destination, "report.docx", touched, None)], "the removal doesn't cross");
+        // Edits on both sides, and an older version coming back, are still conflicts.
+        let also_edited = file(1100, 50_000).changed_at(8);
+        assert_eq!(ask.plan(&snap(&[("report.docx", also_edited)]), &snap(&[("report.docx", edited)]), &b).conflicts().len(), 1);
+        let restored = file(900, 4_000).changed_at(9);
+        assert_eq!(ask.plan(&snap(&[("report.docx", touched)]), &snap(&[("report.docx", restored)]), &b).conflicts().len(), 1);
+        // Inside an app library, a change of details still counts: the library is one conflict.
+        let library = [("Talk.key", Entry::dir()), ("Talk.key/Index.zip", synced)];
+        let plan = ask.plan(
+            &snap(&[library[0], ("Talk.key/Index.zip", touched)]),
+            &snap(&[library[0], ("Talk.key/Index.zip", edited)]),
+            &base(&library),
+        );
+        assert_eq!(plan.conflicts().len(), 1, "{:?}", plan.actions);
     }
 
     #[test]
