@@ -745,7 +745,18 @@ impl Engine {
         let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving, two_way };
         let observer = |progress: &Progress| self.report_progress(id, progress);
         let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
-        let executor = Executor::new(&shores, &survey.source, &survey.destination, care, cancel).excluding(survey.filter.clone());
+        // An item a step makes under a name the plan doesn't have (a conflict copy) is this
+        // run's own write from right before it's made: a change the folder watcher hears
+        // there is no change of the person's.
+        let new_name = |key: &str| {
+            self.change_runtime(id, |rt| {
+                if let Some(own) = rt.own_writes.as_mut() {
+                    own.add(std::iter::once(key));
+                }
+            })
+        };
+        let executor =
+            Executor::new(&shores, &survey.source, &survey.destination, care, cancel).excluding(survey.filter.clone()).telling_new_names(&new_name);
         let mut outcome = executor.run(&survey.plan, &mut meter);
 
         // The housekeeping the list named, only after a run that went all the way.
@@ -786,12 +797,6 @@ impl Engine {
         summary.settled = settled.len() as u64;
         summary.unkept = outcome.unkept.len() as u64;
         summary.left_for_later = survey.left_for_later.removals();
-
-        self.change_runtime(id, |rt| {
-            if let Some(own) = rt.own_writes.as_mut() {
-                own.add(outcome.settled.iter().map(|step| step.path.as_str()));
-            }
-        });
 
         let mut problems: Vec<String> = outcome.stopped.iter().cloned().collect();
         let recorded = match &flushed {

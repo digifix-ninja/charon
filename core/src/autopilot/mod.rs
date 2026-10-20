@@ -368,11 +368,12 @@ struct Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConflictRule, JobSetup, SyncMode};
+    use crate::engine::EngineEvent;
+    use crate::model::{ConflictRule, JobSetup, Phase, SyncMode};
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc::Sender;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// How long any wait may take before the test fails.
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -406,17 +407,23 @@ mod tests {
     /// A two-way job with full automation that syncs once changes have settled for
     /// `settle_seconds`, after its first sync was confirmed.
     fn on_change_job(tmp: &Path, settle_seconds: u32) -> (Engine, JobId, PathBuf, PathBuf) {
+        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
+        let (id, a, b) = add_on_change_job(&engine, tmp, settle_seconds, ConflictRule::Ask);
+        (engine, id, a, b)
+    }
+
+    /// Adds such a job to `engine`, with `conflict` for what changed on both sides.
+    fn add_on_change_job(engine: &Engine, tmp: &Path, settle_seconds: u32, conflict: ConflictRule) -> (JobId, PathBuf, PathBuf) {
         let (a, b) = (tmp.join("a"), tmp.join("b"));
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
         fs::write(a.join("first.txt"), "first").unwrap();
-        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
         let setup = JobSetup {
             name: "Notes".into(),
             source: a.clone(),
             destination: b.clone(),
             mode: SyncMode::TwoWay,
-            conflict: ConflictRule::Ask,
+            conflict,
             trigger: Trigger::OnChange { settle_seconds },
             excludes: vec![],
             safe_delete: true,
@@ -428,7 +435,7 @@ mod tests {
         engine.approve(&id, &review.review_id, true).unwrap();
         until("the first sync", || !engine.is_running(&id));
         assert!(b.join("first.txt").exists());
-        (engine, id, a, b)
+        (id, a, b)
     }
 
     #[test]
@@ -548,6 +555,54 @@ mod tests {
         pilot.changed.insert(id.clone(), Changes { first: quiet, last: quiet });
         pilot.tick();
         assert_eq!(synced().as_deref(), Some("the third version"));
+    }
+
+    #[test]
+    fn a_syncs_own_conflict_copy_heard_while_it_runs_is_no_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Once armed, the next sync stops on its own thread right after its last step, still
+        // running: it says so, and waits until the test lets it go on.
+        type Hold = (Sender<()>, Receiver<()>);
+        let armed: Arc<Mutex<Option<Hold>>> = Arc::default();
+        let hold = armed.clone();
+        let emitter = Arc::new(move |event: EngineEvent| {
+            let EngineEvent::Progress { progress, .. } = event else { return };
+            let held = if progress.phase == Phase::Finishing { hold.lock().unwrap().take() } else { None };
+            if let Some((reached, go_on)) = held {
+                reached.send(()).unwrap();
+                let _ = go_on.recv_timeout(DEADLINE);
+            }
+        });
+        let engine = Engine::open(tmp.path().join("data"), emitter).unwrap();
+        let (id, a, b) = add_on_change_job(&engine, tmp.path(), 30, ConflictRule::KeepBoth);
+        let (mut pilot, changes) = pilot(&engine);
+        let (reached, at_the_end) = mpsc::channel();
+        let (go_on, held) = mpsc::channel();
+        *armed.lock().unwrap() = Some((reached, held));
+
+        // first.txt changed on both sides, and the folders have been quiet for the settle time:
+        // the job syncs, keeping both versions.
+        fs::write(a.join("first.txt"), "the source's version").unwrap();
+        fs::write(b.join("first.txt"), "the destination's version").unwrap();
+        let quiet = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() - chrono::Duration::seconds(31), own: quiet });
+        pilot.changed.insert(id.clone(), Changes { first: quiet, last: quiet });
+        pilot.tick();
+        at_the_end.recv_timeout(DEADLINE).expect("the sync reached its end");
+
+        // While it still runs, the folder watcher reports the conflict copy it made on both sides.
+        let copy = fs::read_dir(&b).unwrap().flatten().map(|item| item.file_name()).find(|name| name.to_string_lossy().starts_with("first (conflict "));
+        let copy = copy.expect("both versions are kept");
+        assert!(engine.is_running(&id));
+        for folder in [&a, &b] {
+            changes.send((id.clone(), folder.join(&copy))).unwrap();
+        }
+        pilot.tick();
+        go_on.send(()).unwrap();
+        until("the sync", || !engine.is_running(&id));
+        assert!(engine.job(&id).unwrap().job.last_run.unwrap().error.is_none());
+        assert!(!pilot.changed.contains_key(&id), "the sync's own conflict copy counts as a change: the job syncs again once its settle time has passed");
+        assert!(!engine.check_due(&id, Duration::from_secs(15 * 60)), "the sync's own conflict copy has the folders looked at again at once");
     }
 
     #[test]

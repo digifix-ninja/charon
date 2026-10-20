@@ -421,6 +421,9 @@ pub struct Executor<'a> {
     links: RefCell<HashMap<Side, Option<bool>>>,
     /// Items put back as they were by steps that couldn't finish (see `put_back`).
     put_back_items: RefCell<Vec<PutBack>>,
+    /// Told the key of each item a step is about to make under a name the plan doesn't have
+    /// (see `telling_new_names`).
+    new_names: Option<&'a dyn Fn(&str)>,
 }
 
 impl<'a> Executor<'a> {
@@ -444,6 +447,7 @@ impl<'a> Executor<'a> {
             unkept: RefCell::default(),
             links: RefCell::default(),
             put_back_items: RefCell::default(),
+            new_names: None,
         }
     }
 
@@ -451,6 +455,13 @@ impl<'a> Executor<'a> {
     /// one, only Charon's own items count as excluded).
     pub fn excluding(mut self, filter: ExcludeFilter) -> Self {
         self.filter = filter;
+        self
+    }
+
+    /// The same executor, telling `hear` the key of each item a step makes under a name the
+    /// plan doesn't have (a conflict copy), right before it makes it.
+    pub fn telling_new_names(mut self, hear: &'a dyn Fn(&str)) -> Self {
+        self.new_names = Some(hear);
         self
     }
 
@@ -1644,6 +1655,9 @@ impl<'a> Executor<'a> {
             return Ok(Done::Skipped("changed since the scan".into()));
         }
         let conflict_key = self.free_conflict_name(key)?;
+        if let Some(hear) = self.new_names {
+            hear(&conflict_key);
+        }
         let aside = self.path(Side::Destination, &conflict_key);
         move_to_new_name(&destination_path, &aside).map_err(|e| Error::file(&destination_path, e))?;
         self.touch(&aside);
@@ -2698,5 +2712,33 @@ mod tests {
             let name = executor.spellings.disk(side, &key);
             assert!(unicode_normalization::is_nfc(&name), "{name:?} on the {}", side.word());
         }
+    }
+
+    /// The run hears of a conflict copy before it's made on either side: a change the folder
+    /// watcher reports there from then on is the run's own write.
+    #[test]
+    fn a_conflict_copy_is_told_before_it_is_made() {
+        let (_tmp, shores) = shores();
+        write(&shores.source.join("plan.txt"), "the source's version", 1_700_000_000);
+        write(&shores.destination.join("plan.txt"), "the destination's version", 1_700_000_100);
+        let (source, destination) = (seen(&shores.source.join("plan.txt")), seen(&shores.destination.join("plan.txt")));
+        let mut plan = Plan::default();
+        plan.push(Action::KeepBoth { path: "plan.txt".into(), source_bytes: source.size, destination_bytes: destination.size, source, destination });
+        // Each key told, and whether it was already there on either side when it was.
+        let told: RefCell<Vec<(String, bool)>> = RefCell::default();
+        let hear = |key: &str| {
+            let there = [&shores.source, &shores.destination].into_iter().any(|root| root.join(key).exists());
+            told.borrow_mut().push((key.to_string(), there));
+        };
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel).telling_new_names(&hear);
+        let observer = |_: &crate::model::Progress| {};
+        let outcome = executor.run(&plan, &mut ProgressMeter::for_plan(&plan, &observer));
+        assert!(outcome.failed.is_empty() && outcome.skipped.is_empty(), "{outcome:?}");
+
+        let copy = names_in(&shores.destination).into_iter().find(|name| name.starts_with("plan (conflict ")).expect("both versions are kept");
+        assert_eq!(fs::read_to_string(shores.source.join(&copy)).unwrap(), "the destination's version");
+        assert_eq!(*told.borrow(), vec![(copy, false)], "told once, before the copy was there");
     }
 }

@@ -193,11 +193,11 @@ pub(crate) struct Confirmed {
     pub acknowledged: bool,
 }
 
-/// The items a sync writes, by key: its plan's steps, and the items its steps made under new
-/// names (conflict copies). Changes the folder watcher hears about anywhere else while the
-/// sync runs are the person's (or another app's), and are looked at once it's done. Until
-/// the sync knows its plan (it's still looking), nothing it could write is known, and it
-/// hasn't written anything: every change is someone else's.
+/// The items a sync writes, by key: its plan's steps, and the items its steps make under new
+/// names (conflict copies), each from right before it's made. Changes the folder watcher hears
+/// about anywhere else while the sync runs are the person's (or another app's), and are looked
+/// at once it's done. Until the sync knows its plan (it's still looking), nothing it could
+/// write is known, and it hasn't written anything: every change is someone else's.
 #[derive(Debug, Default)]
 pub(crate) struct OwnWrites {
     /// The sync's items and every folder above them (a folder changes when an item in it does).
