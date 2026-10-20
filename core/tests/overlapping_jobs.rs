@@ -905,6 +905,189 @@ fn another_charons_sync_in_a_folder_inside_makes_the_job_wait() {
 }
 
 #[test]
+fn another_charons_sync_that_started_inside_after_the_list_was_made_makes_the_job_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (docs, nas) = (tmp.path().join("Docs"), tmp.path().join("NAS/Docs"));
+    write(&docs.join("Projects/plan.txt"), "plan");
+    fs::create_dir_all(nas.join("Projects")).unwrap();
+    let id = add(&engine, job_setup("Docs", &docs, &nas, SyncMode::TwoWay));
+    let review = engine.prepare_review(&id).unwrap();
+
+    // Once the list is made, another computer starts the first sync of NAS/Docs/Projects,
+    // which had no Charon folder when the folders were looked at.
+    let note = another_charons_note(&nas.join("Projects"), Some("studio-mac"));
+    let approval = engine.approve(&id, &review.review_id, true).expect("the confirmation is kept");
+    assert_eq!(approval, Approval::Waiting { waiting_for: "Charon on studio-mac".into() });
+    assert!(!nas.join("Projects/plan.txt").exists(), "nothing was carried into the other sync's folder");
+
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(nas.join("Projects/plan.txt").exists());
+}
+
+#[test]
+fn another_charons_sync_in_a_folder_made_after_the_list_makes_the_job_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (docs, nas) = (tmp.path().join("Docs"), tmp.path().join("NAS/Docs"));
+    write(&docs.join("Letters/2026/june.txt"), "june");
+    write(&docs.join("Notes/todo.txt"), "todo");
+    fs::create_dir_all(&nas).unwrap();
+    let id = add(&engine, job_setup("Docs", &docs, &nas, SyncMode::TwoWay));
+    let review = engine.prepare_review(&id).unwrap();
+
+    // The list makes Letters/2026 on the NAS. Before it's confirmed, someone makes that
+    // folder there, and another computer starts syncing it.
+    let note = another_charons_note(&nas.join("Letters/2026"), Some("office-pc"));
+    let approval = engine.approve(&id, &review.review_id, true).expect("the confirmation is kept");
+    assert_eq!(approval, Approval::Waiting { waiting_for: "Charon on office-pc".into() });
+    assert!(!nas.join("Letters/2026/june.txt").exists() && !nas.join("Notes").exists(), "nothing changed");
+
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+    assert!(nas.join("Notes/todo.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sync_never_leaves_its_note_through_a_link_it_replaces() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let (src, dst, elsewhere) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("elsewhere"));
+    write(&src.join("Work/plan.txt"), "plan");
+    // In the destination, Work is a link to a folder of another job, with Charon's own
+    // folder in it. The sync replaces the link by a folder and never touches what it
+    // points to.
+    fs::create_dir_all(elsewhere.join(".charon")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, dst.join("Work")).unwrap();
+    let id = add(engine, job_setup("Photos", &src, &dst, SyncMode::Mirror));
+    let (folder, noted) = (elsewhere.clone(), Arc::new(AtomicBool::new(true)));
+    let note = noted.clone();
+    rig.at_first_step(move || note.store(busy_notes(&folder) > 0, Ordering::SeqCst));
+    let_progress_throttle_pass();
+    confirm(engine, &id);
+    assert!(rig.hook_fired());
+    assert!(!noted.load(Ordering::SeqCst), "no note went through the link");
+    assert!(dst.join("Work").symlink_metadata().unwrap().is_dir() && dst.join("Work/plan.txt").exists());
+    assert!(!elsewhere.join("plan.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sync_never_leaves_its_note_through_a_link_made_after_the_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let (docs, nas, elsewhere) = (tmp.path().join("Docs"), tmp.path().join("NAS/Docs"), tmp.path().join("Elsewhere"));
+    write(&docs.join("Projects/plan.txt"), "plan");
+    fs::create_dir_all(nas.join("Projects")).unwrap();
+    // Elsewhere is another job's folder, with Charon's own folder in it.
+    fs::create_dir_all(elsewhere.join(".charon")).unwrap();
+    let id = add(engine, job_setup("Docs", &docs, &nas, SyncMode::TwoWay));
+    let review = engine.prepare_review(&id).unwrap();
+
+    // Once the list is made, the person replaces NAS/Docs/Projects by a link to Elsewhere.
+    fs::remove_dir(nas.join("Projects")).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, nas.join("Projects")).unwrap();
+    let (folder, noted) = (elsewhere.clone(), Arc::new(AtomicBool::new(true)));
+    let note = noted.clone();
+    rig.at_first_step(move || note.store(busy_notes(&folder) > 0, Ordering::SeqCst));
+    let_progress_throttle_pass();
+    assert_eq!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Started);
+    wait_idle(engine, &id);
+    assert!(rig.hook_fired());
+    assert!(!noted.load(Ordering::SeqCst), "no note went through the link");
+    assert!(!elsewhere.join("plan.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_sync_of_the_folder_a_link_made_after_the_list_leads_to_holds_nothing_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let (docs, nas, elsewhere) = (tmp.path().join("Docs"), tmp.path().join("NAS/Docs"), tmp.path().join("Elsewhere"));
+    write(&docs.join("Projects/plan.txt"), "plan");
+    // NAS/Docs/Projects is another job's folder: the scan meets Charon's own folder there.
+    fs::create_dir_all(nas.join("Projects/.charon")).unwrap();
+    let id = add(engine, job_setup("Docs", &docs, &nas, SyncMode::TwoWay));
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(review.blocked.is_none(), "{:?}", review.blocked);
+
+    // Once the list is made, the person replaces NAS/Docs/Projects by a link to Elsewhere,
+    // a folder another computer is syncing right now. The sync never goes through the link,
+    // so it doesn't wait for that sync, and leaves no note there.
+    fs::remove_dir_all(nas.join("Projects")).unwrap();
+    another_charons_note(&elsewhere, Some("studio-mac"));
+    std::os::unix::fs::symlink(&elsewhere, nas.join("Projects")).unwrap();
+    let (folder, notes) = (elsewhere.clone(), Arc::new(Mutex::new(None)));
+    let seen = notes.clone();
+    rig.at_first_step(move || *seen.lock().unwrap() = Some(busy_notes(&folder)));
+    let_progress_throttle_pass();
+    assert_eq!(engine.approve(&id, &review.review_id, true).unwrap(), Approval::Started);
+    wait_idle(engine, &id);
+    assert!(rig.hook_fired());
+    assert_eq!(*notes.lock().unwrap(), Some(1), "only the other sync's note is there");
+    assert!(!elsewhere.join("plan.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn another_charons_sync_in_a_folder_that_was_a_link_when_the_list_was_made_makes_the_job_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (src, dst, old) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("old"));
+    write(&src.join("Work/plan.txt"), "plan");
+    // In the destination, Work is a link when the list is made: the list replaces it by a
+    // folder.
+    fs::create_dir_all(&old).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    std::os::unix::fs::symlink(&old, dst.join("Work")).unwrap();
+    let id = add(&engine, job_setup("Photos", &src, &dst, SyncMode::Mirror));
+    let review = engine.prepare_review(&id).unwrap();
+
+    // Before it's confirmed, the link is replaced by a real folder, and another computer
+    // starts syncing that folder.
+    fs::remove_file(dst.join("Work")).unwrap();
+    another_charons_note(&dst.join("Work"), Some("office-pc"));
+    let approval = engine.approve(&id, &review.review_id, true).expect("the confirmation is kept");
+    assert_eq!(approval, Approval::Waiting { waiting_for: "Charon on office-pc".into() });
+    assert!(!dst.join("Work/plan.txt").exists(), "nothing was carried into the other sync's folder");
+}
+
+#[test]
+fn a_sync_leaves_its_note_where_a_sync_of_a_folder_inside_finds_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let rig = Rig::open(&tmp.path().join("data"));
+    let engine = &rig.engine;
+    let (src, dst, work) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("work"));
+    write(&src.join("Work/plan.txt"), "plan");
+    // "Work" syncs a folder inside the folder "Everything" syncs; its marker stays there.
+    let inner = add(engine, job_setup("Work", &src.join("Work"), &work, SyncMode::Backup));
+    confirm(engine, &inner);
+    assert_eq!(busy_notes(&src.join("Work")), 0);
+
+    // Another Charon may reach src/Work through a share that starts there, where nothing of
+    // src is above it: while "Everything" syncs, its note is in the Charon folder of
+    // src/Work as well.
+    let outer = add(engine, job_setup("Everything", &src, &dst, SyncMode::Backup));
+    let (folder, seen) = (src.join("Work"), Arc::new(AtomicBool::new(false)));
+    let saw = seen.clone();
+    rig.at_first_step(move || saw.store(busy_notes(&folder) == 1, Ordering::SeqCst));
+    let_progress_throttle_pass();
+    confirm(engine, &outer);
+    assert!(rig.hook_fired());
+    assert!(seen.load(Ordering::SeqCst), "the note is at the top of the folder inside");
+    assert_eq!(busy_notes(&src.join("Work")), 0, "and taken away with the others");
+    assert!(dst.join("Work/plan.txt").exists());
+}
+
+#[test]
 fn notes_left_by_a_sync_cut_short_count_for_nothing_once_charon_starts_again() {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");

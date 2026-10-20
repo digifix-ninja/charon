@@ -136,6 +136,21 @@ impl Action {
         }
     }
 
+    /// Whether the step changes anything on `side` (keeping both versions changes both).
+    pub fn changes(&self, side: Side) -> bool {
+        match self {
+            Action::KeepBoth { .. } => true,
+            _ => self.side() == Some(side),
+        }
+    }
+
+    /// The folders whose contents the step changes: the folder it makes or removes, and
+    /// every folder its item is in.
+    pub fn folders(&self) -> impl Iterator<Item = &str> {
+        let own = matches!(self, Action::CreateDir { .. } | Action::Delete { item: EntryKind::Dir, .. }).then_some(self.path());
+        own.into_iter().chain(Keys::ancestors(self.path()))
+    }
+
     /// The order a review lists steps in: what deserves a look first.
     fn review_rank(&self) -> u8 {
         match self {

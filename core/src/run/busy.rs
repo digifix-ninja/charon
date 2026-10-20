@@ -1,6 +1,7 @@
 //! Charon's note that a sync is at work in a folder: `.charon/<id>.busy` at the top of each
-//! folder of a running sync, wherever Charon can write there. It names the job, the Charon
-//! the sync runs in and the computer, with a heartbeat refreshed while the sync runs.
+//! folder of a running sync, wherever Charon can write there, and in Charon's own folders
+//! inside them. It names the job, the Charon the sync runs in and the computer, with a
+//! heartbeat refreshed while the sync runs.
 //!
 //! Charon keeps two of its own syncs apart by their folders' paths, and a path can't always
 //! tell: a share mounted under two names is one place under two paths. Another Charon (a
@@ -10,7 +11,10 @@
 //! folders, in the folders above them, and in the folders inside them that hold Charon's
 //! own folder. A note of another sync means the folders are busy, and the sync waits. Two
 //! syncs that start at the same moment each find the other's note, so at most one of them
-//! goes ahead.
+//! goes ahead. A sync of a folder inside another sync's folder may reach it through a share
+//! or mount that starts lower down, where the folders above it can't be seen: it finds the
+//! other sync's note at its own top. Below its own folders, a sync never reads or leaves a
+//! note through a link: a link leads out of its folders, to folders it never syncs.
 //!
 //! Whether the sync of a note is still at work is judged by this computer's clock alone,
 //! since two computers' clocks can be minutes or hours apart: a note that hasn't changed for
@@ -30,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
@@ -112,16 +116,44 @@ struct Sighting {
 /// computer's clock), which notes its own syncs leave now, and which Charons worked with its
 /// data folder before.
 ///
-/// Only one Charon works with a data folder at a time (see `store::DataLock`), so the
-/// Charons that worked with it before have all stopped, and their notes are leftovers: a
-/// sync that was cut short by a crash, or by a quit that didn't wait for it. They're known
-/// by the list of those Charons kept in the data folder.
+/// Only one Charon on a computer works with a data folder at a time (see `store::DataLock`),
+/// so the Charons that worked with it here before have all stopped, and their notes are
+/// leftovers: a sync that was cut short by a crash, or by a quit that didn't wait for it.
+/// They're known by the list of those Charons kept in the data folder. A copy of the data
+/// folder (moved to a new computer while the old one still syncs, or copied into another
+/// folder) brings the list along, so the list keeps where each Charon ran: one that ran with
+/// another computer or another folder may still be at work there, and its notes count like
+/// any other Charon's.
 pub struct BusyWatch {
     /// This Charon among others that may sync the same folders: new each time it starts.
     instance: String,
-    /// The Charons that worked with this data folder before this one.
+    /// The Charons that worked with this data folder on this computer before this one.
     earlier: HashSet<String>,
     known: Mutex<Known>,
+}
+
+/// One start of Charon, as the list of Charons in a data folder keeps it: the Charon, and
+/// the computer and the data folder it ran with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Launch {
+    instance: String,
+    host: String,
+    folder: PathBuf,
+}
+
+impl Launch {
+    /// The start of the Charon `instance` on this computer, with the data folder whose list
+    /// of Charons is `list`.
+    fn here(instance: &str, list: &Path) -> Self {
+        let folder = list.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self { instance: instance.to_string(), host: this_computer(), folder }
+    }
+
+    /// Whether this Charon ran on the same computer and with the same data folder as `now`:
+    /// the data folder's lock then kept them apart, so it has stopped.
+    fn ran_like(&self, now: &Launch) -> bool {
+        self.host == now.host && self.folder == now.folder
+    }
 }
 
 #[derive(Default)]
@@ -137,16 +169,18 @@ impl BusyWatch {
     /// `list`: this one is added to it.
     pub fn open(list: &Path) -> Self {
         let instance = uuid::Uuid::new_v4().simple().to_string();
-        let earlier: Vec<String> = fs::read(list).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let mut listed = vec![instance.clone()];
-        listed.extend(earlier.iter().take(EARLIER_KEPT - 1).cloned());
+        let now = Launch::here(&instance, list);
+        let before: Vec<Launch> = fs::read(list).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let earlier = before.iter().filter(|launch| launch.ran_like(&now)).map(|launch| launch.instance.clone()).collect();
+        let mut listed = vec![now];
+        listed.extend(before.into_iter().take(EARLIER_KEPT - 1));
         let saved = serde_json::to_vec(&listed).map_err(Error::from).and_then(|bytes| atomic::write(list, &bytes));
         if let Err(e) = saved {
             // Its notes are then told apart from other Charons' only by their heartbeat,
             // after a crash: two minutes later.
             log::warn!("couldn't save the list of Charons in {}: {e}", list.display());
         }
-        Self { instance, earlier: earlier.into_iter().collect(), known: Mutex::default() }
+        Self { instance, earlier, known: Mutex::default() }
     }
 
     /// This Charon among others that may sync the same folders.
@@ -161,8 +195,9 @@ impl BusyWatch {
 
     /// The notes of syncs other than `me` around `roots` that are still at work: in their
     /// Charon folders, in those of every folder above them, and in those of the folders
-    /// `inside` them. Notes whose Charon stopped are tidied away (only those Charon can
-    /// read: a file it can't read may not be a note at all).
+    /// `inside` them (never through a link, see `places`). Notes whose Charon stopped are
+    /// tidied away (only those Charon can read: a file it can't read may not be a note at
+    /// all).
     pub fn around(&self, roots: &[&Path], inside: &[PathBuf], me: &BusyNote) -> Vec<BusyNote> {
         self.around_at(roots, inside, me, Instant::now())
     }
@@ -227,9 +262,14 @@ impl BusyWatch {
     }
 
     /// Where notes are looked for: the roots, every folder above them as they really are
-    /// (whatever name they're reached under), and the folders `inside` them. Each folder is
-    /// there once, by its real path where it has one: under two names (a link such as macOS'
-    /// /var, or Windows' \\?\ form), its notes would count twice.
+    /// (whatever name they're reached under), and the folders `inside` them whose Charon
+    /// folder is reached without going through a link. Each folder is there once, by its
+    /// real path where it has one: under two names (a link such as macOS' /var, or Windows'
+    /// \\?\ form), its notes would count twice.
+    ///
+    /// The folders inside were found by a look that may be hours old. A folder among them,
+    /// or one on the way to it, may have been replaced by a link since: what it leads to is
+    /// no folder of this sync's, and a sync there doesn't make this one wait.
     fn places(roots: &[&Path], inside: &[PathBuf]) -> BTreeSet<PathBuf> {
         let mut places: BTreeSet<PathBuf> = BTreeSet::new();
         for root in roots {
@@ -240,7 +280,12 @@ impl BusyWatch {
                 }
             }
         }
-        places.extend(inside.iter().map(|folder| fs::canonicalize(folder).unwrap_or_else(|_| folder.clone())));
+        places.extend(
+            inside
+                .iter()
+                .filter(|folder| is_real_folder_inside(roots, &folder.join(MARKER_FOLDER)))
+                .map(|folder| fs::canonicalize(folder).unwrap_or_else(|_| folder.clone())),
+        );
         places
     }
 
@@ -292,6 +337,8 @@ pub struct Claim {
 
 /// The notes a claim left, and what they say.
 struct Notes {
+    /// The sync's folders: every note is in one of them, or inside one.
+    roots: Vec<PathBuf>,
     files: Vec<PathBuf>,
     note: BusyNote,
 }
@@ -300,13 +347,13 @@ impl Notes {
     /// Writes the note into every file again, with a new heartbeat. A Charon folder that
     /// went away (its drive was unplugged, its share dropped) is left as it is: making it
     /// again would put it on the computer's own disk. Its note is written again once the
-    /// folder is back.
+    /// folder is back. So is one that is now reached through a link (a folder on the way
+    /// was replaced by one while the sync runs): the link leads out of the sync's folders.
     fn refresh(&mut self) {
         self.note.heartbeat = Utc::now();
         let Ok(bytes) = serde_json::to_vec_pretty(&self.note) else { return };
         for file in &self.files {
-            let there = file.parent().is_some_and(|folder| fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir()));
-            if !there {
+            if !file.parent().is_some_and(|folder| is_real_folder_inside(&self.roots, folder)) {
                 continue;
             }
             if let Err(e) = atomic::write_into(file, &bytes) {
@@ -323,9 +370,16 @@ impl Notes {
 }
 
 impl Claim {
-    /// Leaves `note` in each of `roots` where Charon can write, then looks around them (see
-    /// `BusyWatch::around`). When another sync is at work there, nothing stays behind and
-    /// the error is that sync's note.
+    /// Leaves `note` in each of `roots` where Charon can write, and in the Charon folders of
+    /// the folders `inside` them, then looks around them (see `BusyWatch::around`). When
+    /// another sync is at work there, nothing stays behind and the error is that sync's note.
+    ///
+    /// A sync of a folder inside may reach it through a share or mount that starts lower
+    /// down, and then can't look in the folders above it: it finds this sync's note in its
+    /// own Charon folder. A Charon folder inside gets a note only while it and every folder
+    /// on the way to it from the sync's folder are folders of their own: one replaced by a
+    /// link since the folders were looked at would take the note out of the sync's folders.
+    /// A Charon folder that's gone gets no note, and none is made.
     pub fn take(watch: &Arc<BusyWatch>, note: BusyNote, roots: &[&Path], inside: &[PathBuf]) -> std::result::Result<Claim, BusyNote> {
         let name = OsString::from(format!("{}{BUSY_EXTENSION}", uuid::Uuid::new_v4().simple()));
         let bytes = serde_json::to_vec_pretty(&note).unwrap_or_default();
@@ -343,8 +397,20 @@ impl Claim {
                 Err(e) => log::info!("no busy note in {} ({e})", root.display()),
             }
         }
+        for folder in inside.iter().map(|place| place.join(MARKER_FOLDER)) {
+            if !is_real_folder_inside(roots, &folder) {
+                log::info!("no busy note in {}: it's gone, or reached through a link", folder.display());
+                continue;
+            }
+            let file = folder.join(&name);
+            match atomic::write_into(&file, &bytes) {
+                Ok(()) => files.push(file),
+                Err(e) => log::info!("no busy note in {} ({e})", folder.display()),
+            }
+        }
         let other = watch.around(roots, inside, &note).into_iter().next();
-        let mut claim = Claim { watch: watch.clone(), name, notes: Arc::new(Mutex::new(Notes { files, note })), _heartbeat: None };
+        let roots = roots.iter().map(|root| root.to_path_buf()).collect();
+        let mut claim = Claim { watch: watch.clone(), name, notes: Arc::new(Mutex::new(Notes { roots, files, note })), _heartbeat: None };
         if let Some(other) = other {
             return Err(other);
         }
@@ -379,6 +445,26 @@ impl Drop for Claim {
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).remove();
         self.watch.hold(&self.name, false);
     }
+}
+
+/// Whether `folder` is there as a folder of its own, not a link to one.
+fn is_real_folder(folder: &Path) -> bool {
+    fs::symlink_metadata(folder).is_ok_and(|meta| meta.is_dir())
+}
+
+/// Whether `folder`, somewhere inside one of `roots`, is there as a folder of its own, and
+/// so is every folder on the way to it from that root: it's reached without going through
+/// a link. (The root itself may be a link: the person chose it.)
+fn is_real_folder_inside<R: AsRef<Path>>(roots: &[R], folder: &Path) -> bool {
+    roots.iter().any(|root| {
+        let Ok(below) = folder.strip_prefix(root) else { return false };
+        let mut path = root.as_ref().to_path_buf();
+        !below.as_os_str().is_empty()
+            && below.components().all(|part| {
+                path.push(part);
+                matches!(part, Component::Normal(_)) && is_real_folder(&path)
+            })
+    })
 }
 
 /// This computer's name, as other computers' Charons show it.
@@ -484,6 +570,36 @@ mod tests {
     }
 
     #[test]
+    fn a_sync_of_a_folder_inside_finds_the_note_at_its_own_top() {
+        let (data, tmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (mine, theirs) = (watch(&data.path().join("mine")), watch(&data.path().join("theirs")));
+        let (homes, laptop) = (tmp.path().join("homes"), tmp.path().join("laptop"));
+        let (photos, music) = (homes.join("alice/Photos"), homes.join("alice/Music"));
+        // Photos is another job's folder: the scan met Charon's own folder there.
+        fs::create_dir_all(photos.join(MARKER_FOLDER)).unwrap();
+        fs::create_dir_all(&music).unwrap();
+        fs::create_dir_all(&laptop).unwrap();
+        let claim = Claim::take(&mine, mine.note(&"homes".into(), "Homes"), &[&homes, &laptop], &[photos.clone(), music.clone()]).unwrap();
+        assert_eq!(notes_in(&photos), 1, "a note in the Charon folder inside");
+        assert!(!music.join(MARKER_FOLDER).exists(), "no Charon folder is made");
+
+        // Another Charon syncs Photos through a share that starts there, where nothing of
+        // "homes" is above it. (Mounting needs special rights: a link to the Charon folder
+        // of Photos plays the share's top.)
+        #[cfg(unix)]
+        {
+            let share = tmp.path().join("home");
+            fs::create_dir_all(&share).unwrap();
+            std::os::unix::fs::symlink(photos.join(MARKER_FOLDER), share.join(MARKER_FOLDER)).unwrap();
+            let refused = Claim::take(&theirs, theirs.note(&"photos".into(), "Photos"), &[&share], &[]).err().expect("the folder is busy");
+            assert_eq!(refused.job, "homes");
+        }
+        drop(claim);
+        assert_eq!(notes_in(&photos), 0, "taken away with the claim");
+        assert!(Claim::take(&theirs, theirs.note(&"photos".into(), "Photos"), &[&photos], &[]).is_ok());
+    }
+
+    #[test]
     fn a_note_counts_until_it_stays_the_same_for_two_minutes_by_this_computers_clock() {
         let (data, tmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let watch = watch(data.path());
@@ -542,6 +658,36 @@ mod tests {
     }
 
     #[test]
+    fn notes_of_a_charon_that_ran_with_a_copy_of_the_data_folder_still_count() {
+        let (data, nas) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // Charon syncs the share right now, while its data folder is copied into another
+        // folder, and a Charon starts with the copy.
+        let (first, copy) = (data.path().join("first"), data.path().join("copy"));
+        let old = watch(&first);
+        let claim = Claim::take(&old, old.note(&"job".into(), "Job"), &[nas.path()], &[]).unwrap();
+        let file = BusyWatch::in_folder(&nas.path().join(MARKER_FOLDER)).remove(0).0;
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(first.join("instances.json"), copy.join("instances.json")).unwrap();
+        let new = watch(&copy);
+        let refused = Claim::take(&new, new.note(&"job".into(), "Job"), &[nas.path()], &[]).err().expect("the folder is busy");
+        assert_eq!(refused.instance, old.instance());
+        assert!(file.exists(), "the live note stays");
+        drop(claim);
+
+        // The data folder was moved to a new computer, to the same place there, while the
+        // old computer's Charon still syncs.
+        let moved = data.path().join("moved");
+        let there = Launch { instance: "old-mac-charon".into(), host: "old-mac".into(), folder: moved.clone() };
+        atomic::write(&moved.join("instances.json"), &serde_json::to_vec(&vec![there]).unwrap()).unwrap();
+        let mut syncing = note("job", "old-mac-charon");
+        syncing.host = "old-mac".into();
+        let file = leave(nas.path(), &syncing);
+        let new = watch(&moved);
+        assert_eq!(new.around(&[nas.path()], &[], &new.note(&"job".into(), "Job")), vec![syncing]);
+        assert!(file.exists(), "the live note stays");
+    }
+
+    #[test]
     fn this_charons_note_counts_only_while_its_claim_lasts() {
         let (data, a) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let watch = watch(data.path());
@@ -596,6 +742,32 @@ mod tests {
         assert_eq!(notes_in(&usb.join("Backup")), 1);
         drop(claim);
         assert_eq!(notes_in(&laptop) + notes_in(&usb.join("Backup")), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn notes_never_go_through_a_link_inside_the_syncs_folders() {
+        let (data, tmp) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let watch = watch(data.path());
+        let (docs, elsewhere) = (tmp.path().join("Docs"), tmp.path().join("Elsewhere"));
+        // Elsewhere is another job's folder, and another Charon is at work there.
+        leave(&elsewhere, &note("elsewhere", "another"));
+        // The scan met Charon's own folder in Docs/Projects and Docs/Work. Projects has been
+        // replaced by a link to Elsewhere since.
+        fs::create_dir_all(docs.join("Work").join(MARKER_FOLDER)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, docs.join("Projects")).unwrap();
+        let inside = [docs.join("Projects"), docs.join("Work")];
+        let claim = Claim::take(&watch, watch.note(&"docs".into(), "Docs"), &[&docs], &inside).expect("a sync of Elsewhere holds nothing up");
+        assert_eq!(notes_in(&elsewhere), 1, "no note went through the link");
+        assert_eq!(notes_in(&docs.join("Work")), 1);
+
+        // While the sync runs, Work is moved away and a link to Elsewhere takes its place:
+        // the heartbeat doesn't write through it either.
+        fs::rename(docs.join("Work"), tmp.path().join("Work moved")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, docs.join("Work")).unwrap();
+        claim.notes.lock().unwrap().refresh();
+        assert_eq!(notes_in(&elsewhere), 1, "the heartbeat wrote nothing through the link");
+        assert_eq!(notes_in(&docs), 1, "the note at the top is refreshed");
     }
 
     #[test]
