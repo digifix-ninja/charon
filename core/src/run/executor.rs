@@ -1093,7 +1093,7 @@ impl<'a> Executor<'a> {
                 match self.replace(to, &partial, &target, &relative, &old) {
                     Ok(true) => {}
                     Ok(false) => {
-                        let _ = fs::remove_file(&kept);
+                        Copier::discard(&kept);
                         return Ok(None);
                     }
                     Err(e) => {
@@ -1101,7 +1101,7 @@ impl<'a> Executor<'a> {
                         // each sync that fails here (an app holds the file open) would leave
                         // one more.
                         if Self::still_in_place(&target, &old, copy) {
-                            let _ = fs::remove_file(&kept);
+                            Copier::discard(&kept);
                         }
                         return Err(e);
                     }
@@ -1162,7 +1162,7 @@ impl<'a> Executor<'a> {
             Copier::discard(partial);
             return Ok(false);
         };
-        Self::make_writable(target);
+        Copier::make_writable(target);
         let swapped = Swapped { checked: Identity::of(&checked), copy: Identity::at(partial) };
         match swap(partial, target) {
             Ok(()) => self.check_swapped(to, partial, target, relative, expected, swapped),
@@ -1304,7 +1304,7 @@ impl<'a> Executor<'a> {
 
     /// Removes a file or link for good.
     fn remove_item(path: &Path) -> io::Result<()> {
-        Self::make_writable(path);
+        Copier::make_writable(path);
         fs::remove_file(path)
     }
 
@@ -1519,7 +1519,7 @@ impl<'a> Executor<'a> {
         self.touch(&kept);
         let removed = self.remove_checked(side, relative, target, planned);
         if !matches!(removed, Ok(true)) {
-            let _ = fs::remove_file(&kept);
+            Copier::discard(&kept);
         }
         removed
     }
@@ -1527,7 +1527,7 @@ impl<'a> Executor<'a> {
     /// Removes the file or link at `target` for good, if it's still `planned`: renamed aside,
     /// checked, then removed. `false` when it isn't (it's put back).
     fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
-        Self::make_writable(target);
+        Copier::make_writable(target);
         // Gone already: what the plan wanted.
         let Some(aside) = Self::move_aside(target, self.shores.root(side))? else { return Ok(true) };
         let moved = self.look_fresh(side, &aside);
@@ -1542,25 +1542,6 @@ impl<'a> Executor<'a> {
                 Err(Error::file(target, e))
             }
         }
-    }
-
-    /// Windows refuses to replace or delete a read-only file or folder (Explorer marks
-    /// customised folders so); the item was checked to be exactly what the plan saw, so its
-    /// read-only mark is lifted first.
-    fn make_writable(path: &Path) {
-        #[cfg(windows)]
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            let mut permissions = meta.permissions();
-            if (meta.is_file() || meta.is_dir()) && permissions.readonly() {
-                #[allow(clippy::permissions_set_readonly_false)]
-                permissions.set_readonly(false);
-                if let Err(e) = fs::set_permissions(path, permissions) {
-                    log::warn!("couldn't lift the read-only mark of {}: {e}", path.display());
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = path;
     }
 
     /// Removes a folder whose contents were removed by earlier steps. If anything besides
@@ -1585,7 +1566,7 @@ impl<'a> Executor<'a> {
             self.remove(side, item, &root.join(item), true, None)?;
         }
         self.real_folders.borrow_mut().clear();
-        Self::make_writable(target);
+        Copier::make_writable(target);
         match fs::remove_dir(target) {
             Ok(()) => {
                 self.removed_folders.borrow_mut().insert(target.to_path_buf());

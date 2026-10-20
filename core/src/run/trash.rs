@@ -139,7 +139,7 @@ impl Trash {
         let temp = Copier::partial_in(&base);
         Self::copy_file(&from, &temp)?;
         self.keep(root, &base, relative, |place| rename_new(&temp, place)).map_err(|e| {
-            let _ = fs::remove_file(&temp);
+            Copier::discard(&temp);
             Error::file(base.join(relative), e)
         })
     }
@@ -287,12 +287,12 @@ impl Trash {
         // `scan::Contents::open`); it stays open while it's copied.
         let _reading = crate::scan::Contents::open(from).map_err(unreadable)?;
         if let Err(e) = fs::copy(from, to) {
-            let _ = fs::remove_file(to);
+            Copier::discard(to);
             return Err(unreadable(e));
         }
         // The copy must be on the drive before the original is replaced.
         if let Err(e) = Self::unlock(to).and_then(|()| Self::flush(to)) {
-            let _ = fs::remove_file(to);
+            Copier::discard(to);
             return Err(Error::file(to, e));
         }
         let modified = filetime::FileTime::from_last_modification_time(&meta);
@@ -494,6 +494,7 @@ impl Trash {
                 log::warn!("kept {}: something in it changed after it went into the trash, or can't be read", folder.display());
                 continue;
             }
+            Self::lift_read_only_marks(&folder);
             if let Err(e) = fs::remove_dir_all(&folder) {
                 log::warn!("couldn't clear old trash {}: {e}", folder.display());
             }
@@ -501,6 +502,20 @@ impl Trash {
         // Leave no empty trash folder behind.
         let _ = fs::remove_dir(&trash);
     }
+
+    /// Windows: what went into the trash keeps its read-only mark, and FAT and exFAT drives
+    /// won't remove a read-only file or folder. The marks inside `folder` are lifted first,
+    /// never through a link.
+    #[cfg(windows)]
+    fn lift_read_only_marks(folder: &Path) {
+        for item in walkdir::WalkDir::new(folder).follow_links(false).into_iter().flatten() {
+            Copier::make_writable(item.path());
+        }
+    }
+
+    /// Read-only marks are Windows' own.
+    #[cfg(not(windows))]
+    fn lift_read_only_marks(_folder: &Path) {}
 
     /// `root/.charon-trash`, if it is a real folder (created when `create` and missing).
     fn real_trash(root: &Path, create: bool) -> io::Result<PathBuf> {
@@ -775,6 +790,30 @@ mod tests {
         Trash::sweep(tmp.path(), &[old], false);
         assert!(!folders[0].exists());
         assert!(folders[1].exists());
+    }
+
+    /// Windows: what went into the trash keeps its read-only mark, and is still cleared out
+    /// with its folder. (FAT and exFAT drives won't remove a read-only file or folder until
+    /// the mark is lifted.)
+    #[cfg(windows)]
+    #[test]
+    fn read_only_items_in_old_trash_are_cleared_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        fs::create_dir_all(tmp.path().join("from a cd")).unwrap();
+        fs::write(tmp.path().join("from a cd/photo.jpg"), "photo").unwrap();
+        set_time(&tmp.path().join("from a cd/photo.jpg"), days_ago(41));
+        let kept = trash.put(tmp.path(), "from a cd/photo.jpg").unwrap();
+        trash.write_lists();
+        for item in [kept.as_path(), kept.parent().unwrap()] {
+            let mut permissions = fs::metadata(item).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(item, permissions).unwrap();
+        }
+        let look = Trash::look(tmp.path(), 30, false, false);
+        assert_eq!(look.expired.len(), 1);
+        Trash::sweep(tmp.path(), &[look.expired[0].name.clone()], false);
+        assert!(!tmp.path().join(TRASH_FOLDER).exists());
     }
 
     /// A folder without a list (an interrupted run, an earlier version) is judged by the

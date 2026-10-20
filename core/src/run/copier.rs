@@ -216,9 +216,33 @@ impl<'a> Copier<'a> {
         })
     }
 
-    /// Removes an unfinished copy.
-    pub fn discard(partial: &Path) {
-        let _ = fs::remove_file(partial);
+    /// Removes a copy Charon made: an unfinished one, or one it no longer needs in the trash.
+    /// A copy of a read-only file is read-only too, and under Windows FAT and exFAT drives
+    /// won't remove it with that mark, so it's lifted first.
+    pub fn discard(copy: &Path) {
+        Self::make_writable(copy);
+        let _ = fs::remove_file(copy);
+    }
+
+    /// Lifts the read-only mark of a file or folder about to be replaced or removed: Windows
+    /// refuses to replace or delete an item with it (Explorer marks customised folders so).
+    /// Only for Charon's own copies and trash, and for items checked to be exactly what the
+    /// plan saw.
+    /// Read-only marks are Windows' own: elsewhere nothing is done.
+    pub(crate) fn make_writable(path: &Path) {
+        #[cfg(windows)]
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            let mut permissions = meta.permissions();
+            if (meta.is_file() || meta.is_dir()) && permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                if let Err(e) = fs::set_permissions(path, permissions) {
+                    log::warn!("couldn't lift the read-only mark of {}: {e}", path.display());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = path;
     }
 
     /// A fresh temporary name in the folder of `to` (see `partial_in`).
@@ -651,6 +675,21 @@ mod tests {
         assert!(matches!(copy(std::time::Duration::from_secs(30)), Err(Error::Changed(_))));
         let far_ahead = copy(std::time::Duration::from_secs(40 * 24 * 60 * 60)).unwrap();
         assert_eq!(fs::read_to_string(&far_ahead.partial).unwrap(), "photo");
+    }
+
+    /// Windows: a copy of a read-only file is read-only too, and is still removed when it's
+    /// no longer needed. (FAT and exFAT drives won't remove it until the mark is lifted.)
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_copy_is_still_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = Copier::partial_in(tmp.path());
+        fs::write(&copy, "half").unwrap();
+        let mut permissions = fs::metadata(&copy).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&copy, permissions).unwrap();
+        Copier::discard(&copy);
+        assert!(!copy.exists());
     }
 
     #[test]
