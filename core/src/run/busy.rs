@@ -112,16 +112,44 @@ struct Sighting {
 /// computer's clock), which notes its own syncs leave now, and which Charons worked with its
 /// data folder before.
 ///
-/// Only one Charon works with a data folder at a time (see `store::DataLock`), so the
-/// Charons that worked with it before have all stopped, and their notes are leftovers: a
-/// sync that was cut short by a crash, or by a quit that didn't wait for it. They're known
-/// by the list of those Charons kept in the data folder.
+/// Only one Charon on a computer works with a data folder at a time (see `store::DataLock`),
+/// so the Charons that worked with it here before have all stopped, and their notes are
+/// leftovers: a sync that was cut short by a crash, or by a quit that didn't wait for it.
+/// They're known by the list of those Charons kept in the data folder. A copy of the data
+/// folder (moved to a new computer while the old one still syncs, or copied into another
+/// folder) brings the list along, so the list keeps where each Charon ran: one that ran with
+/// another computer or another folder may still be at work there, and its notes count like
+/// any other Charon's.
 pub struct BusyWatch {
     /// This Charon among others that may sync the same folders: new each time it starts.
     instance: String,
-    /// The Charons that worked with this data folder before this one.
+    /// The Charons that worked with this data folder on this computer before this one.
     earlier: HashSet<String>,
     known: Mutex<Known>,
+}
+
+/// One start of Charon, as the list of Charons in a data folder keeps it: the Charon, and
+/// the computer and the data folder it ran with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Launch {
+    instance: String,
+    host: String,
+    folder: PathBuf,
+}
+
+impl Launch {
+    /// The start of the Charon `instance` on this computer, with the data folder whose list
+    /// of Charons is `list`.
+    fn here(instance: &str, list: &Path) -> Self {
+        let folder = list.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self { instance: instance.to_string(), host: this_computer(), folder }
+    }
+
+    /// Whether this Charon ran on the same computer and with the same data folder as `now`:
+    /// the data folder's lock then kept them apart, so it has stopped.
+    fn ran_like(&self, now: &Launch) -> bool {
+        self.host == now.host && self.folder == now.folder
+    }
 }
 
 #[derive(Default)]
@@ -137,16 +165,18 @@ impl BusyWatch {
     /// `list`: this one is added to it.
     pub fn open(list: &Path) -> Self {
         let instance = uuid::Uuid::new_v4().simple().to_string();
-        let earlier: Vec<String> = fs::read(list).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
-        let mut listed = vec![instance.clone()];
-        listed.extend(earlier.iter().take(EARLIER_KEPT - 1).cloned());
+        let now = Launch::here(&instance, list);
+        let before: Vec<Launch> = fs::read(list).ok().and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default();
+        let earlier = before.iter().filter(|launch| launch.ran_like(&now)).map(|launch| launch.instance.clone()).collect();
+        let mut listed = vec![now];
+        listed.extend(before.into_iter().take(EARLIER_KEPT - 1));
         let saved = serde_json::to_vec(&listed).map_err(Error::from).and_then(|bytes| atomic::write(list, &bytes));
         if let Err(e) = saved {
             // Its notes are then told apart from other Charons' only by their heartbeat,
             // after a crash: two minutes later.
             log::warn!("couldn't save the list of Charons in {}: {e}", list.display());
         }
-        Self { instance, earlier: earlier.into_iter().collect(), known: Mutex::default() }
+        Self { instance, earlier, known: Mutex::default() }
     }
 
     /// This Charon among others that may sync the same folders.
@@ -539,6 +569,36 @@ mod tests {
         fs::write(&leftover, &left).unwrap();
         let elsewhere = BusyWatch::open(&data.path().join("other-data.json"));
         assert_eq!(elsewhere.around(&[a.path()], &[], &elsewhere.note(&"other".into(), "Other")).len(), 1);
+    }
+
+    #[test]
+    fn notes_of_a_charon_that_ran_with_a_copy_of_the_data_folder_still_count() {
+        let (data, nas) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        // Charon syncs the share right now, while its data folder is copied into another
+        // folder, and a Charon starts with the copy.
+        let (first, copy) = (data.path().join("first"), data.path().join("copy"));
+        let old = watch(&first);
+        let claim = Claim::take(&old, old.note(&"job".into(), "Job"), &[nas.path()], &[]).unwrap();
+        let file = BusyWatch::in_folder(&nas.path().join(MARKER_FOLDER)).remove(0).0;
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(first.join("instances.json"), copy.join("instances.json")).unwrap();
+        let new = watch(&copy);
+        let refused = Claim::take(&new, new.note(&"job".into(), "Job"), &[nas.path()], &[]).err().expect("the folder is busy");
+        assert_eq!(refused.instance, old.instance());
+        assert!(file.exists(), "the live note stays");
+        drop(claim);
+
+        // The data folder was moved to a new computer, to the same place there, while the
+        // old computer's Charon still syncs.
+        let moved = data.path().join("moved");
+        let there = Launch { instance: "old-mac-charon".into(), host: "old-mac".into(), folder: moved.clone() };
+        atomic::write(&moved.join("instances.json"), &serde_json::to_vec(&vec![there]).unwrap()).unwrap();
+        let mut syncing = note("job", "old-mac-charon");
+        syncing.host = "old-mac".into();
+        let file = leave(nas.path(), &syncing);
+        let new = watch(&moved);
+        assert_eq!(new.around(&[nas.path()], &[], &new.note(&"job".into(), "Job")), vec![syncing]);
+        assert!(file.exists(), "the live note stays");
     }
 
     #[test]
