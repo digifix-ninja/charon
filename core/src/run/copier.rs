@@ -28,6 +28,11 @@ const CLOUD_SINCE_SCAN: &str = "only in the cloud since the scan (not downloaded
 /// On a drive that keeps times in steps of a second or more, a file saved this recently
 /// may still be being written within the same step, where its time can't show it.
 const STILL_BEING_WRITTEN_MS: i64 = 3_000;
+/// A network drive's clock may be a few minutes ahead of the computer's, so a file saved
+/// there a moment ago can carry a time up to this far ahead. A time further ahead is no save
+/// going on: a camera with its clock set wrong, or a FAT stick written in a time zone further
+/// east.
+const CLOCK_AHEAD_MS: i64 = 5 * 60 * 1000;
 
 /// A finished copy under its temporary name, waiting to take the real one.
 #[derive(Debug)]
@@ -261,6 +266,12 @@ impl<'a> Copier<'a> {
         Self::temporary(to, top, |partial| OpenOptions::new().write(true).create_new(true).open(partial)).map_err(|(partial, e)| Error::file(partial, e))
     }
 
+    /// Whether a file last modified at `modified` was saved so recently, as of `now`, that on
+    /// a drive with coarse times it may still be being written.
+    fn saved_a_moment_ago(modified: i64, now: i64) -> bool {
+        modified > now - STILL_BEING_WRITTEN_MS && modified <= now + CLOCK_AHEAD_MS
+    }
+
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
     /// take along.
     fn write_partial(&self, from: &Path, partial: &Path, mut writer: File, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<BTreeSet<&'static str>> {
@@ -270,7 +281,7 @@ impl<'a> Copier<'a> {
         if !before.is_file() || !Entry::file(before.len(), Scanner::modified_ms(&before)).changed_at(changed).unchanged(expected) {
             return Err(Error::Changed("changed since the scan".into()));
         }
-        if self.coarse_source && Scanner::modified_ms(&before) > Scanner::millis(std::time::SystemTime::now()) - STILL_BEING_WRITTEN_MS {
+        if self.coarse_source && Self::saved_a_moment_ago(Scanner::modified_ms(&before), Scanner::millis(std::time::SystemTime::now())) {
             return Err(Error::Changed("saved a moment ago and may still be being written, so it waits for the next sync".into()));
         }
         let mut buffer = vec![0u8; CHUNK];
@@ -622,6 +633,24 @@ mod tests {
         assert!(matches!(result, Err(Error::Changed(_))));
         filetime::set_file_mtime(&from, filetime::FileTime::from_unix_time(1_600_000_000, 0)).unwrap();
         assert!(Copier::new(&never).coarse_source_times(true).file(&from, &to, &entry_of(&from), &mut |_| {}).is_ok());
+    }
+
+    /// A network drive's clock may be a little ahead, so a file dated a moment ahead waits
+    /// too. One dated far ahead (a camera with its clock set wrong) is no save going on: it's
+    /// copied, rather than waiting on every sync until the computer's clock catches up.
+    #[test]
+    fn a_file_dated_far_ahead_on_a_coarse_drive_is_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("IMG_0001.JPG");
+        fs::write(&from, "photo").unwrap();
+        let never = AtomicBool::new(false);
+        let copy = |ahead: std::time::Duration| {
+            filetime::set_file_mtime(&from, filetime::FileTime::from_system_time(std::time::SystemTime::now() + ahead)).unwrap();
+            Copier::new(&never).coarse_source_times(true).file(&from, &tmp.path().join("copy.jpg"), &entry_of(&from), &mut |_| {})
+        };
+        assert!(matches!(copy(std::time::Duration::from_secs(30)), Err(Error::Changed(_))));
+        let far_ahead = copy(std::time::Duration::from_secs(40 * 24 * 60 * 60)).unwrap();
+        assert_eq!(fs::read_to_string(&far_ahead.partial).unwrap(), "photo");
     }
 
     #[test]
