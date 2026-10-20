@@ -1113,7 +1113,7 @@ impl<'a> Executor<'a> {
                     Ok(kept) => self.touch(&kept),
                     Err(e) => {
                         Copier::discard(&partial);
-                        return Err(Error::file(&target, e));
+                        return Err(e);
                     }
                 }
                 Copier::commit_new(&partial, &target)?;
@@ -1463,7 +1463,7 @@ impl<'a> Executor<'a> {
         let root = self.shores.root(side);
         let Some(planned) = planned else {
             if keep {
-                let kept = self.trash.put(root, relative).map_err(|e| Error::file(target, e))?;
+                let kept = self.trash.put(root, relative)?;
                 self.touch(&kept);
             } else {
                 Self::remove_item(target).map_err(|e| Error::file(target, e))?;
@@ -1488,14 +1488,14 @@ impl<'a> Executor<'a> {
     fn move_to_trash(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
         let kept = match self.trash.put(self.shores.root(side), relative) {
             Ok(kept) => kept,
-            Err(e) if e.kind() == io::ErrorKind::CrossesDevices && planned.is_file() => {
+            Err(Error::File { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices && planned.is_file() => {
                 return self.remove_after_copying(side, relative, target, planned);
             }
             // Gone already: what the plan wanted.
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) && Self::look(target)?.is_none() => {
+            Err(Error::File { source, .. }) if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) && Self::look(target)?.is_none() => {
                 return Ok(true);
             }
-            Err(e) => return Err(Error::file(target, e)),
+            Err(e) => return Err(e),
         };
         self.touch(&kept);
         let moved = self.look_fresh(side, &kept);
