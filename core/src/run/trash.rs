@@ -837,6 +837,29 @@ mod tests {
         assert!(!tmp.path().join(TRASH_FOLDER).exists());
     }
 
+    /// Windows: clearing out a dated folder first lifts the read-only marks of everything in
+    /// it, the folder itself included. (FAT and exFAT drives won't remove a marked item; NTFS
+    /// removes it anyway, so this looks at the marks themselves.)
+    #[cfg(windows)]
+    #[test]
+    fn the_read_only_marks_in_a_dated_folder_are_lifted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("2000-01-01_00-00-00");
+        let inner = folder.join("from a cd");
+        let file = inner.join("photo.jpg");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(&file, "photo").unwrap();
+        for item in [&file, &inner, &folder] {
+            let mut permissions = fs::metadata(item).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(item, permissions).unwrap();
+        }
+        Trash::lift_read_only_marks(&folder);
+        for item in [&file, &inner, &folder] {
+            assert!(!fs::metadata(item).unwrap().permissions().readonly(), "{} is still read-only", item.display());
+        }
+    }
+
     /// A folder without a list (an interrupted run, an earlier version) is judged by the
     /// times of its files: only one clearly newer than the folder counts as changed there.
     #[test]

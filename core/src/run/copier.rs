@@ -678,18 +678,23 @@ mod tests {
     }
 
     /// Windows: a copy of a read-only file is read-only too, and is still removed when it's
-    /// no longer needed. (FAT and exFAT drives won't remove it until the mark is lifted.)
+    /// no longer needed: its mark is lifted first, since FAT and exFAT drives won't remove a
+    /// file that has one. (NTFS removes it anyway, so a second name of the same file shows
+    /// whether the mark was lifted.)
     #[cfg(windows)]
     #[test]
     fn a_read_only_copy_is_still_discarded() {
         let tmp = tempfile::tempdir().unwrap();
         let copy = Copier::partial_in(tmp.path());
+        let second_name = tmp.path().join("second name");
         fs::write(&copy, "half").unwrap();
+        fs::hard_link(&copy, &second_name).unwrap();
         let mut permissions = fs::metadata(&copy).unwrap().permissions();
         permissions.set_readonly(true);
         fs::set_permissions(&copy, permissions).unwrap();
         Copier::discard(&copy);
         assert!(!copy.exists());
+        assert!(!fs::metadata(&second_name).unwrap().permissions().readonly(), "the mark was lifted before the copy was removed");
     }
 
     #[test]
