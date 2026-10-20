@@ -3,10 +3,11 @@
 //! empty one (that would look like "everything in it was deleted").
 
 use crate::error::{Error, Result};
+use crate::scan::cloud::CloudFolders;
 use crate::scan::volume::windows_name_problem;
 use crate::scan::{
-    freed_up_item, is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, RootId,
-    Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
+    is_charon_folder_in_other_case, is_claim, is_clutter, is_legacy_partial, is_partial, is_system_folder, CharonFolder, Entry, ExcludeFilter, Keys, Placeholder,
+    RootId, Snapshot, Volume, MARKER_FOLDER, TRASH_FOLDER,
 };
 use std::fs;
 use std::path::Path;
@@ -55,6 +56,7 @@ impl<'a> Scanner<'a> {
         let drive_top = Self::top_of_drive(root);
         let mut walker = WalkDir::new(root).follow_links(false).min_depth(1).into_iter();
         let mut seen: u64 = 0;
+        let mut cloud = CloudFolders::of(root);
         // Files a cloud service freed up, by their keys, with the placeholder left for each.
         let mut freed_up: Vec<(String, String)> = Vec::new();
 
@@ -87,6 +89,7 @@ impl<'a> Scanner<'a> {
             };
             let key = Keys::normalize(&disk);
             let name = Keys::name(&key);
+            cloud.note(&disk, file_type.is_file());
 
             if item.depth() == 1 && is_system_folder(name) {
                 if file_type.is_dir() {
@@ -102,11 +105,13 @@ impl<'a> Scanner<'a> {
                 }
                 continue;
             }
-            if let Some(item) = Self::freed_up(&key, name, file_type) {
+            let placeholder = Placeholder::named(name).filter(|placeholder| file_type.is_file() && cloud.is_placeholder(&disk, placeholder.service));
+            if let Some(placeholder) = placeholder {
                 // A cloud service's placeholder for a file it freed up: the service's own,
                 // never synced, and its folder isn't empty. The file is the person's, only in
                 // the cloud now, and unless it's excluded or here after all, it's left alone
                 // on both sides (missing, it would look removed).
+                let item = Self::freed_up(&key, placeholder);
                 snapshot.reserve(&key, &disk);
                 snapshot.occupy_folders_of(&key);
                 if !self.filter.excludes(&item) {
@@ -230,23 +235,29 @@ impl<'a> Scanner<'a> {
         }
         for (item, placeholder) in freed_up {
             if !snapshot.contains(&item) && !snapshot.leaves_alone(&item) {
-                snapshot.freeze(&item, format!("it's only in the cloud (only its placeholder “{}” is on this computer), so Charon leaves it alone", Keys::name(&placeholder)));
+                snapshot.freeze(
+                    &item,
+                    format!(
+                        "it's only in the cloud (only its placeholder “{}” is on this computer), so Charon leaves it alone (if that placeholder is an old copy, remove it)",
+                        Keys::name(&placeholder)
+                    ),
+                );
             }
         }
+        snapshot.facts_mut().clouds = cloud.places();
         if let Some(counter) = self.counter {
             counter(seen);
         }
         Ok(snapshot)
     }
 
-    /// The key of the file a cloud service freed up, when the file at `key` (named `name`)
-    /// is the placeholder it left in its place (see `freed_up_item`).
-    fn freed_up(key: &str, name: &str, file_type: fs::FileType) -> Option<String> {
-        let item = freed_up_item(name).filter(|_| file_type.is_file())?;
-        Some(match Keys::parent(key) {
-            Some(folder) => format!("{folder}/{item}"),
-            None => item.to_string(),
-        })
+    /// The key of the file a cloud service freed up, when the file at `key` is the
+    /// `placeholder` it left in its place.
+    fn freed_up(key: &str, placeholder: Placeholder) -> String {
+        match Keys::parent(key) {
+            Some(folder) => format!("{folder}/{}", placeholder.item),
+            None => placeholder.item.to_string(),
+        }
     }
 
     /// A file's size and time. On Windows they are read from the file itself, the way the
@@ -663,31 +674,62 @@ mod tests {
         assert!(s.get(".charon-trash").is_none());
     }
 
-    /// iCloud Drive before macOS 14, Nextcloud and ownCloud leave a placeholder in place of a
-    /// file they free up. Missing from the scan, the file would look removed, and the other
-    /// side's copy would be removed too.
+    /// Nextcloud and ownCloud (and iCloud Drive before macOS 14, see `cloud`) leave a
+    /// placeholder in place of a file they free up. Missing from the scan, the file would look
+    /// removed, and the other side's copy would be removed too.
     #[test]
     fn a_file_a_cloud_service_freed_up_is_left_alone_not_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        write(&tmp.path().join("Docs/.Report.pdf.icloud"), "placeholder");
-        write(&tmp.path().join("Docs/._notes.txt.icloud"), "placeholder of _notes.txt");
-        write(&tmp.path().join("Plans.odt.nextcloud"), " ");
-        write(&tmp.path().join("Docs/Budget.xlsx.owncloud"), " ");
+        // The client's journal, at the top of the folder it syncs.
+        write(&tmp.path().join("Nextcloud/.sync_0123456789ab.db"), "journal");
+        let root = tmp.path().join("Nextcloud/Work");
+        write(&root.join("Docs/Report.pdf.nextcloud"), " ");
+        write(&root.join("Plans.odt.nextcloud"), " ");
+        // Named like what the patterns leave out, a placeholder is still one.
+        write(&root.join("Docs/Budget.xlsx.owncloud"), " ");
         // Downloaded again: the file is here, and its placeholder is a leftover.
-        write(&tmp.path().join("Docs/.Back.pdf.icloud"), "placeholder");
-        write(&tmp.path().join("Docs/Back.pdf"), "the file");
+        write(&root.join("Docs/Back.pdf.nextcloud"), " ");
+        write(&root.join("Docs/Back.pdf"), "the file");
         // Excluded: left alone by the patterns, like its placeholder.
-        write(&tmp.path().join("Docs/.draft.tmp.icloud"), "placeholder");
-        let s = scan(tmp.path(), &["*.tmp", "._*"]);
+        write(&root.join("Docs/draft.tmp.nextcloud"), " ");
+        let s = scan(&root, &["*.tmp", "*.owncloud"]);
         let mut frozen: Vec<&str> = s.frozen_places().map(|(key, _)| key.as_str()).collect();
         frozen.sort();
-        assert_eq!(frozen, vec!["Docs/Budget.xlsx", "Docs/Report.pdf", "Docs/_notes.txt", "Plans.odt"]);
-        assert!(s.frozen("Docs/Report.pdf").is_some_and(|why| why.contains("only in the cloud") && why.contains(".Report.pdf.icloud")));
+        assert_eq!(frozen, vec!["Docs/Budget.xlsx", "Docs/Report.pdf", "Plans.odt"]);
+        assert!(s.frozen("Docs/Report.pdf").is_some_and(|why| why.contains("only in the cloud") && why.contains("Report.pdf.nextcloud") && why.contains("remove it")));
         assert!(s.get("Docs/Back.pdf").is_some());
         assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/Back.pdf"], "placeholders are never synced");
-        assert!(s.leaves_alone("Docs/.Report.pdf.icloud") && s.leaves_alone("Docs/.Back.pdf.icloud") && s.leaves_alone("Docs/.draft.tmp.icloud"));
+        assert!(s.leaves_alone("Docs/Report.pdf.nextcloud") && s.leaves_alone("Docs/Back.pdf.nextcloud") && s.leaves_alone("Docs/draft.tmp.nextcloud"));
         assert!(s.is_occupied("Docs"), "a folder holding a placeholder isn't empty");
         assert!(s.skipped().is_empty());
+        assert_eq!(s.placeholder_service("Docs/New.txt.nextcloud"), Some(crate::scan::CloudService::SyncClient), "nothing named so is made here");
+        assert_eq!(s.placeholder_service("Docs/New.txt"), None);
+    }
+
+    /// A copy of a placeholder where its cloud service keeps no files (a backup made by a tool
+    /// that copied a cloud folder as it was) is an ordinary file: it never keeps the file it
+    /// names from being synced there.
+    #[test]
+    fn a_copy_of_a_placeholder_elsewhere_is_an_ordinary_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(&tmp.path().join("Nextcloud/.sync_0123456789ab.db"), "journal");
+        write(&tmp.path().join("Nextcloud/Docs/Report.pdf.nextcloud"), " ");
+        write(&tmp.path().join("Backup/Docs/Report.pdf.nextcloud"), " ");
+        write(&tmp.path().join("Backup/Docs/.Plans.key.icloud"), "placeholder");
+        // An ownCloud client's journal, with no placeholders in its folder yet.
+        write(&tmp.path().join("ownCloud/._sync_ba9876543210.db"), "journal");
+        let s = scan(&tmp.path().join("Backup"), &[]);
+        assert_eq!(s.frozen_places().count(), 0);
+        assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs", "Docs/.Plans.key.icloud", "Docs/Report.pdf.nextcloud"]);
+        assert_eq!(s.placeholder_service("Docs/New.txt.nextcloud"), None);
+        assert_eq!(s.placeholder_service("Docs/.New.txt.icloud"), None);
+
+        // Scanned from above, each is told by its own folder.
+        let s = scan(tmp.path(), &[]);
+        assert_eq!(s.frozen_places().map(|(key, _)| key.as_str()).collect::<Vec<_>>(), vec!["Nextcloud/Docs/Report.pdf"]);
+        assert!(s.get("Backup/Docs/Report.pdf.nextcloud").is_some() && s.get("Nextcloud/Docs/Report.pdf.nextcloud").is_none());
+        assert!(s.placeholder_service("Nextcloud/New.txt.nextcloud").is_some() && s.placeholder_service("Backup/New.txt.nextcloud").is_none());
+        assert!(s.placeholder_service("ownCloud/Docs/New.txt.owncloud").is_some());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 
 use crate::model::human_count;
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side, Unit};
-use crate::scan::{Entry, EntryKind, Keys, Snapshot, Volume};
+use crate::scan::{Entry, EntryKind, Keys, Placeholder, Snapshot, Volume};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
 
@@ -108,10 +108,17 @@ impl<'a> Ground<'a> {
             }
             for holder in [Side::Source, Side::Destination] {
                 if self.side(holder).contains(key) {
-                    let reason = format!(
-                        "left out: its name differs only in upper and lower case from “{disk}” on the {}, a name Charon or the drive keeps for itself",
-                        side.word()
-                    );
+                    let reason = match Placeholder::named(Keys::name(disk)) {
+                        Some(placeholder) => format!(
+                            "left out: on the {}, “{disk}” is the placeholder {} left for a file that's only in the cloud, so Charon leaves this name alone",
+                            side.word(),
+                            placeholder.service.name()
+                        ),
+                        None => format!(
+                            "left out: its name differs only in upper and lower case from “{disk}” on the {}, a name Charon or the drive keeps for itself",
+                            side.word()
+                        ),
+                    };
                     found.push((holder, key.clone(), reason));
                 }
             }
@@ -121,7 +128,8 @@ impl<'a> Ground<'a> {
 
     /// Items on the other side that side `to`'s drive can't hold: names it can't take, files
     /// too big for it, links where it has none, and what it refused in an earlier sync. Only
-    /// the topmost such place is listed.
+    /// the topmost such place is listed. Nor does Charon make an item a cloud service would
+    /// take for its placeholder there: the service could take the file it names for freed up.
     fn unholdable(&self, to: Side) -> Vec<(String, String)> {
         let (from, here) = (self.side(to.opposite()), self.side(to));
         let drive = here.volume().map(Volume::describe).unwrap_or_else(|| format!("{}'s drive", to.word()));
@@ -133,6 +141,13 @@ impl<'a> Ground<'a> {
             let existing = here.get(key);
             let reason = if let Some(why) = here.refused(key) {
                 Some(format!("an earlier sync found that {}", why.reason(&drive)))
+            } else if let Some(service) = here.placeholder_service(key) {
+                Some(format!(
+                    "it's named like a placeholder {} leaves for a file that's only in the cloud, and on the {} {} would take it for its own (if it's an old copy of one, remove it)",
+                    service.name(),
+                    to.word(),
+                    service.name()
+                ))
             } else if existing.is_none() {
                 let name: String = Keys::name(from.spelling(key)).nfc().collect();
                 let volume = here.volume();
