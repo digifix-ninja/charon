@@ -861,6 +861,66 @@ fn a_library_changed_on_both_sides_is_kept_whole_from_one_side() {
     assert_eq!(next.tally.conflicts, 0);
 }
 
+/// An engine that runs the hook put in its slot once, right before the next step acts.
+fn hooked(data: &Path) -> (Engine, Arc<Mutex<Option<Hook>>>) {
+    let hook: Arc<Mutex<Option<Hook>>> = Arc::default();
+    let armed = hook.clone();
+    let engine = Engine::open(
+        data,
+        Arc::new(move |event: EngineEvent| {
+            if let EngineEvent::Progress { progress, .. } = &event {
+                if progress.current.is_some() {
+                    if let Some(hook) = armed.lock().unwrap().take() {
+                        hook();
+                    }
+                }
+            }
+        }),
+    )
+    .unwrap();
+    (engine, hook)
+}
+
+/// Something else writes into an app library on the side it's carried to while the sync
+/// runs (its app there, or another computer's sync): a file the list doesn't touch
+/// changes, or a new one turns up. Then nothing of the library moves, and it's never left
+/// a mix of two versions. System clutter and excluded items don't count.
+#[test]
+fn a_library_written_to_on_the_other_side_during_the_sync_isnt_mixed() {
+    let cases = [
+        ("a file the list doesn't touch changes", "c.txt", false),
+        ("a new file turns up", "Media/take 2.wav", false),
+        ("Finder's clutter turns up", ".DS_Store", true),
+        ("an excluded file turns up", "cache.tmp", true),
+    ];
+    for (case, meddle, carried) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+        let song = |root: &Path, name: &str| root.join("Song.logicx").join(name);
+        for name in ["a.txt", "b.txt", "c.txt", "Media/take 1.wav"] {
+            write(&song(&a, name), "1");
+        }
+        fs::create_dir_all(&b).unwrap();
+        let (engine, hook) = hooked(&data);
+        let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+        confirm(&engine, &id);
+
+        write(&song(&a, "a.txt"), "2 from a");
+        write(&song(&a, "b.txt"), "2 from a");
+        let meddled = song(&b, meddle);
+        *hook.lock().unwrap() = Some(Box::new(move || write(&meddled, "written on b meanwhile")));
+        thread::sleep(Duration::from_millis(200)); // live progress reaches the window at most this often
+        confirm(&engine, &id);
+        assert!(hook.lock().unwrap().is_none(), "{case}: something wrote during the sync");
+        let run = engine.job(&id).unwrap().job.last_run.unwrap();
+        let expected = if carried { ((2, 0), "2 from a") } else { ((0, 2), "1") };
+        assert_eq!((run.copied, run.skipped), expected.0, "{case}: {run:?}");
+        for name in ["a.txt", "b.txt"] {
+            assert_eq!(fs::read_to_string(song(&b, name)).unwrap(), expected.1, "{case}: {name}");
+        }
+    }
+}
+
 /// An app that had a removed file open follows it into .charon-trash and saves the person's
 /// work there: Charon says so, never empties it, and stops running by itself until then.
 #[test]

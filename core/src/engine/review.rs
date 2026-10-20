@@ -249,7 +249,8 @@ impl Engine {
     /// Carries out exactly the reviewed list, after the checks that make sure it can still be
     /// trusted. A list that `waited` for another sync was confirmed in time: neither its age
     /// nor the changes made in the folders since count against it (each step still checks
-    /// its items right before it acts, and leaves alone what changed).
+    /// its items right before it acts, and leaves alone what changed; an app library or a
+    /// database is only carried when nothing of it changed, see `run::Executor`).
     fn carry_out(&self, id: &JobId, review_id: &str, acknowledged: bool, waited: bool) -> Result<()> {
         let review = self.stored_review(id, review_id)?;
         // The folders must still be the very folders the list was made from.

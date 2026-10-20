@@ -9,7 +9,9 @@
 //! When such a unit changed on both sides of a two-way job, syncing some of its files one
 //! way and others the other way would leave a mix that the app may not open, or would
 //! quietly damage. So the whole unit becomes one conflict, and the person chooses whose
-//! version to keep as a whole (see `plan::Resolution`).
+//! version to keep as a whole (see `plan::Resolution`). A run carries a unit's files
+//! together too: all of them, or none when anything of the unit changed meanwhile (see
+//! `run::Executor`).
 
 use crate::scan::{Entry, Keys, Snapshot};
 

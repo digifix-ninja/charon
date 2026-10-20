@@ -7,6 +7,7 @@
 //! the engine's own tests play a second mount past the path checks (see `engine::overlaps`).
 //! A copy of a job's folder, hidden `.charon` folder and all, is made as the person would.
 
+use charon_core::model::ConflictChoice;
 use charon_core::run::{BusyNote, BUSY_EXTENSION};
 use charon_core::store::DataFolder;
 use charon_core::{
@@ -522,6 +523,49 @@ fn a_confirmed_sync_waits_for_another_charon_and_starts_once_it_is_done() {
     assert!(!dst.join("b.txt").exists(), "only what the person confirmed");
     assert!(!row.confirmed && row.waiting_for.is_none());
     assert!(engine.log(&id, 20).iter().any(|line| line.text.contains("after waiting for another sync")));
+}
+
+/// A library settled from one side while another computer's sync is at work in the folders
+/// waits for that sync, which writes into the library meanwhile. The settled list then
+/// carries nothing of the library: it's never left half one version, half the other.
+#[test]
+fn a_library_settled_while_another_charon_writes_into_it_is_never_mixed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let engine = plain_engine(&tmp.path().join("data"));
+    let (laptop, nas) = (tmp.path().join("laptop"), tmp.path().join("nas"));
+    let song = |root: &Path, name: &str| root.join("Song.logicx").join(name);
+    write(&song(&laptop, "a.txt"), "a1");
+    write(&song(&laptop, "b.txt"), "b1");
+    let mut setup = job_setup("Music", &laptop, &nas, SyncMode::TwoWay);
+    setup.conflict = ConflictRule::Ask;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+
+    // The project changed on both computers: one conflict, for the whole project.
+    write(&song(&laptop, "a.txt"), "a2 from the laptop");
+    write(&song(&laptop, "b.txt"), "b2 from the laptop");
+    write(&song(&nas, "a.txt"), "a2 from studio-mac, a longer take");
+    write(&song(&nas, "b.txt"), "b2 from studio-mac, a longer take");
+    let review = engine.prepare_review(&id).unwrap();
+    engine.discard_review(&id, &review.review_id);
+    let conflict = view(&engine, &id).conflicts[0].clone();
+    assert_eq!(conflict.path, "Song.logicx");
+
+    // The person keeps the laptop's version while Charon on studio-mac syncs the NAS, and
+    // that sync writes studio-mac's newest work into the project.
+    let review = engine.prepare_resolution(&id, &conflict, ConflictChoice::KeepSource).unwrap();
+    assert_eq!(review.total_steps, 2);
+    let note = another_charons_note(&nas, Some("studio-mac"));
+    assert!(matches!(engine.approve(&id, &review.review_id, review.needs_tick).unwrap(), Approval::Waiting { .. }));
+    write(&song(&nas, "b.txt"), "b3 from studio-mac, saved again");
+    fs::remove_file(note).unwrap();
+    assert!(engine.start_confirmed(&id));
+    wait_idle(&engine, &id);
+
+    let run = view(&engine, &id).job.last_run.expect("the settled list ran");
+    assert_eq!((run.copied, run.skipped), (0, 2), "{run:?}");
+    assert_eq!(fs::read_to_string(song(&nas, "a.txt")).unwrap(), "a2 from studio-mac, a longer take", "nothing of the project moves");
+    assert_eq!(fs::read_to_string(song(&nas, "b.txt")).unwrap(), "b3 from studio-mac, saved again");
 }
 
 #[test]
