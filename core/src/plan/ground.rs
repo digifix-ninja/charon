@@ -50,22 +50,41 @@ impl<'a> Ground<'a> {
                 ground.frozen.insert(key);
             }
         }
-        ground.keep_databases_whole(plan);
+        ground.keep_units_whole(plan);
         ground
     }
 
-    /// A database's files only go together (see `Unit`): when one of them is left alone, so
-    /// are the others. Otherwise a sync would carry a journal without the database it was
-    /// written for, and the copy would no longer fit together.
-    fn keep_databases_whole(&mut self, plan: &mut Plan) {
+    /// The files of an app library or a database only go together (see `Unit`): when one of
+    /// them is left alone, so are the others. Otherwise a sync would carry some of a
+    /// library's files into a library whose other files stay as they were, or a journal
+    /// without the database it was written for, and the copy would no longer fit together.
+    fn keep_units_whole(&mut self, plan: &mut Plan) {
         let exists = |key: &str| self.source.contains(key) || self.destination.contains(key);
         let shown = |key: &str| if self.source.contains(key) { self.source.spelling(key).to_string() } else { self.destination.spelling(key).to_string() };
-        // Each file kept, with the file left alone that keeps it.
+        // Each library kept, with the item left alone inside it that keeps it.
+        let mut libraries: Vec<(String, String)> = Vec::new();
+        for frozen in &self.frozen {
+            let Some(Unit::Package(library)) = Unit::of(frozen, self.source, self.destination) else { continue };
+            if library != *frozen && exists(&library) && !self.is_frozen(&library) && !libraries.iter().any(|(other, _)| *other == library) {
+                libraries.push((library, shown(frozen)));
+            }
+        }
+        for (library, frozen) in libraries {
+            let side = if self.source.contains(&library) { Side::Source } else { Side::Destination };
+            plan.note(
+                NoteKind::Blocked,
+                Some(side),
+                self.side(side).spelling(&library),
+                format!("left alone: “{frozen}” inside it can't be synced, and the files of an app library or document only go together"),
+            );
+            self.block(&library);
+        }
+        // Each database file kept, with the file left alone that keeps it.
         let mut kept: Vec<(String, String)> = Vec::new();
         for frozen in &self.frozen {
             let Some(database) = Unit::database_of(frozen, self.source, self.destination) else { continue };
             for file in Unit::database_files(&database) {
-                if file != *frozen && exists(&file) && !self.is_frozen(&file) && !kept.iter().any(|(other, _)| *other == file) {
+                if file != *frozen && exists(&file) && !self.is_off_limits(&file) && !kept.iter().any(|(other, _)| *other == file) {
                     kept.push((file, shown(frozen)));
                 }
             }
@@ -186,16 +205,17 @@ impl<'a> Ground<'a> {
     /// to the other side, and nothing is removed there either: as in the run that couldn't
     /// read it, a removal could take the last copy of what the file holds (a file renamed,
     /// then held open by its program). Each removal of a file or link waits there, with a
-    /// note, until the file is copied or left out; its folders stay too (see `finish`). A
-    /// database's files only go together, so the rest of its database waits as well.
-    /// Removals that make way for an item of another kind stay, as they do in a run.
+    /// note, until the file is copied or left out; its folders stay too (see `finish`). The
+    /// files of an app library or a database only go together, so the rest of its library or
+    /// database waits as well. Removals that make way for an item of another kind stay, as
+    /// they do in a run.
     pub fn hold_removals(&self, plan: &mut Plan) {
         let reasons = (self.held_reason(Side::Source), self.held_reason(Side::Destination));
         let reason_on = |side: Side| match side {
             Side::Source => reasons.0.as_ref(),
             Side::Destination => reasons.1.as_ref(),
         };
-        let held: HashSet<(Side, String)> = plan
+        let held: BTreeSet<(Side, String)> = plan
             .ordered_steps()
             .into_iter()
             .filter_map(|step| match step.action {
@@ -206,24 +226,33 @@ impl<'a> Ground<'a> {
         if held.is_empty() {
             return;
         }
-        // The databases of the files kept, each with one of those files to name.
-        let mut databases: Vec<(Unit, String)> = Vec::new();
+        // The libraries and databases of the files kept, each with the side and the name of
+        // one of those files.
+        let mut units: Vec<(Unit, Side, String)> = Vec::new();
         for (side, key) in &held {
-            if let Some(database) = Unit::database_of(key, self.source, self.destination).map(Unit::Database) {
-                if !databases.iter().any(|(other, _)| *other == database) {
-                    databases.push((database, self.side(*side).spelling(key).to_string()));
+            if let Some(unit) = Unit::of(key, self.source, self.destination) {
+                if !units.iter().any(|(other, ..)| *other == unit) {
+                    units.push((unit, *side, self.side(*side).spelling(key).to_string()));
                 }
             }
         }
+        // The libraries with steps left alone, each noted once, on the side its file is kept.
+        let mut libraries: Vec<(&Unit, Side, &String)> = Vec::new();
         for action in std::mem::take(&mut plan.actions) {
-            let database = databases.iter().find(|(database, _)| database.holds(action.path()));
-            let (side, reason) = match (&action, database) {
+            let unit = units.iter().find(|(unit, ..)| unit.holds(action.path()));
+            let (side, reason) = match (&action, unit) {
                 (Action::Conflict { .. }, _) => {
                     plan.push(action);
                     continue;
                 }
                 (Action::Delete { side, path, .. }, _) if held.contains(&(*side, path.clone())) => (*side, reason_on(*side).cloned().unwrap_or_default()),
-                (_, Some((_, kept))) => (
+                (_, Some((library @ Unit::Package(_), side, kept))) => {
+                    if !libraries.iter().any(|(other, ..)| *other == library) {
+                        libraries.push((library, *side, kept));
+                    }
+                    continue;
+                }
+                (_, Some((Unit::Database(_), _, kept))) => (
                     Self::side_shown(&action),
                     format!("left alone for now: the removal of “{kept}”, a file of the same database, waits, and a database's files only go together"),
                 ),
@@ -233,6 +262,14 @@ impl<'a> Ground<'a> {
                 }
             };
             plan.note(NoteKind::Blocked, Some(side), self.side(side).spelling(action.path()), reason);
+        }
+        for (library, side, kept) in libraries {
+            plan.note(
+                NoteKind::Blocked,
+                Some(side),
+                self.side(side).spelling(library.key()),
+                format!("left alone for now: the removal of “{kept}” inside it waits, and the files of an app library or document only go together"),
+            );
         }
     }
 
@@ -481,6 +518,44 @@ mod tests {
         let plan = crate::plan::TwoWayPlanner::new(crate::model::ConflictRule::Ask).plan(&a, &b, &baseline);
         assert_eq!((plan.removed_on(Side::Source), plan.removed_on(Side::Destination)), (1, 0), "{:?}", plan.actions);
         assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == "old.pst" && n.side == Some(Side::Destination)), "{:?}", plan.notes);
+    }
+
+    /// When the removal of a library's file waits, the rest of the library waits too, under
+    /// one note for the library.
+    #[test]
+    fn a_library_whose_removal_waits_waits_whole() {
+        let lib = "Song.logicx";
+        let item = |name: &str| format!("{lib}/{name}");
+        let mut source = snap(&[(lib, Entry::dir()), (&item("take.wav"), Entry::file(9, 60_000)), ("new.pst", Entry::file(8, 1))], FsKind::Ext);
+        source.freeze_unread("new.pst", "permission denied");
+        let destination = snap(
+            &[(lib, Entry::dir()), (&item("take.wav"), Entry::file(8, 1)), (&item("old.wav"), Entry::file(8, 1)), ("old.txt", Entry::file(1, 1))],
+            FsKind::Ext,
+        );
+        let plan = crate::plan::OneWayPlanner::mirror().plan(&source, &destination);
+        assert!(plan.actions.is_empty(), "the library isn't half replaced: {:?}", plan.actions);
+        let mut kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
+        kept.sort();
+        let old = item("old.wav");
+        assert_eq!(kept, vec![(lib, Some(Side::Destination)), (old.as_str(), Some(Side::Destination)), ("old.txt", Some(Side::Destination))]);
+        let reason = plan.notes.iter().find(|n| n.path == lib).map(|n| n.reason.as_str()).unwrap_or_default();
+        assert!(reason.contains(&format!("“{old}”")), "{reason}");
+    }
+
+    #[test]
+    fn an_app_library_with_an_item_left_alone_is_left_alone_whole() {
+        let lib = "Photos Library.photoslibrary";
+        let item = |name: &str| format!("{lib}/{name}");
+        let mut source = snap(&[(lib, Entry::dir()), (&item("database"), Entry::dir()), (&item("database/b.db"), Entry::file(8, 2)), (&item("a.jpg"), Entry::file(4, 2))], FsKind::Ext);
+        source.freeze_unread(&item("database/b.db"), "permission denied");
+        let destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), Entry::file(4, 1)), ("fine.txt", Entry::file(1, 1))], FsKind::Ext);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits(lib) && ground.is_off_limits(&item("a.jpg")));
+        assert!(!ground.is_off_limits("fine.txt"));
+        let kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
+        assert_eq!(kept, vec![(lib, Some(Side::Source))], "one note for the library: {:?}", plan.notes);
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.reason.contains(&format!("“{}”", item("database/b.db")))));
     }
 
     #[test]

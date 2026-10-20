@@ -585,6 +585,34 @@ mod tests {
         assert_eq!(plan.summary().to_destination, 1);
     }
 
+    /// A file of a library that Charon leaves alone (one it couldn't read, or one only in
+    /// the cloud) keeps the whole library: syncing its other files would leave a library made
+    /// of two versions on the side they go to.
+    #[test]
+    fn a_library_with_a_file_left_alone_is_left_alone_whole() {
+        let lib = "Lib.photoslibrary";
+        let item = |name: &str| format!("{lib}/{name}");
+        let baseline = base(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(2, 10_000)), ("notes.txt", file(3, 10_000))]);
+        let source = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(5, 20_000)), (&item("b.db"), file(2, 10_000)), ("notes.txt", file(4, 20_000))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(6, 20_000)), ("notes.txt", file(3, 10_000))]);
+        // The destination changed "b.db", which the last sync couldn't read there.
+        destination.freeze_unread(&item("b.db"), "permission denied");
+        let plan = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&source, &destination, &baseline);
+        assert!(plan.actions.iter().all(|action| action.path() == "notes.txt"), "nothing inside the library moves: {:?}", plan.actions);
+        assert!(
+            plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib && n.reason.contains(&format!("“{}”", item("b.db")))),
+            "{:?}",
+            plan.notes
+        );
+        // Changed on one side only, with a file only in the cloud on the other side.
+        let source = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(5, 20_000)), (&item("b.db"), file(7, 20_000))]);
+        let mut destination = snap(&[(lib, Entry::dir()), (&item("a.jpg"), file(1, 10_000)), (&item("b.db"), file(2, 10_000))]);
+        destination.freeze(&item("b.db"), "it's only in the cloud");
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&source, &destination, &baseline);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == lib), "{:?}", plan.notes);
+    }
+
     /// A Numbers document saved as one file, and a private key: only named like an app's
     /// package. They follow the job's rule like any file.
     #[test]
