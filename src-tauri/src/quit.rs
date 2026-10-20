@@ -35,25 +35,30 @@ impl Quit {
     }
 
     /// The tray's Quit: when jobs have changes waiting for an OK, the window asks first
-    /// (it answers with `quit_app`); otherwise Charon quits.
+    /// (it answers with `quit_app`); otherwise Charon quits. The rows it counts ask the disk
+    /// (a network share that doesn't answer takes a while), so not on the thread that draws
+    /// the menu bar and the window.
     pub fn ask(app: &AppHandle) {
-        let waiting = app.try_state::<AppState>().map(|state| state.engine.overview().waiting).unwrap_or(0);
-        if waiting > 0 {
-            crate::show_main_window(app);
-            let _ = app.emit("confirm-quit", ConfirmQuit { jobs: waiting });
-        } else {
-            Self::now(app);
-        }
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let waiting = app.try_state::<AppState>().map(|state| state.engine.overview().waiting).unwrap_or(0);
+            if waiting > 0 {
+                crate::show_main_window(&app);
+                let _ = app.emit("confirm-quit", ConfirmQuit { jobs: waiting });
+            } else {
+                Self::now(&app);
+            }
+        });
     }
 
     /// Stops the syncs (on a background thread, so the window stays responsive) and then
-    /// exits.
+    /// exits. Asks nothing of the disk, as it may run on the thread that draws the window.
     pub fn now(app: &AppHandle) {
         if let Some(state) = app.try_state::<AppState>() {
             let running = state.engine.running();
             if !running.is_empty() {
                 // The window says what it waits for, so Charon doesn't look stuck.
-                let jobs = running.iter().filter_map(|id| state.engine.job(id).ok()).map(|view| view.job.setup.name).collect();
+                let jobs = state.engine.job_list().into_iter().filter(|job| running.contains(&job.id)).map(|job| job.setup.name).collect();
                 let _ = app.emit("quitting", Quitting { jobs });
             }
         }
@@ -72,8 +77,13 @@ impl Quit {
         ready || !running
     }
 
-    /// Stops every sync and waits for them. Safe to call more than once.
+    /// Stops every sync and waits for them. Safe to call more than once: once they were
+    /// stopped (or waited for in vain), it returns at once, so a sync stuck on a share that
+    /// doesn't answer holds up the exit only once.
     pub fn stop_syncs(app: &AppHandle) {
+        if app.try_state::<Quit>().is_some_and(|quit| quit.ready.load(Ordering::SeqCst)) {
+            return;
+        }
         if let Some(state) = app.try_state::<AppState>() {
             if !state.engine.shut_down(STOP_WAIT) {
                 log::error!("a sync didn't stop in time; its next look compares both folders afresh");
