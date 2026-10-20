@@ -1,7 +1,7 @@
 //! Turning a stored job and its live state into the row the window shows.
 
 use crate::autopilot::Schedule;
-use crate::engine::{Engine, JobRuntime, Look, Presence, Whereabouts};
+use crate::engine::{Engine, FoundAhead, JobRuntime, Look, Moment, Presence, Whereabouts};
 use crate::model::{Job, JobStatus, JobView, Pending, Progress, RunSummary, Settings, Trigger, VolumeLabel, Waiting};
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
 use std::sync::atomic::Ordering;
@@ -14,6 +14,7 @@ pub(crate) const DESTINATION_SILENT: &str = "The destination doesn't answer. If 
 /// A job's live state at the moment its row was taken, with the row's number. Both are
 /// taken under the same locks, so a row with a higher number never shows an older state.
 pub(crate) struct Snapshot {
+    /// The stored job, with its last sync as the row shows it (see `Engine::last_synced`).
     job: Job,
     running: bool,
     /// A look at the folders runs now (in the background, or for a list).
@@ -33,8 +34,9 @@ impl Engine {
     /// Takes a job's row state. Called with the state lock and then the runtime lock held
     /// (the documented order).
     pub(crate) fn snapshot(&self, job: &Job, rt: Option<&JobRuntime>) -> Snapshot {
+        let last_synced = Self::last_synced(job, rt.and_then(|rt| rt.dated_ahead.as_ref()), Moment::now());
         let snapshot = Snapshot {
-            job: job.clone(),
+            job: Job { last_synced, ..job.clone() },
             running: rt.is_some_and(|rt| rt.is_running()),
             looking: rt.is_some_and(|rt| rt.is_checking() || rt.preparing.is_some()),
             must_ask: rt.is_some_and(|rt| rt.must_ask),
@@ -202,6 +204,15 @@ impl Engine {
             confirmed,
             job,
         }
+    }
+
+    /// When the job last synced, as its row shows it at `now`: the date Charon keeps, unless
+    /// Charon found that date later than now (`dated_ahead`, see `note_syncs_dated_ahead`).
+    /// The sync was made before Charon found it so, and the row then shows it as made then,
+    /// if that's earlier (see `FoundAhead::latest`), even once the clock is past the date.
+    pub(crate) fn last_synced(job: &Job, dated_ahead: Option<&FoundAhead>, now: Moment) -> Option<DateTime<Utc>> {
+        let stored = job.last_synced?;
+        Some(dated_ahead.filter(|ahead| ahead.at == stored).map_or(stored, |ahead| ahead.latest(now)))
     }
 
     /// A line for a job that hasn't crossed for longer than it should have: changes that

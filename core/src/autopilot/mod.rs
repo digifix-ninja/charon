@@ -25,10 +25,12 @@
 //!    sync, whatever the job's trigger.
 //! 5. **Regular look:** every few minutes, in case the watcher missed something (network
 //!    shares, sleep). An on-change job that runs by itself and has changes waiting syncs,
-//!    unless its folders are still changing: then step 2 syncs once they have settled.
-//!    Folders that never settle (an app that saves every few seconds) still sync here, once
-//!    they have kept changing for a whole interval of the regular look since they began to
-//!    and since the job last synced.
+//!    unless its folders are still changing (step 2 then syncs once they have settled), or
+//!    it synced less than its settle time ago (what was saved into the sync's own items
+//!    meanwhile isn't heard as a change): then it syncs once that time has passed. Folders
+//!    that never settle (an app that saves every few seconds) still sync here, once they have
+//!    kept changing for a whole interval of the regular look since they began to and since
+//!    the job last synced.
 //!
 //! A sync that is due waits (it isn't dropped) while another sync uses the same folders, and
 //! starts as soon as that sync is done. So does a list the person confirmed meanwhile.
@@ -139,8 +141,8 @@ impl Autopilot {
             self.engine.after_a_gap();
         }
         self.last_tick = Some(moment);
-        // A sync dated later than now was made while the clock was ahead.
-        self.engine.correct_syncs_dated_ahead();
+        // A sync dated later than now: the clock was ahead then, or is behind now.
+        self.engine.note_syncs_dated_ahead(moment);
         // Notices an older Charon at work, so the window says so before anything tries to sync.
         self.engine.older_charon_running();
         // While Charon's state can't be saved, tries again now and then (at most once a
@@ -227,12 +229,10 @@ impl Autopilot {
                 continue;
             }
             // 2. Changes settled: quiet for the settle time since the last change heard, and
-            //    since the last sync ended (what changes while a sync runs isn't heard here).
+            //    since the last sync ended (what changes in a sync's own items while it runs
+            //    isn't heard here).
+            let settle = Self::settle_time(job);
             if let Some(changes) = self.changed.get(id) {
-                let settle = match job.setup.trigger {
-                    Trigger::OnChange { settle_seconds } => Duration::from_secs(settle_seconds as u64),
-                    _ => CHECK_SETTLE,
-                };
                 if changes.last.elapsed() >= settle && !self.engine.synced_within(id, settle) {
                     self.changed.remove(id);
                     if by_itself && job.setup.trigger.syncs_on_change() {
@@ -261,12 +261,15 @@ impl Autopilot {
                 self.run(id, "to carry out removals left for later");
                 continue;
             }
-            // 5. Regular look. While the folders still change, step 2 waits for them to settle.
-            //    Folders that never settle still sync here, but only once they have kept
-            //    changing for a whole interval of the regular look since they began to and
-            //    since the job last synced.
+            // 5. Regular look. While the folders still change, step 2 waits for them to settle,
+            //    and a sync that ended less than the settle time ago counts as a change (what
+            //    was saved into its own items meanwhile isn't heard). Folders that never
+            //    settle still sync here, but only once they have kept changing for a whole
+            //    interval of the regular look since they began to and since the job last
+            //    synced.
             let interval = settings.check_interval();
-            let settling = self.changed.get(id).is_some_and(|changes| changes.first.elapsed() < interval || self.engine.synced_within(id, interval));
+            let settling = self.engine.synced_within(id, settle)
+                || self.changed.get(id).is_some_and(|changes| changes.first.elapsed() < interval || self.engine.synced_within(id, interval));
             if by_itself && job.setup.trigger.syncs_on_change() && !settling && self.engine.has_pending(id) {
                 self.run(id, "for changes found by a look");
             } else if self.engine.check_due(id, interval) {
@@ -286,6 +289,16 @@ impl Autopilot {
         let own = now.own.saturating_duration_since(last.own);
         let wall = (now.wall - last.wall).to_std().unwrap_or_default();
         own.max(wall) >= AWAY
+    }
+
+    /// How long a job's folders must be quiet, since the last change heard and since the job
+    /// last synced, before their changes count as settled: the job's settle time when it
+    /// syncs on change, a moment for any other job.
+    fn settle_time(job: &Job) -> Duration {
+        match job.setup.trigger {
+            Trigger::OnChange { settle_seconds } => Duration::from_secs(settle_seconds as u64),
+            _ => CHECK_SETTLE,
+        }
     }
 
     /// Starts a sync of a job that runs by itself, or keeps it waiting until nothing stands
@@ -326,8 +339,8 @@ impl Autopilot {
     }
 
     /// Notes which jobs saw changes that matter, leaving out changes to excluded items, and
-    /// Charon's own writes during and just after a sync (a change elsewhere meanwhile has the
-    /// job looked at once its sync is done).
+    /// Charon's own writes during and just after a sync (a change elsewhere during a sync
+    /// counts, and also has the job looked at once its sync is done).
     fn collect_changes(&mut self) {
         while let Ok((id, path)) = self.changes.try_recv() {
             let matters = if self.engine.synced_within(&id, QUIET_AFTER_RUN) {
@@ -355,11 +368,12 @@ struct Changes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ConflictRule, JobSetup, SyncMode};
+    use crate::engine::EngineEvent;
+    use crate::model::{ConflictRule, JobSetup, Phase, SyncMode};
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc::Sender;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     /// How long any wait may take before the test fails.
     const DEADLINE: Duration = Duration::from_secs(30);
@@ -393,17 +407,23 @@ mod tests {
     /// A two-way job with full automation that syncs once changes have settled for
     /// `settle_seconds`, after its first sync was confirmed.
     fn on_change_job(tmp: &Path, settle_seconds: u32) -> (Engine, JobId, PathBuf, PathBuf) {
+        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
+        let (id, a, b) = add_on_change_job(&engine, tmp, settle_seconds, ConflictRule::Ask);
+        (engine, id, a, b)
+    }
+
+    /// Adds such a job to `engine`, with `conflict` for what changed on both sides.
+    fn add_on_change_job(engine: &Engine, tmp: &Path, settle_seconds: u32, conflict: ConflictRule) -> (JobId, PathBuf, PathBuf) {
         let (a, b) = (tmp.join("a"), tmp.join("b"));
         fs::create_dir_all(&a).unwrap();
         fs::create_dir_all(&b).unwrap();
         fs::write(a.join("first.txt"), "first").unwrap();
-        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
         let setup = JobSetup {
             name: "Notes".into(),
             source: a.clone(),
             destination: b.clone(),
             mode: SyncMode::TwoWay,
-            conflict: ConflictRule::Ask,
+            conflict,
             trigger: Trigger::OnChange { settle_seconds },
             excludes: vec![],
             safe_delete: true,
@@ -415,7 +435,7 @@ mod tests {
         engine.approve(&id, &review.review_id, true).unwrap();
         until("the first sync", || !engine.is_running(&id));
         assert!(b.join("first.txt").exists());
-        (engine, id, a, b)
+        (id, a, b)
     }
 
     #[test]
@@ -493,6 +513,120 @@ mod tests {
         engine.pretend_the_last_sync_ended(&id, long_ago);
         pilot.tick();
         assert_eq!(synced().as_deref(), Some("3"));
+    }
+
+    #[test]
+    fn an_on_change_job_never_syncs_again_right_after_its_sync_while_an_app_keeps_saving() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, a, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, changes) = pilot(&engine);
+        let save = |version: &str| {
+            fs::write(a.join("notes.txt"), version).unwrap();
+            changes.send((id.clone(), a.join("notes.txt"))).unwrap();
+        };
+        let synced = || {
+            until("the tick's sync, if any", || !engine.is_running(&id));
+            fs::read_to_string(b.join("notes.txt")).ok()
+        };
+        // A sync starts while no change waits to settle (it came from Sync all, or to carry out
+        // removals left for later), and an app saves notes.txt while the sync still looks at
+        // the folders.
+        save("first");
+        let carry_on = engine.begin_automatic_run(&id, "to carry out removals left for later");
+        save("second version");
+        pilot.tick();
+        assert!(pilot.changed.contains_key(&id), "a save heard while the sync looked doesn't count as a change");
+        carry_on();
+        let after_the_sync = synced();
+        assert!(after_the_sync.is_some());
+
+        // The app saves again right after it, into one of the sync's own items: that isn't heard
+        // as a change. The sync's plan was outdated, so the folders are looked at again at once.
+        save("the third version");
+        pilot.tick();
+        until("the look after the sync", || engine.has_pending(&id));
+        pilot.tick();
+        assert_eq!(synced(), after_the_sync, "synced again right after the last sync, while the app still saved");
+
+        // The app stops. Once the folders have been quiet for the settle time, since the last
+        // save and since the sync, the job syncs, and the last save is carried too.
+        let quiet = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() - chrono::Duration::seconds(31), own: quiet });
+        pilot.changed.insert(id.clone(), Changes { first: quiet, last: quiet });
+        pilot.tick();
+        assert_eq!(synced().as_deref(), Some("the third version"));
+    }
+
+    #[test]
+    fn a_syncs_own_conflict_copy_heard_while_it_runs_is_no_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Once armed, the next sync stops on its own thread right after its last step, still
+        // running: it says so, and waits until the test lets it go on.
+        type Hold = (Sender<()>, Receiver<()>);
+        let armed: Arc<Mutex<Option<Hold>>> = Arc::default();
+        let hold = armed.clone();
+        let emitter = Arc::new(move |event: EngineEvent| {
+            let EngineEvent::Progress { progress, .. } = event else { return };
+            let held = if progress.phase == Phase::Finishing { hold.lock().unwrap().take() } else { None };
+            if let Some((reached, go_on)) = held {
+                reached.send(()).unwrap();
+                let _ = go_on.recv_timeout(DEADLINE);
+            }
+        });
+        let engine = Engine::open(tmp.path().join("data"), emitter).unwrap();
+        let (id, a, b) = add_on_change_job(&engine, tmp.path(), 30, ConflictRule::KeepBoth);
+        let (mut pilot, changes) = pilot(&engine);
+        let (reached, at_the_end) = mpsc::channel();
+        let (go_on, held) = mpsc::channel();
+        *armed.lock().unwrap() = Some((reached, held));
+
+        // first.txt changed on both sides, and the folders have been quiet for the settle time:
+        // the job syncs, keeping both versions.
+        fs::write(a.join("first.txt"), "the source's version").unwrap();
+        fs::write(b.join("first.txt"), "the destination's version").unwrap();
+        let quiet = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() - chrono::Duration::seconds(31), own: quiet });
+        pilot.changed.insert(id.clone(), Changes { first: quiet, last: quiet });
+        pilot.tick();
+        at_the_end.recv_timeout(DEADLINE).expect("the sync reached its end");
+
+        // While it still runs, the folder watcher reports the conflict copy it made on both sides.
+        let copy = fs::read_dir(&b).unwrap().flatten().map(|item| item.file_name()).find(|name| name.to_string_lossy().starts_with("first (conflict "));
+        let copy = copy.expect("both versions are kept");
+        assert!(engine.is_running(&id));
+        for folder in [&a, &b] {
+            changes.send((id.clone(), folder.join(&copy))).unwrap();
+        }
+        pilot.tick();
+        go_on.send(()).unwrap();
+        until("the sync", || !engine.is_running(&id));
+        assert!(engine.job(&id).unwrap().job.last_run.unwrap().error.is_none());
+        assert!(!pilot.changed.contains_key(&id), "the sync's own conflict copy counts as a change: the job syncs again once its settle time has passed");
+        assert!(!engine.check_due(&id, Duration::from_secs(15 * 60)), "the sync's own conflict copy has the folders looked at again at once");
+    }
+
+    #[test]
+    fn an_on_change_job_waits_its_settle_time_after_a_sync_before_it_syncs_what_a_look_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, a, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, _changes) = pilot(&engine);
+        // Right after the job's last sync, an app saves first.txt, which that sync wrote. The
+        // save can't be told from the sync's own write, so it isn't heard as a change; a look
+        // finds it.
+        engine.pretend_the_last_sync_ended(&id, Moment::now());
+        fs::write(a.join("first.txt"), "first, as the app saved it").unwrap();
+        engine.check(&id);
+        until("the look", || engine.has_pending(&id));
+        pilot.tick();
+        until("the tick's sync, if any", || !engine.is_running(&id));
+        assert_eq!(fs::read_to_string(b.join("first.txt")).unwrap(), "first", "synced right after the last sync");
+
+        // Once the settle time has passed since that sync, it syncs.
+        let quiet = Instant::now().checked_sub(Duration::from_secs(31)).expect("the computer has run for half a minute");
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() - chrono::Duration::seconds(31), own: quiet });
+        pilot.tick();
+        until("the sync", || !engine.is_running(&id));
+        assert_eq!(fs::read_to_string(b.join("first.txt")).unwrap(), "first, as the app saved it");
     }
 
     #[test]
@@ -576,26 +710,69 @@ mod tests {
         assert!(engine.take_follow_up_at(&id, looked.after(minutes(2))));
     }
 
+    /// The job's last sync as Charon keeps it (in its state file too), and as its row shows it.
+    fn last_synced(engine: &Engine, id: &JobId, data: &Path) -> (DateTime<Utc>, DateTime<Utc>, DateTime<Utc>) {
+        let kept = engine.job_list().into_iter().find(|job| &job.id == id).and_then(|job| job.last_synced).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&fs::read(data.join("charon-state.json")).unwrap()).unwrap();
+        let saved = state["jobs"].as_array().unwrap().iter().find(|job| job["id"] == id.as_str()).unwrap()["lastSynced"].clone();
+        let saved: DateTime<Utc> = serde_json::from_value(saved).unwrap();
+        (kept, saved, engine.job(id).unwrap().job.last_synced.unwrap())
+    }
+
     #[test]
     fn a_sync_dated_later_than_now_counts_as_made_when_charon_finds_it() {
         let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
         let (engine, id, _, b) = on_change_job(tmp.path(), 30);
         let (mut pilot, _changes) = pilot(&engine);
-        let synced = || engine.job(&id).unwrap().job.last_synced.unwrap();
-        let before = synced();
+        let (synced, _, shown) = last_synced(&engine, &id, &data);
         pilot.tick();
-        assert_eq!(synced(), before, "a sync dated before now stays as it was");
+        assert_eq!(shown, synced);
+        assert_eq!(last_synced(&engine, &id, &data), (synced, synced, synced), "a sync dated before now shows as it was");
 
         // The job synced while the clock was three days ahead, which has been set right since,
         // and its drive then went into a drawer.
-        engine.pretend_the_last_sync_ended(&id, Moment { wall: Utc::now() + chrono::Duration::days(3), own: Instant::now() });
+        let ahead = Utc::now() + chrono::Duration::days(3);
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: ahead, own: Instant::now() });
         fs::remove_dir_all(&b).unwrap();
         let set_right = Utc::now();
         pilot.tick();
-        assert!(set_right <= synced() && synced() <= Utc::now(), "still dated {}", synced());
-        // A week later, the row says it hasn't synced since.
-        let job = engine.job(&id).unwrap().job;
-        let later = synced() + chrono::Duration::days(7) + chrono::Duration::hours(1);
-        assert_eq!(Engine::stale(&job, None, true, later).as_deref(), Some("Not synced for 7 days"));
+        let (kept, saved, shown) = last_synced(&engine, &id, &data);
+        assert_eq!((kept, saved), (ahead, ahead), "the date Charon keeps changed");
+        assert!(set_right <= shown && shown <= Utc::now(), "the row shows {shown}");
+        // A week later, with the clock past the date by then, the row says the job hasn't
+        // synced since.
+        let later = Moment::now().after(Duration::from_secs((7 * 24 + 1) * 60 * 60));
+        engine.note_syncs_dated_ahead(later);
+        let job = Job { last_synced: engine.last_synced_at(&id, later), ..engine.job(&id).unwrap().job };
+        assert_eq!(Engine::stale(&job, None, true, later.wall).as_deref(), Some("Not synced for 7 days"));
+    }
+
+    #[test]
+    fn a_clock_behind_at_launch_never_dates_a_recent_sync_years_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let (engine, id, _, b) = on_change_job(tmp.path(), 30);
+        let (mut pilot, _changes) = pilot(&engine);
+        // The computer starts with its clock years behind (a flat clock battery: here, that's
+        // the clock the test runs by). The job really synced a day ago, and its drive is in a
+        // drawer.
+        let behind = chrono::Duration::days(2850);
+        let synced = Utc::now() + behind - chrono::Duration::days(1);
+        engine.pretend_the_last_sync_ended(&id, Moment { wall: synced, own: Instant::now() });
+        fs::remove_dir_all(&b).unwrap();
+        pilot.tick();
+        let (kept, saved, shown) = last_synced(&engine, &id, &data);
+        assert_eq!((kept, saved), (synced, synced), "the date Charon keeps changed");
+        assert!(shown <= Utc::now(), "until the clock is right, the row counts the sync as made when Charon found it so");
+
+        // Once the system sets the clock right, the row says when the job really synced, and
+        // that's not long ago.
+        let set_right = Moment { wall: Utc::now() + behind, own: Instant::now() };
+        engine.note_syncs_dated_ahead(set_right);
+        let shown = engine.last_synced_at(&id, set_right);
+        assert_eq!(shown, Some(synced));
+        let job = Job { last_synced: shown, ..engine.job(&id).unwrap().job };
+        assert_eq!(Engine::stale(&job, None, true, set_right.wall), None);
     }
 }

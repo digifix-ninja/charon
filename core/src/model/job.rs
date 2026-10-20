@@ -244,6 +244,11 @@ pub struct Job {
     pub last_run: Option<RunSummary>,
     /// When the last *successful* sync finished.
     pub last_synced: Option<DateTime<Utc>>,
+    /// The last sync, once Charon found it dated later than now, and for how long Charon has
+    /// known so. Kept beside `last_synced`, which stays as it is, until the job syncs again
+    /// (see `engine::FoundAhead`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dated_ahead: Option<DatedAhead>,
     /// The next sync must be confirmed by the person, even with full automation: true for a
     /// new job, after its setup changed in a way that changes what a sync does, after a
     /// safety check held a run back, and after the person stopped a run.
@@ -282,6 +287,19 @@ pub struct Job {
     /// so a list that waits for days says so.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waiting_since: Option<DateTime<Utc>>,
+}
+
+/// A job's last sync that Charon found dated later than now (the clock was ahead when the job
+/// synced, or behind when Charon found it so), and for how long Charon had known so when this
+/// was saved, counted by its own clock: the time while Charon wasn't running doesn't count, as
+/// that clock can't tell how long it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatedAhead {
+    /// The last sync's date, as `Job::last_synced` keeps it.
+    pub last_synced: DateTime<Utc>,
+    /// For how long Charon had known it was later than now.
+    pub counted_seconds: u64,
 }
 
 /// What one of Charon's markers in a folder must say: its token and its counter.
@@ -370,6 +388,7 @@ impl Job {
             created_at: Utc::now(),
             last_run: None,
             last_synced: None,
+            dated_ahead: None,
             needs_review: true,
             run_in_progress: false,
             last_scheduled: None,

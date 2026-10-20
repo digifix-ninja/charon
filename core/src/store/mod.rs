@@ -4,7 +4,7 @@
 //! * `baselines.rs`  – `Baselines`: the two-way memory of each job
 //! * `landings.rs`   – `Landings`: Mirror and Backup copies whose dates didn't stick
 //! * `unattended.rs` – `Unattended`: what automatic runs changed since the last confirmed list
-//! * `absences.rs`   – `Absences`: items found missing on a share or cloud drive, and since when
+//! * `absences.rs`   – `Absences`: items found missing on a share or cloud drive, and for how long
 //! * `journal.rs`    – `Journal`: one activity log per job
 //! * `lock.rs`       – `DataLock`: only one Charon works with the data folder at a time
 //! * `atomic.rs`     – writing a file so a crash never leaves it half-written
