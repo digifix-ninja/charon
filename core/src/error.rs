@@ -64,6 +64,12 @@ pub enum Error {
     #[error("Couldn't create {}: {}.", .path.display(), .why.reason("drive"))]
     Refused { path: PathBuf, why: Refusal },
 
+    /// The system refused to let Charon read a file it was to copy (no permission, or
+    /// another program holds the file, or part of it, for itself): `reason` says which, for
+    /// a note, and `at` where in the file reading stopped.
+    #[error("Couldn't read {}: {reason}.", .path.display())]
+    ReadDenied { path: PathBuf, reason: String, at: u64 },
+
     /// Something written during a run landed on another drive than the folder's: the drive
     /// went away and left its mount folder behind. The run stops there.
     #[error("{0}")]

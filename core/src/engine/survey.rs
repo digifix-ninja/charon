@@ -8,7 +8,7 @@ use crate::engine::{runs, Engine, EngineEvent};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
-use crate::run::{Found, Markers, Room, Trash, TrashLook};
+use crate::run::{Copier, Found, Markers, Room, Trash, TrashLook, Unread};
 use crate::scan::{
     is_legacy_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot, Volume,
 };
@@ -258,6 +258,7 @@ impl Engine {
             destination.refuse_links();
         }
         self.apply_refusals(job, &mut source, &mut destination);
+        self.apply_unread(job, &mut source, &mut destination)?;
 
         let mut warnings = Vec::new();
         let mut holds = Vec::new();
@@ -760,6 +761,36 @@ impl Engine {
                 here.refuse(&refused.key, refused.why);
             }
         }
+    }
+
+    /// Notes in the scans the files a sync of this session couldn't read (see `run::Unread`)
+    /// that still can't be read, whether they changed since or not (the program that holds
+    /// one open may go on writing to it). The plan then leaves each alone on both sides, as
+    /// it leaves alone a place a scan can't read, instead of trying it again on every sync,
+    /// and removes nothing on the side it should be copied to (see `Snapshot::freeze_unread`).
+    /// A file that can be read now is tried again.
+    fn apply_unread(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) -> Result<()> {
+        let unread: Vec<Unread> = self.change_runtime(&job.id, |rt| rt.unread.values().cloned().collect());
+        if unread.is_empty() {
+            return Ok(());
+        }
+        // Reading a file the cloud took back since the scan would download it.
+        Self::without_downloads("The look at files Charon couldn't read", || {
+            for item in unread {
+                let snapshot = match item.side {
+                    Side::Source => &mut *source,
+                    Side::Destination => &mut *destination,
+                };
+                if !snapshot.get(&item.key).is_some_and(Entry::is_file) {
+                    continue;
+                }
+                let path = job.setup.root(item.side).join(snapshot.spelling(&item.key));
+                if let Some(reason) = Copier::read_refusal(&path, item.at) {
+                    snapshot.freeze_unread(&item.key, reason);
+                }
+            }
+            Ok(())
+        })
     }
 
     /// Old trash to empty and half-copied leftovers to tidy, on the sides the job writes to.

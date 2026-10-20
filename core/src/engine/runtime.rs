@@ -3,7 +3,7 @@
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side};
-use crate::run::Refused;
+use crate::run::{Refused, Unread};
 use crate::scan::{Entry, ExcludeFilter, Snapshot, Volume};
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, HashSet};
@@ -48,6 +48,10 @@ pub(crate) struct JobRuntime {
     /// Items a drive refused in a sync (by the side they were to go to, and key), with that
     /// drive. Looks leave them out while the item and the drive stay the same.
     pub refused: HashMap<(Side, String), (Refused, Option<Volume>)>,
+    /// Files a sync couldn't read (by the side they are on, and key). While one still can't
+    /// be read, looks list it as a place they can't read, and remove nothing on the side it
+    /// should be copied to.
+    pub unread: HashMap<(Side, String), Unread>,
     /// The job's exclude filter, to tell which folder changes matter: the setup it was made
     /// for, and the filter (matching case the way the job's drives do, once a look has
     /// found out how they do).
@@ -86,6 +90,7 @@ impl JobRuntime {
         self.same_contents.clear();
         self.no_links = (false, false);
         self.refused.clear();
+        self.unread.clear();
         self.filter = None;
         self.missing = Missing::default();
         self.tried = None;

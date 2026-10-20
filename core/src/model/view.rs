@@ -2,7 +2,7 @@
 
 use crate::model::{Job, JobId};
 use crate::plan::{NoteKind, Side, Unit};
-use crate::scan::{Entry, EntryKind, Volume};
+use crate::scan::{Entry, EntryKind, Volume, PRIVACY_REFUSAL};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -142,6 +142,10 @@ pub struct RunSummary {
     pub bytes: u64,
     pub conflicts: u64,
     pub failed: u64,
+    /// The first items that failed (at most `FAILED_NAMED`), as spelled on disk, so the row
+    /// can name them; the log says why.
+    #[serde(default)]
+    pub failed_items: Vec<String>,
     /// Steps left out because the item changed after the scan (or the review). The next
     /// look picks them up again.
     #[serde(default)]
@@ -156,6 +160,10 @@ pub struct RunSummary {
     /// Places that couldn't be read, so nothing in them was synced.
     #[serde(default)]
     pub unreadable: u64,
+    /// Files this run found it couldn't read when it came to copy them (counted among
+    /// `unreadable` too). The looks after it list them, so they are only new here.
+    #[serde(default)]
+    pub found_unreadable: u64,
     /// Conflicts settled by Newest wins: the older version went to .charon-trash.
     #[serde(default)]
     pub settled: u64,
@@ -182,10 +190,12 @@ impl RunSummary {
             bytes: 0,
             conflicts: 0,
             failed: 0,
+            failed_items: Vec::new(),
             skipped: 0,
             left_out: 0,
             kept: 0,
             unreadable: 0,
+            found_unreadable: 0,
             settled: 0,
             unkept: 0,
             cancelled: false,
@@ -198,6 +208,26 @@ impl RunSummary {
     /// problem of the run (nothing there was touched); the row shows them on their own.
     pub fn is_clean(&self) -> bool {
         self.error.is_none() && self.failed == 0 && !self.cancelled
+    }
+
+    /// What went wrong in this run, in words for the row: why the whole run failed, or which
+    /// items couldn't be synced. `None` when nothing did.
+    pub fn problem(&self) -> Option<String> {
+        if let Some(error) = &self.error {
+            return Some(error.clone());
+        }
+        if self.failed == 0 {
+            return None;
+        }
+        let names: Vec<String> = self.failed_items.iter().map(|path| format!("“{path}”")).collect();
+        let more = self.failed.saturating_sub(names.len() as u64);
+        let which = match names.as_slice() {
+            [] => return Some(format!("{} couldn't be synced. The job's Activity says which, and why.", plural(self.failed, "item"))),
+            [one] if more == 0 => one.clone(),
+            [first, second] if more == 0 => format!("{first} and {second}"),
+            _ => format!("{} and {} more", names.join(", "), human_count(more)),
+        };
+        Some(format!("{} couldn't be synced: {which}. The job's Activity says why.", plural(self.failed, "item")))
     }
 
     /// One line for the log and notifications: "copied 12 files (8.2 MB), deleted 1".
@@ -317,8 +347,19 @@ pub struct Place {
     pub privacy: bool,
 }
 
+impl Place {
+    /// A place of `kind` on `side`, and whether macOS's privacy settings keep Charon out.
+    pub fn new(kind: NoteKind, side: Side, path: impl Into<String>, reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self { kind, side, path: path.into(), privacy: reason == PRIVACY_REFUSAL, reason }
+    }
+}
+
 /// The most places a row lists (unreadable, and not synced); the rest are counted.
 pub const PLACES_SHOWN: usize = 100;
+
+/// The failed items a run's summary names (the others are counted).
+pub const FAILED_NAMED: usize = 2;
 
 /// A drive, the way the person knows it: "Backup SSD", "exFAT".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -487,4 +528,44 @@ pub struct Finished {
     pub id: JobId,
     pub name: String,
     pub summary: RunSummary,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failed(count: u64, names: &[&str]) -> RunSummary {
+        let mut run = RunSummary::starting(Utc::now(), true);
+        run.failed = count;
+        run.failed_items = names.iter().map(|name| name.to_string()).collect();
+        run
+    }
+
+    #[test]
+    fn a_run_with_failed_items_names_them() {
+        assert_eq!(failed(0, &[]).problem(), None);
+        assert_eq!(
+            failed(1, &["Outlook Files/me.pst"]).problem().as_deref(),
+            Some("1 item couldn't be synced: “Outlook Files/me.pst”. The job's Activity says why.")
+        );
+        assert_eq!(failed(2, &["a.txt", "b.txt"]).problem().as_deref(), Some("2 items couldn't be synced: “a.txt” and “b.txt”. The job's Activity says why."));
+        assert_eq!(
+            failed(1_204, &["a.txt", "b.txt"]).problem().as_deref(),
+            Some("1,204 items couldn't be synced: “a.txt”, “b.txt” and 1,202 more. The job's Activity says why.")
+        );
+        // A run recorded before Charon kept the names.
+        assert_eq!(failed(3, &[]).problem().as_deref(), Some("3 items couldn't be synced. The job's Activity says which, and why."));
+        // Why a whole run failed says it all.
+        let mut stopped = failed(1, &["a.txt"]);
+        stopped.error = Some("The destination folder went away during the sync.".into());
+        assert_eq!(stopped.problem(), stopped.error);
+    }
+
+    #[test]
+    fn changes_waiting_for_an_ok_are_never_hidden_behind_jobs_that_need_attention() {
+        let overview = Overview { jobs: 4, attention: 1, waiting: 2, ..Default::default() };
+        assert_eq!(overview.headline(), "1 job needs attention, 2 wait for your OK");
+        assert_eq!(Overview { waiting: 0, ..overview.clone() }.headline(), "1 job needs attention");
+        assert_eq!(Overview { attention: 0, ..overview }.headline(), "2 jobs wait for your OK");
+    }
 }

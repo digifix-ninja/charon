@@ -230,6 +230,8 @@ pub struct ScanFacts {
     pub(crate) no_links: bool,
     /// Items this drive refused to take in an earlier sync (key → why).
     pub(crate) refused: BTreeMap<String, Refusal>,
+    /// Files a sync couldn't read, and that still can't be read. Also frozen.
+    pub(crate) unread: BTreeSet<String>,
 }
 
 /// Every item in a folder, keyed by its NFC path relative to the folder, with `/`
@@ -390,6 +392,11 @@ impl Snapshot {
         self.facts.refused.get(key).copied()
     }
 
+    /// The files a sync couldn't read, and that still can't be read (see `freeze_unread`).
+    pub fn unread(&self) -> impl Iterator<Item = &String> {
+        self.facts.unread.iter()
+    }
+
     pub fn is_folded(&self) -> bool {
         self.facts.folded
     }
@@ -440,6 +447,7 @@ impl Snapshot {
         for skipped in &mut self.facts.skipped {
             skipped.key = skipped.key.as_deref().map(Keys::fold);
         }
+        self.facts.unread = std::mem::take(&mut self.facts.unread).iter().map(|key| Keys::fold(key)).collect();
         for twin in twins {
             self.freeze(&twin, "another item in this folder has the same name in different upper/lower case, and one of the drives can't hold both, so Charon leaves them alone");
             self.facts.clashes.insert(twin);
@@ -476,6 +484,14 @@ impl Snapshot {
     /// (see `ScanFacts::reserved`).
     pub(crate) fn reserve(&mut self, key: &str, disk: &str) {
         self.facts.reserved.insert(key.to_string(), disk.to_string());
+    }
+
+    /// Marks the file `key` as one a sync couldn't read, and that still can't be read: it is
+    /// left alone like a place a scan can't read, and while it can't be copied, nothing is
+    /// removed on the other side (see `plan::Ground::hold_removals`).
+    pub(crate) fn freeze_unread(&mut self, key: &str, reason: impl Into<String>) {
+        self.freeze(key, reason);
+        self.facts.unread.insert(key.to_string());
     }
 
     /// Marks `folder` (and the folders around it) as holding something Charon leaves alone.

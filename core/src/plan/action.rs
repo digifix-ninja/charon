@@ -226,7 +226,9 @@ pub enum NoteKind {
     NameClash,
     /// A folder that should go but holds things Charon leaves alone.
     KeptFolder,
-    /// Two kinds of item meet (file and folder) in a way this mode doesn't settle.
+    /// Left alone for the reason the note gives: two kinds of item meet (file and folder) in
+    /// a way this mode doesn't settle, a database with a file that can't be synced, or a
+    /// removal that waits for a file Charon can't read.
     Blocked,
 }
 

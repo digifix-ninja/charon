@@ -14,7 +14,7 @@ use crate::engine::runtime::MISSING_FOR;
 use crate::engine::survey::{Purpose, Survey};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
-use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Progress, ReviewKind, RunSummary};
+use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
 use crate::plan::{Action, Baseline, NoteKind, Side};
 use crate::run::{Care, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
 use crate::scan::{never_download_on_this_thread, ExcludeFilter};
@@ -415,10 +415,13 @@ impl Engine {
         summary.bytes = outcome.bytes;
         summary.conflicts = survey.plan.conflicts().len() as u64;
         summary.failed = outcome.failed.len() as u64;
+        summary.failed_items = outcome.failed.iter().take(FAILED_NAMED).map(|(path, _)| survey.spelling(path)).collect();
         summary.skipped = outcome.skipped.len() as u64;
         summary.left_out = outcome.left_out.len() as u64;
         summary.kept = outcome.kept.len() as u64;
-        summary.unreadable = survey.plan.notes.iter().filter(|n| n.kind == NoteKind::Unreadable).count() as u64;
+        // Places the look couldn't read, and files this run couldn't.
+        summary.found_unreadable = outcome.unread.len() as u64;
+        summary.unreadable = survey.plan.notes.iter().filter(|n| n.kind == NoteKind::Unreadable).count() as u64 + summary.found_unreadable;
         summary.cancelled = outcome.cancelled;
         let settled = if crossing.kind == ReviewKind::Sync { Self::settled_by_newest(survey, &outcome) } else { Vec::new() };
         summary.settled = settled.len() as u64;
@@ -451,6 +454,14 @@ impl Engine {
         for (path, reason) in outcome.skipped.iter().chain(&outcome.left_out).take(LOGGED_ITEMS) {
             journal.info(id, &format!("{path}: {reason}"));
         }
+        let unread: Vec<Place> = outcome
+            .unread
+            .iter()
+            .map(|item| Place::new(NoteKind::Unreadable, item.side, survey.snapshot(item.side).spelling(&item.key), item.reason.clone()))
+            .collect();
+        for place in unread.iter().take(LOGGED_ITEMS) {
+            journal.info(id, &format!("{}: couldn't be read, so it's left alone until it can be ({})", place.path, place.reason));
+        }
         for (path, to) in settled.iter().take(LOGGED_ITEMS) {
             journal.info(
                 id,
@@ -482,13 +493,18 @@ impl Engine {
                     Side::Destination => rt.no_links.1 = true,
                 }
             }
-            // An item this run carried after all was taken; one refused waits for a change.
-            if !rt.refused.is_empty() {
+            // An item this run carried after all was taken, and read. One refused waits for
+            // a change, one unread until it can be read.
+            if !rt.refused.is_empty() || !rt.unread.is_empty() {
                 let carried: HashSet<&str> = outcome.settled.iter().map(|step| step.path.as_str()).collect();
                 rt.refused.retain(|(_, key), _| !carried.contains(key.as_str()));
+                rt.unread.retain(|(_, key), _| !carried.contains(key.as_str()));
             }
             for refused in &outcome.refused {
                 rt.refused.insert((refused.side, refused.key.clone()), (refused.clone(), survey.volume(refused.side).cloned()));
+            }
+            for unread in &outcome.unread {
+                rt.unread.insert((unread.side, unread.key.clone()), unread.clone());
             }
         });
         // The drives, with what this run found out about links on them.
@@ -505,8 +521,8 @@ impl Engine {
             }
             _ => None,
         };
-        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.left_out.is_empty();
-        self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left }));
+        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.left_out.is_empty() || !unread.is_empty();
+        self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left, unread }));
     }
 
     /// The conflicts this run settled by Newest wins, with the side the newer version was
@@ -739,6 +755,7 @@ impl Engine {
         // Live state last: whoever sees the run end finds its results.
         let carried = recorded.is_some();
         let left = recorded.as_ref().is_some_and(|r| r.left);
+        let unread = recorded.map(|r| r.unread).unwrap_or_default();
         let mut look = Look::of(survey);
         let resolved: Vec<String> = survey.plan.actions.iter().map(|a| a.path().to_string()).collect();
         self.change_runtime(id, |rt| {
@@ -775,6 +792,15 @@ impl Engine {
                         look.conflicts.retain(|c| !resolved.contains(&c.key));
                     }
                 }
+            }
+            // Files this run couldn't read show at once, as the next look will list them.
+            if let Some(look) = rt.look.as_mut() {
+                for place in unread {
+                    if !look.unreadable.contains(&place) {
+                        look.unreadable.push(place);
+                    }
+                }
+                look.unreadable.truncate(PLACES_SHOWN);
             }
             // After a stopped run, or a confirmed run that left something, look again at once,
             // so the row shows what's still waiting. Runs by themselves wait for the regular
@@ -852,8 +878,10 @@ struct Recorded {
     drives: Option<Drives>,
     /// Files removed or replaced on the source and on the destination.
     destroyed: (Vec<String>, Vec<String>),
-    /// Steps failed, were skipped or left out.
+    /// Steps failed, were skipped or left out, or files couldn't be read.
     left: bool,
+    /// The files this run couldn't read, as places for the row.
+    unread: Vec<Place>,
 }
 
 impl Survey {

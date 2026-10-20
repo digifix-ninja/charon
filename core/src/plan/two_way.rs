@@ -95,6 +95,7 @@ impl TwoWayPlanner {
                 (true, true) => self.settle_conflict(&mut plan, &mut ground, baseline, path, s, d),
             }
         }
+        ground.hold_removals(&mut plan);
         ground.finish(&mut plan);
         plan
     }

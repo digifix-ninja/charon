@@ -1,7 +1,8 @@
 //! What both planners need besides the items themselves: the places they must not touch,
 //! and a last look at folder removals once every step is known.
 
-use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
+use crate::model::human_count;
+use crate::plan::{Action, Baseline, NoteKind, Plan, Side, Unit};
 use crate::scan::{Entry, EntryKind, Keys, Snapshot, Volume};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use unicode_normalization::UnicodeNormalization;
@@ -49,7 +50,36 @@ impl<'a> Ground<'a> {
                 ground.frozen.insert(key);
             }
         }
+        ground.keep_databases_whole(plan);
         ground
+    }
+
+    /// A database's files only go together (see `Unit`): when one of them is left alone, so
+    /// are the others. Otherwise a sync would carry a journal without the database it was
+    /// written for, and the copy would no longer fit together.
+    fn keep_databases_whole(&mut self, plan: &mut Plan) {
+        let exists = |key: &str| self.source.contains(key) || self.destination.contains(key);
+        let shown = |key: &str| if self.source.contains(key) { self.source.spelling(key).to_string() } else { self.destination.spelling(key).to_string() };
+        // Each file kept, with the file left alone that keeps it.
+        let mut kept: Vec<(String, String)> = Vec::new();
+        for frozen in &self.frozen {
+            let Some(database) = Unit::database_of(frozen, exists) else { continue };
+            for file in Unit::database_files(&database) {
+                if file != *frozen && exists(&file) && !self.is_frozen(&file) && !kept.iter().any(|(other, _)| *other == file) {
+                    kept.push((file, shown(frozen)));
+                }
+            }
+        }
+        for (file, frozen) in kept {
+            let side = if self.source.contains(&file) { Side::Source } else { Side::Destination };
+            plan.note(
+                NoteKind::Blocked,
+                Some(side),
+                self.side(side).spelling(&file),
+                format!("left alone: “{frozen}”, a file of the same database, can't be synced, and a database's files only go together"),
+            );
+            self.block(&file);
+        }
     }
 
     /// The same ground, without notes (for working out a baseline).
@@ -150,6 +180,94 @@ impl<'a> Ground<'a> {
         let snapshot = self.side(side);
         let shifting = snapshot.shifts_times();
         snapshot.inside(folder).any(|(key, entry)| !Entry::still_on(Some(entry), baseline.side(key, side), shifting))
+    }
+
+    /// While a file on one side can't be read (see `Snapshot::unread`), it can't be copied
+    /// to the other side, and nothing is removed there either: as in the run that couldn't
+    /// read it, a removal could take the last copy of what the file holds (a file renamed,
+    /// then held open by its program). Each removal of a file or link waits there, with a
+    /// note, until the file is copied or left out; its folders stay too (see `finish`). A
+    /// database's files only go together, so the rest of its database waits as well.
+    /// Removals that make way for an item of another kind stay, as they do in a run.
+    pub fn hold_removals(&self, plan: &mut Plan) {
+        let reasons = (self.held_reason(Side::Source), self.held_reason(Side::Destination));
+        let reason_on = |side: Side| match side {
+            Side::Source => reasons.0.as_ref(),
+            Side::Destination => reasons.1.as_ref(),
+        };
+        let held: HashSet<(Side, String)> = plan
+            .ordered_steps()
+            .into_iter()
+            .filter_map(|step| match step.action {
+                Action::Delete { side, path, item, .. } if *item != EntryKind::Dir && !step.makes_room() && reason_on(*side).is_some() => Some((*side, path.clone())),
+                _ => None,
+            })
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        // The databases of the files kept, each with one of those files to name.
+        let exists = |key: &str| self.source.contains(key) || self.destination.contains(key);
+        let mut databases: Vec<(Unit, String)> = Vec::new();
+        for (side, key) in &held {
+            if let Some(database) = Unit::database_of(key, exists).map(Unit::Database) {
+                if !databases.iter().any(|(other, _)| *other == database) {
+                    databases.push((database, self.side(*side).spelling(key).to_string()));
+                }
+            }
+        }
+        for action in std::mem::take(&mut plan.actions) {
+            let database = databases.iter().find(|(database, _)| database.holds(action.path()));
+            let (side, reason) = match (&action, database) {
+                (Action::Conflict { .. }, _) => {
+                    plan.push(action);
+                    continue;
+                }
+                (Action::Delete { side, path, .. }, _) if held.contains(&(*side, path.clone())) => (*side, reason_on(*side).cloned().unwrap_or_default()),
+                (_, Some((_, kept))) => (
+                    Self::side_shown(&action),
+                    format!("left alone for now: the removal of “{kept}”, a file of the same database, waits, and a database's files only go together"),
+                ),
+                (_, None) => {
+                    plan.push(action);
+                    continue;
+                }
+            };
+            plan.note(NoteKind::Blocked, Some(side), self.side(side).spelling(action.path()), reason);
+        }
+    }
+
+    /// Why removals on `side` wait (see `hold_removals`), or `None` when nothing on the
+    /// other side is a file Charon can't read.
+    fn held_reason(&self, side: Side) -> Option<String> {
+        let from = side.opposite();
+        let snapshot = self.side(from);
+        let unread: Vec<&str> = snapshot.unread().map(|key| snapshot.spelling(key)).collect();
+        let first = unread.first()?;
+        Some(match unread.len() {
+            1 => format!(
+                "kept for now: Charon can't read “{first}” on the {}, so it isn't copied here, and this could be the last copy of what it holds \
+                 (if it was renamed, say). This goes once “{first}” is copied, or left out",
+                from.word()
+            ),
+            n => format!(
+                "kept for now: Charon can't read {} files on the {} (“{first}” and {} more), so they aren't copied here, and this could be the last copy \
+                 of what one of them holds (if it was renamed, say). This goes once they're copied, or left out",
+                human_count(n as u64),
+                from.word(),
+                human_count(n as u64 - 1)
+            ),
+        })
+    }
+
+    /// The side whose item a step is about, for a note: the side it's copied from, or the
+    /// side it's removed from.
+    fn side_shown(action: &Action) -> Side {
+        match action {
+            Action::Copy { to, .. } => to.opposite(),
+            Action::Delete { side, .. } | Action::CreateDir { side, .. } => *side,
+            Action::KeepBoth { .. } | Action::Conflict { .. } => Side::Source,
+        }
     }
 
     /// A folder is only removed when everything inside it is removed by this plan too.
@@ -281,6 +399,75 @@ mod tests {
         assert!(!ground.is_off_limits("fine.txt"));
         assert_eq!(plan.notes.len(), 3, "one note for each item left out: {:?}", plan.notes);
         assert!(plan.notes.iter().all(|n| n.kind == NoteKind::LeftOut && n.side == Some(Side::Destination)));
+    }
+
+    #[test]
+    fn a_database_with_a_file_left_alone_is_left_alone_whole() {
+        let mut source = snap(
+            &[("notes.db", Entry::file(8, 2)), ("notes.db-wal", Entry::file(4, 2)), ("other.db", Entry::file(8, 1)), ("other.db-wal", Entry::file(4, 1))],
+            FsKind::Ext,
+        );
+        source.freeze("notes.db", "permission denied");
+        let destination = snap(&[("notes.db", Entry::file(8, 1)), ("notes.db-shm", Entry::file(2, 1))], FsKind::Ext);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("notes.db"));
+        assert!(ground.is_off_limits("notes.db-wal"), "its journal never goes without it");
+        assert!(ground.is_off_limits("notes.db-shm"));
+        assert!(!ground.is_off_limits("other.db") && !ground.is_off_limits("other.db-wal"));
+        let kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
+        assert_eq!(kept, vec![("notes.db-wal", Some(Side::Source)), ("notes.db-shm", Some(Side::Destination))]);
+        assert!(plan.notes.iter().all(|n| n.kind != NoteKind::Blocked || n.reason.contains("“notes.db”")), "{:?}", plan.notes);
+    }
+
+    #[test]
+    fn nothing_is_removed_where_a_file_that_cant_be_read_should_go() {
+        // Mirror: "mail/old.pst" was renamed "mail/new.pst" on the source, where Charon
+        // can't read it.
+        let mut source = snap(
+            &[("keep.txt", Entry::file(1, 1)), ("mail", Entry::dir()), ("mail/new.pst", Entry::file(8, 1)), ("notes.db", Entry::file(9, 60_000))],
+            FsKind::Ext,
+        );
+        source.freeze_unread("mail/new.pst", "permission denied");
+        let destination = snap(
+            &[
+                ("keep.txt", Entry::file(1, 1)),
+                ("mail", Entry::dir()),
+                ("mail/old.pst", Entry::file(8, 1)),
+                ("notes.db", Entry::file(8, 1)),
+                ("notes.db-wal", Entry::file(4, 1)),
+                ("old", Entry::dir()),
+                ("old/gone.txt", Entry::file(1, 1)),
+            ],
+            FsKind::Ext,
+        );
+        let plan = crate::plan::OneWayPlanner::mirror().plan(&source, &destination);
+        assert!(plan.actions.is_empty(), "nothing goes, and the database isn't half replaced: {:?}", plan.actions);
+        let mut kept: Vec<(&str, Option<Side>)> = plan.notes.iter().filter(|n| n.kind == NoteKind::Blocked).map(|n| (n.path.as_str(), n.side)).collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                ("mail/old.pst", Some(Side::Destination)),
+                ("notes.db", Some(Side::Source)),
+                ("notes.db-wal", Some(Side::Destination)),
+                ("old/gone.txt", Some(Side::Destination)),
+            ]
+        );
+        let reason = |path: &str| plan.notes.iter().find(|n| n.path == path).map(|n| n.reason.as_str()).unwrap_or_default();
+        assert!(reason("mail/old.pst").starts_with("kept for now: Charon can't read “mail/new.pst” on the source"), "{}", reason("mail/old.pst"));
+        assert!(reason("notes.db").contains("“notes.db-wal”"), "{}", reason("notes.db"));
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Unreadable && n.path == "mail/new.pst"));
+
+        // Two-way: only the side the file should go to waits.
+        let file = Entry::file(8, 1);
+        let mut a = snap(&[("both.txt", file), ("gone-on-b.txt", file), ("new.pst", file)], FsKind::Ext);
+        a.freeze_unread("new.pst", "permission denied");
+        let b = snap(&[("both.txt", file), ("old.pst", file)], FsKind::Ext);
+        let baseline: Baseline = ["both.txt", "gone-on-b.txt", "old.pst"].iter().map(|key| (key.to_string(), crate::plan::Pair::new(file, file))).collect();
+        let plan = crate::plan::TwoWayPlanner::new(crate::model::ConflictRule::Ask).plan(&a, &b, &baseline);
+        assert_eq!((plan.removed_on(Side::Source), plan.removed_on(Side::Destination)), (1, 0), "{:?}", plan.actions);
+        assert!(plan.notes.iter().any(|n| n.kind == NoteKind::Blocked && n.path == "old.pst" && n.side == Some(Side::Destination)), "{:?}", plan.notes);
     }
 
     #[test]

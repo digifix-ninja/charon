@@ -13,7 +13,7 @@ use crate::run::rename::rename_new;
 use crate::scan::{Entry, Refusal, Scanner, PARTIAL_EXTENSION, PARTIAL_PREFIX};
 use std::collections::BTreeSet;
 use std::fs::{self, File, FileTimes, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -177,7 +177,7 @@ impl<'a> Copier<'a> {
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
     /// take along.
     fn write_partial(&self, from: &Path, partial: &Path, mut writer: File, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<BTreeSet<&'static str>> {
-        let mut reader = File::open(from).map_err(|e| Self::unreadable(from, e))?;
+        let mut reader = File::open(from).map_err(|e| Self::unreadable(from, e, 0))?;
         let before = reader.metadata().map_err(|e| Error::file(from, e))?;
         let changed = Scanner::change_time(&before);
         if !before.is_file() || !Entry::file(before.len(), Scanner::modified_ms(&before)).changed_at(changed).unchanged(expected) {
@@ -195,7 +195,7 @@ impl<'a> Copier<'a> {
             let n = match reader.read(&mut buffer) {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(Self::unreadable(from, e)),
+                Err(e) => return Err(Self::unreadable(from, e, written)),
             };
             if n == 0 {
                 break;
@@ -242,12 +242,59 @@ impl<'a> Copier<'a> {
     /// Why the file to copy couldn't be read. A file the cloud took back since the scan
     /// (iCloud Drive, OneDrive and Dropbox free up space that way) can't be read without
     /// downloading it, which Charon never does: that's a change since the scan, not a failure.
-    fn unreadable(from: &Path, error: std::io::Error) -> Error {
+    /// A file the system won't let Charon read is `Error::ReadDenied` (see `refusal_to_read`),
+    /// with where reading stopped (`at`).
+    pub(crate) fn unreadable(from: &Path, error: std::io::Error, at: u64) -> Error {
         #[cfg(target_os = "macos")]
         if error.raw_os_error() == Some(libc::EDEADLK) {
             return Error::Changed("only in the cloud since the scan (not downloaded to this computer), so Charon left it alone".into());
         }
-        Error::file(from, error)
+        match Self::refusal_to_read(&error) {
+            Some(reason) => Error::ReadDenied { path: from.to_path_buf(), reason, at },
+            None => Error::file(from, error),
+        }
+    }
+
+    /// Why the system refuses to let Charon read a file, when `error` says it does: no
+    /// permission (on a Mac, the privacy settings too), or another program has the file
+    /// open for itself (Outlook's mailboxes, the NTUSER.DAT of a Windows profile in use) or
+    /// has locked part of it. That lasts until someone changes it, so such a file is left
+    /// alone like a place a scan can't read, instead of failing on every sync.
+    pub fn refusal_to_read(error: &std::io::Error) -> Option<String> {
+        let code = error.raw_os_error()?;
+        #[cfg(unix)]
+        {
+            (code == libc::EACCES || code == libc::EPERM).then(|| Scanner::io_reason(error))
+        }
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+            match code as u32 {
+                ERROR_ACCESS_DENIED => Some(Scanner::io_reason(error)),
+                ERROR_SHARING_VIOLATION => {
+                    Some("another program has it open and keeps others from reading it; once that program closes it, the next sync copies it".into())
+                }
+                ERROR_LOCK_VIOLATION => Some("another program has locked it while it works with it; once that program lets go, the next sync copies it".into()),
+                _ => None,
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = code;
+            None
+        }
+    }
+
+    /// Why the system refuses to let Charon read the file at `path` right now, if it does
+    /// (see `refusal_to_read`). It reads what a copy read when it was refused there: the
+    /// chunk at `at`, where reading stopped. A program may lock part of a file and still let
+    /// others open it and read the rest.
+    pub fn read_refusal(path: &Path, at: u64) -> Option<String> {
+        let read = File::open(path).and_then(|mut file| {
+            file.seek(SeekFrom::Start(at))?;
+            file.read(&mut vec![0u8; CHUNK])
+        });
+        read.err().and_then(|e| Self::refusal_to_read(&e))
     }
 
     /// Gives the copy the original's modification (and access) time. A drive that refuses
@@ -523,6 +570,52 @@ mod tests {
         assert!(Copier::refuses_links(&error(libc::EACCES), true));
         assert!(Copier::refuses_links(&error(libc::EINVAL), true));
         assert!(!Copier::refuses_links(&error(libc::EIO), true));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn refusals_to_read_are_told_from_passing_problems() {
+        let error = std::io::Error::from_raw_os_error;
+        assert_eq!(Copier::refusal_to_read(&error(libc::EACCES)).as_deref(), Some("permission denied"));
+        assert!(Copier::refusal_to_read(&error(libc::EPERM)).is_some());
+        assert_eq!(Copier::refusal_to_read(&error(libc::EIO)), None, "a drive error is a failure to report");
+        assert_eq!(Copier::refusal_to_read(&error(libc::ENOSPC)), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn files_other_programs_hold_are_refusals_to_read() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
+        let error = |code: u32| std::io::Error::from_raw_os_error(code as i32);
+        assert!(Copier::refusal_to_read(&error(ERROR_SHARING_VIOLATION)).is_some_and(|reason| reason.contains("another program has it open")));
+        assert!(Copier::refusal_to_read(&error(ERROR_LOCK_VIOLATION)).is_some_and(|reason| reason.contains("locked")));
+        assert!(Copier::refusal_to_read(&error(ERROR_ACCESS_DENIED)).is_some());
+        assert_eq!(Copier::refusal_to_read(&error(ERROR_DISK_FULL)), None);
+    }
+
+    /// A file the system won't let Charon read is no failure of the copy: it says why.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_charon_may_not_read_is_denied_not_failed() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("locked.dat"), tmp.path().join("copy.dat"));
+        fs::write(&from, "private").unwrap();
+        let planned = entry_of(&from);
+        fs::set_permissions(&from, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read(&from).is_ok() {
+            return; // root ignores permissions
+        }
+        let never = AtomicBool::new(false);
+        let result = Copier::new(&never).file(&from, &to, &planned, &mut |_| {});
+        assert!(matches!(&result, Err(Error::ReadDenied { path, reason, at: 0 }) if path == &from && reason == "permission denied"), "{result:?}");
+        assert_eq!(Copier::read_refusal(&from, 0).as_deref(), Some("permission denied"));
+        assert_eq!(Copier::read_refusal(&from, CHUNK as u64).as_deref(), Some("permission denied"), "wherever reading stopped");
+        let leftovers: Vec<_> = fs::read_dir(tmp.path()).unwrap().flatten().filter(|i| crate::scan::is_partial(&i.file_name().to_string_lossy())).collect();
+        assert!(leftovers.is_empty(), "the unfinished copy is gone");
+        fs::set_permissions(&from, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(Copier::read_refusal(&from, 0), None, "readable again");
+        assert_eq!(Copier::read_refusal(&from, 1 << 30), None, "past its end, there's nothing to refuse");
     }
 
     #[cfg(unix)]

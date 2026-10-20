@@ -114,6 +114,7 @@ impl OneWayPlanner {
         if self.mirror {
             Self::plan_removals(source, destination, &ground, &mut plan);
         }
+        ground.hold_removals(&mut plan);
         ground.finish(&mut plan);
         plan
     }

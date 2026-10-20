@@ -99,6 +99,15 @@ impl Notifier {
                 "Open Charon to see which ones in the job's log.".into(),
             ));
         }
+        // Said once: the looks after the run list the file, so the next runs don't find it again.
+        if run.found_unreadable > 0 {
+            let body = if run.found_unreadable == 1 {
+                "Another program has it open, or Charon isn't allowed to read it, so it isn't synced. Open Charon to see which one, and to leave it out or let Charon read it."
+            } else {
+                "Other programs have them open, or Charon isn't allowed to read them, so they aren't synced. Open Charon to see which ones, and to leave them out or let Charon read them."
+            };
+            return Some((format!("{name}: {} couldn't be read", plural(run.found_unreadable, "file")), body.into()));
+        }
         if run.left_out > 0 {
             let what = if run.left_out == 1 { "it" } else { "them" };
             return Some((
@@ -189,6 +198,39 @@ impl Notifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A run of the job “Documents”, as the engine records it, with `fields` set.
+    fn documents(fields: serde_json::Value) -> Finished {
+        let mut run = serde_json::json!({
+            "startedAt": "2026-10-20T08:00:00Z",
+            "finishedAt": "2026-10-20T08:01:00Z",
+            "copied": 0,
+            "deleted": 0,
+            "bytes": 0,
+            "conflicts": 0,
+            "failed": 0,
+            "cancelled": false,
+            "error": null,
+        });
+        if let (Some(run), Some(fields)) = (run.as_object_mut(), fields.as_object()) {
+            run.extend(fields.clone());
+        }
+        Finished { id: "documents".into(), name: "Documents".into(), summary: serde_json::from_value(run).unwrap() }
+    }
+
+    #[test]
+    fn a_file_a_run_found_it_cannot_read_is_mentioned_once() {
+        let (title, body) = Notifier::finished(&documents(serde_json::json!({ "unreadable": 1, "foundUnreadable": 1 }))).unwrap();
+        assert_eq!(title, "Documents: 1 file couldn't be read");
+        assert_eq!(
+            body,
+            "Another program has it open, or Charon isn't allowed to read it, so it isn't synced. Open Charon to see which one, and to leave it out or let Charon read it."
+        );
+        let (title, _) = Notifier::finished(&documents(serde_json::json!({ "unreadable": 3, "foundUnreadable": 2 }))).unwrap();
+        assert_eq!(title, "Documents: 2 files couldn't be read");
+        // Listed before this run: nothing new to tell.
+        assert!(Notifier::finished(&documents(serde_json::json!({ "unreadable": 1 }))).is_none());
+    }
 
     fn waiting(name: &str, items: u64, removals: u64, conflicts: u64) -> WaitingJob {
         WaitingJob { id: name.into(), name: name.into(), items, removals, conflicts, drive_connected: false }

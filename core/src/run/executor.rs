@@ -94,6 +94,8 @@ pub struct Outcome {
     /// its end (moved, renamed or removed meanwhile, or a change its drive lost). They aren't
     /// recorded as synced, so the next look compares them afresh (see `Executor::retrace`).
     pub unrecorded: Vec<String>,
+    /// Files the system wouldn't let this run read on the side they were to be copied from.
+    pub unread: Vec<Unread>,
 }
 
 /// An item a drive refused to take (see `Refusal`): the side it was to go to, its key, why,
@@ -104,6 +106,18 @@ pub struct Refused {
     pub key: String,
     pub why: Refusal,
     pub item: Entry,
+}
+
+/// A file the system wouldn't let a run read on the side it was to be copied from (no
+/// permission, or another program holds it): that side, its key, why, and where in the
+/// file reading stopped. Like a place a scan can't read, it is left alone on both sides
+/// while it still can't be read there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Unread {
+    pub side: Side,
+    pub key: String,
+    pub reason: String,
+    pub at: u64,
 }
 
 /// What one step did.
@@ -544,6 +558,23 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
+            Err(Error::ReadDenied { path, reason, at }) => {
+                log::info!("{}: couldn't read {}: {reason}", action.path(), path.display());
+                // Like a failed copy, this keeps the run's removals on the receiving side (see
+                // `Holds::note`): one could take the last copy there of what didn't arrive (a
+                // file renamed, say). The looks after it keep them too, while the file can't be
+                // read (see `plan::Ground::hold_removals`).
+                match self.unread_item(action, &path, &reason, at) {
+                    Some(unread) => {
+                        if !outcome.unread.contains(&unread) {
+                            outcome.unread.push(unread);
+                        }
+                    }
+                    // A file the scan didn't see (a conflict copy this run named) has no place
+                    // to be listed: the step failed.
+                    None => outcome.failed.push((action.path().to_string(), Error::ReadDenied { path, reason, at }.to_string())),
+                }
+            }
             Err(e) => {
                 log::warn!("{}: {e}", action.path());
                 outcome.failed.push((action.path().to_string(), e.to_string()));
@@ -595,6 +626,17 @@ impl<'a> Executor<'a> {
             Some((side, _)) => format!("left out: {}", why.reason(&self.drive(*side))),
             None => format!("left out: {}", why.reason("drive")),
         }
+    }
+
+    /// The record of the file at `path` that `action` couldn't read on a side it copies
+    /// from, where reading stopped at `at` (`None` for a file the scan didn't see, or one on
+    /// a side the step copies to).
+    fn unread_item(&self, action: &Action, path: &Path, reason: &str, at: u64) -> Option<Unread> {
+        Self::receiving(action).into_iter().map(Side::opposite).find_map(|side| {
+            let relative = Scanner::relative(self.shores.root(side), path)?;
+            let key = self.spellings.key_for(&relative);
+            self.spellings.snapshot(side).contains(&key).then(|| Unread { side, key, reason: reason.to_string(), at })
+        })
     }
 
     /// The record of an item `side`'s drive refused, with the item as the other side has it
@@ -1553,13 +1595,14 @@ impl<'a> Executor<'a> {
 
     /// `look`, but on a drive that may show changes late (a network share, a cloud drive) a
     /// file is opened and asked directly: its listing can show another computer's change late.
+    /// A file the system won't let Charon open there fails with `Error::ReadDenied`.
     fn look_fresh(&self, side: Side, path: &Path) -> Result<Option<Entry>> {
         match Self::look(path)? {
             Some(entry) if self.shows_changes_late(side) && entry.is_file() => match fs::File::open(path).and_then(|file| file.metadata()) {
                 Ok(meta) if meta.is_file() => Ok(Some(Entry::file(meta.len(), Scanner::modified_ms(&meta)).changed_at(Scanner::change_time(&meta)))),
                 Ok(_) => Err(Error::Changed("changed since the scan".into())),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(Error::file(path, e)),
+                Err(e) => Err(Copier::unreadable(path, e, 0)),
             },
             other => Ok(other),
         }

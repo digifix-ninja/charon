@@ -648,15 +648,7 @@ impl Look {
             plan.notes
                 .iter()
                 .filter(|note| kinds.contains(&note.kind))
-                .filter_map(|note| {
-                    Some(crate::model::Place {
-                        kind: note.kind,
-                        side: note.side?,
-                        path: note.path.clone(),
-                        reason: note.reason.clone(),
-                        privacy: note.reason == crate::scan::PRIVACY_REFUSAL,
-                    })
-                })
+                .filter_map(|note| Some(crate::model::Place::new(note.kind, note.side?, note.path.clone(), note.reason.clone())))
                 .collect()
         };
         let mut unreadable = places(&[NoteKind::Unreadable]);

@@ -2,7 +2,7 @@
 
 use crate::autopilot::Schedule;
 use crate::engine::{Engine, JobRuntime, Look};
-use crate::model::{Job, JobStatus, JobView, Pending, Progress, Settings, Trigger, VolumeLabel, Waiting};
+use crate::model::{Job, JobStatus, JobView, Pending, Progress, RunSummary, Settings, Trigger, VolumeLabel, Waiting};
 use crate::plan::Side;
 use crate::scan::Volume;
 use chrono::{DateTime, Datelike, Duration, Local, Utc};
@@ -148,7 +148,8 @@ impl Engine {
                 before.describe()
             )),
             (JobStatus::Offline, None) => Some("The destination isn't reachable. Is the drive connected?".into()),
-            _ => problem.or_else(|| job.last_run.as_ref().and_then(|run| run.error.clone())),
+            // A failed run always says what went wrong, naming the items that failed.
+            _ => problem.or_else(|| job.last_run.as_ref().and_then(RunSummary::problem)),
         };
         let (source_volume, destination_volume) = match (look.as_ref().and_then(|l| l.volumes.clone()), &job.drives) {
             (Some((source, destination)), _) => (Some(source), Some(destination)),
