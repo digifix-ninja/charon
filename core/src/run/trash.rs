@@ -18,7 +18,8 @@
 //! an app may still be saving someone's work into it. A folder holding such a file is never
 //! cleared out, and reviews say where the file is. The files the system scatters into folders
 //! (Finder's .DS_Store) never count, nor does the placeholder a cloud service leaves for a
-//! listed file it frees up, as long as it says the file was as listed. On FAT and exFAT
+//! listed file it frees up, or for a package of listed files (iCloud Drive frees up a package
+//! as one item), as long as it says the file or the package was as listed. On FAT and exFAT
 //! drives, a time moved by whole hours (a daylight-saving change) doesn't count either.
 //!
 //! The trash folder must be a real folder: if `.charon-trash` is a link or a file, nothing
@@ -59,6 +60,31 @@ const UNLISTED_MARGIN_MS: i64 = 60 * 60 * 1000;
 /// The files of one dated folder: path inside it (`/`-separated) → size and modification
 /// time (milliseconds since 1970) as they landed.
 type Listed = BTreeMap<String, (u64, i64)>;
+
+/// What a dated folder's list says about one item in it.
+#[derive(Debug, Clone, Copy)]
+enum ListedItem {
+    /// A file, with its size and time as it landed.
+    File(u64, i64),
+    /// A folder the list names files in, with their size together: a package Charon put
+    /// into the trash file by file (the list names files only, never a folder).
+    Folder(u64),
+}
+
+impl ListedItem {
+    /// What `list` says about the item at `item` (a path in the dated folder): the file it
+    /// names there, or else the listed files inside a folder there. `None` when it names
+    /// neither.
+    fn find(list: &Listed, item: &str) -> Option<Self> {
+        if let Some(&(size, modified)) = list.get(item) {
+            return Some(Self::File(size, modified));
+        }
+        let inside = format!("{item}/");
+        let mut sizes = list.range(inside.clone()..).take_while(|(path, _)| path.starts_with(&inside)).map(|(_, &(size, _))| size).peekable();
+        sizes.peek()?;
+        Some(Self::Folder(sizes.sum()))
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 struct StoredList {
@@ -500,28 +526,34 @@ impl Trash {
     /// that file up as it was listed: the file is no longer there, and the placeholder says
     /// what the list says about it. Nextcloud and ownCloud give a placeholder the file's own
     /// time; iCloud Drive before macOS 14 turns `report.txt` into a new, hidden
-    /// `.report.txt.icloud` that holds the file's size. Such a stand-in holds nobody's work,
-    /// whatever its own time, and goes along with its dated folder. One that says otherwise
-    /// stands for work saved into the file after it went in, and is judged by its time like
-    /// any other file.
+    /// `.report.txt.icloud` that holds the file's size. It frees up a package (a folder the
+    /// Finder shows as one document, `Doc.rtfd`) as one item, with one `.Doc.rtfd.icloud` for
+    /// all of it, while the list names each file of the package: that placeholder must hold
+    /// the size of all of them together. Such a stand-in holds nobody's work, whatever its own
+    /// time, and goes along with its dated folder. One that says otherwise may stand for work
+    /// saved into the trash after Charon put it there, and one that says nothing can't tell:
+    /// either is judged by its time like any other file.
     fn stands_in_for_listed(folder: &Path, path: &str, meta: &fs::Metadata, list: &Listed, shifting: bool) -> bool {
         let Some(placeholder) = Placeholder::named(Keys::name(path)).filter(|_| meta.is_file()) else { return false };
         let item = match Keys::parent(path) {
             Some(parent) => format!("{parent}/{}", placeholder.item),
             None => placeholder.item.to_string(),
         };
-        let Some(&(size, modified)) = list.get(&item) else { return false };
+        let Some(listed) = ListedItem::find(list, &item) else { return false };
         if !fs::symlink_metadata(folder.join(&item)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound) {
             return false;
         }
-        match placeholder.service {
+        match (placeholder.service, listed) {
             // The client's time is to the second; on FAT and exFAT it may have moved by whole
             // hours since, as for any file there.
-            CloudService::SyncClient => {
+            (CloudService::SyncClient, ListedItem::File(_, modified)) => {
                 let own = Scanner::modified_ms(meta);
                 (own - modified).abs() <= MTIME_TOLERANCE_MS || (shifting && Entry::whole_hours_apart(own, modified))
             }
-            CloudService::ICloud => placeholder.recorded_size(&folder.join(path)) == Some(size),
+            // Nextcloud and ownCloud leave placeholders for files only, and a folder of files
+            // has no one time to compare theirs with.
+            (CloudService::SyncClient, ListedItem::Folder(_)) => false,
+            (CloudService::ICloud, ListedItem::File(size, _) | ListedItem::Folder(size)) => placeholder.recorded_size(&folder.join(path)) == Some(size),
         }
     }
 
@@ -665,10 +697,25 @@ mod tests {
     /// Writes at `path` the placeholder iCloud Drive before macOS 14 leaves when it frees up a
     /// file of `size` bytes: a property list about the file, written now.
     fn icloud_placeholder(path: &Path, size: u64) {
+        icloud_stand_in(path, "NSURLFileResourceTypeRegular", Some(size));
+    }
+
+    /// Writes at `path` the placeholder iCloud Drive before macOS 14 leaves when it frees up a
+    /// package as one item: a property list about the package, with the size of all it held
+    /// when there is one.
+    fn icloud_package_placeholder(path: &Path, size: Option<u64>) {
+        icloud_stand_in(path, "NSURLFileResourceTypeDirectory", size);
+    }
+
+    /// A property list about the item of type `kind` that the placeholder at `path` stands
+    /// for, with the item's size when there is one, written now.
+    fn icloud_stand_in(path: &Path, kind: &str, size: Option<u64>) {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
         let mut about = plist::Dictionary::new();
-        about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String("NSURLFileResourceTypeRegular".into()));
-        about.insert("NSURLFileSizeKey".into(), size.into());
+        about.insert("NSURLFileResourceTypeKey".into(), plist::Value::String(kind.into()));
+        if let Some(size) = size {
+            about.insert("NSURLFileSizeKey".into(), size.into());
+        }
         about.insert("NSURLNameKey".into(), plist::Value::String(Placeholder::named(&name).unwrap().item.into()));
         plist::Value::Dictionary(about).to_writer_binary(fs::File::create(path).unwrap()).unwrap();
     }
@@ -930,6 +977,49 @@ mod tests {
         assert!(!dated.exists(), "cleared out, the stand-ins with it");
     }
 
+    /// iCloud Drive before macOS 14 frees up a package (an `.rtfd`, a Logic project: a folder
+    /// the Finder shows as one document) as one item: the folder goes with all it holds, and
+    /// one hidden `.Doc.rtfd.icloud` stands in for it, which holds the size of all of it.
+    /// Charon put the package's files into the trash one by one and listed each, never the
+    /// folder. When they add up to that size, the stand-in is nobody's work: the folder is
+    /// still cleared out when its time comes, with it.
+    #[test]
+    fn a_cloud_placeholder_for_a_package_of_listed_files_is_nobodys_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let files = [
+            ("Doc.rtfd/TXT.rtf", "the text of the document"),
+            ("Doc.rtfd/photo.png", "a picture in it"),
+            // Named like the package, next to it: no part of it.
+            ("Doc.rtfd.zip", "a zipped copy of the document"),
+            ("Music/Song.logicx/Alternatives/000/ProjectData", "the song"),
+            ("Music/Song.logicx/Resources/Info.plist", "about the song"),
+        ];
+        for (name, text) in files {
+            let path = tmp.path().join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            set_time(&path, days_ago(41));
+            trash.put(tmp.path(), name).unwrap();
+        }
+        trash.write_lists();
+        let dated = tmp.path().join(TRASH_FOLDER).join(&trash.folder);
+        let size_of = |package: &str| files.iter().filter(|(name, _)| name.starts_with(&format!("{package}/"))).map(|(_, text)| text.len() as u64).sum::<u64>();
+
+        // Freed up weeks later, each package as one item.
+        for (package, placeholder) in [("Doc.rtfd", ".Doc.rtfd.icloud"), ("Music/Song.logicx", "Music/.Song.logicx.icloud")] {
+            fs::remove_dir_all(dated.join(package)).unwrap();
+            icloud_package_placeholder(&dated.join(placeholder), Some(size_of(package)));
+        }
+        for thorough in [false, true] {
+            let look = Trash::look(tmp.path(), 30, thorough, false);
+            assert!(look.revived.is_empty(), "{:?}", look.revived);
+            assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![trash.folder.as_str()]);
+        }
+        Trash::sweep(tmp.path(), std::slice::from_ref(&trash.folder), 30, false);
+        assert!(!dated.exists(), "cleared out, the stand-ins with it");
+    }
+
     /// Someone's work saved into a trashed file holds its dated folder. When the cloud service
     /// then frees that file up, its placeholder says the file changed after it went in:
     /// Nextcloud's has the time of the work, iCloud Drive's its size. The folder stays held,
@@ -968,6 +1058,40 @@ mod tests {
         let held = [".notes.txt.icloud", ".report.txt.icloud", "plans.odt.nextcloud"];
         assert_eq!(look.revived, held.map(|placeholder| format!("{TRASH_FOLDER}/{folder}/{placeholder}")));
         Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
+        assert!(held.iter().all(|placeholder| dated.join(placeholder).exists()), "never cleared out");
+    }
+
+    /// A package's placeholder that doesn't say the package held just what Charon listed in
+    /// it is judged by its time like any other file, and holds its folder: one with another
+    /// size (someone's work saved into the package after it went in), one with no size, and
+    /// one next to a package that's still there.
+    #[test]
+    fn a_cloud_placeholder_for_a_package_changed_in_the_trash_holds_its_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let text = "the text of the document";
+        for package in ["Present.rtfd", "Saved.rtfd", "Unsized.rtfd"] {
+            let name = format!("{package}/TXT.rtf");
+            fs::create_dir_all(tmp.path().join(package)).unwrap();
+            fs::write(tmp.path().join(&name), text).unwrap();
+            set_time(&tmp.path().join(&name), days_ago(41));
+            trash.put(tmp.path(), &name).unwrap();
+        }
+        trash.write_lists();
+        let dated = tmp.path().join(TRASH_FOLDER).join(&trash.folder);
+
+        // An app that had one open saved someone's work into it before iCloud freed it up.
+        let work = "someone's work, saved into the trash";
+        fs::remove_dir_all(dated.join("Saved.rtfd")).unwrap();
+        icloud_package_placeholder(&dated.join(".Saved.rtfd.icloud"), Some((text.len() + work.len()) as u64));
+        fs::remove_dir_all(dated.join("Unsized.rtfd")).unwrap();
+        icloud_package_placeholder(&dated.join(".Unsized.rtfd.icloud"), None);
+        icloud_package_placeholder(&dated.join(".Present.rtfd.icloud"), Some(text.len() as u64));
+        let look = Trash::look(tmp.path(), 30, true, false);
+        assert!(look.expired.is_empty(), "{look:?}");
+        let held = [".Present.rtfd.icloud", ".Saved.rtfd.icloud", ".Unsized.rtfd.icloud"];
+        assert_eq!(look.revived, held.map(|placeholder| format!("{TRASH_FOLDER}/{}/{placeholder}", trash.folder)));
+        Trash::sweep(tmp.path(), std::slice::from_ref(&trash.folder), 30, false);
         assert!(held.iter().all(|placeholder| dated.join(placeholder).exists()), "never cleared out");
     }
 
