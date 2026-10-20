@@ -584,6 +584,7 @@ export class DemoBackend {
       warnings: [...(warnings ?? w.warnings), ...info],
       blocked: kind === "sync" ? w.blocked ?? null : null,
       needsTick: kind === "sync" && sorted.some(s => s.danger),
+      confirmAnyway: kind === "sync" && !sorted.length ? this.confirmAnyway(j, w) : null,
       clusters,
       housekeeping: kind === "sync" ? w.housekeeping : [],
       totalSteps: sorted.length,
@@ -593,6 +594,16 @@ export class DemoBackend {
     };
     this.reviews.set(review.reviewId, { review, steps: sorted, notes, jobId: j.id, setup: setupKey(j), stale: false, settles });
     return review;
+  }
+
+  /** Why a list without steps is still worth confirming, as Rust says it (null: it only says both folders match). */
+  confirmAnyway(j, w) {
+    if (j.fullAutomation && (j.needsReview || w.held)) return "Confirm once so Charon may sync this job by itself from now on.";
+    if (w.held) return "Confirm it, and the job stops waiting for your OK.";
+    if (j.lastSynced) return null;
+    return j.mode === "two-way"
+      ? "Confirm it, and Charon remembers both folders as they are now, so that later lists can carry what you remove on one side to the other."
+      : "Confirm it as the job's first sync, so Charon knows both folders from now on.";
   }
 
   /** A review of settling one conflict, exactly as the person saw it. */
@@ -647,7 +658,9 @@ export class DemoBackend {
     if (refused) throw refused;
     if (entry.stale) throw "Something changed in the folders since this list was made. Look again.";
     if (review.blocked) throw review.blocked;
-    if (review.needsTick && !acknowledged) throw "Tick “I've looked at the removals and replacements” first.";
+    if (review.needsTick && !acknowledged) {
+      throw `Tick “${review.totalSteps ? "I've looked at the removals and replacements" : "I've read the warnings above"}” first.`;
+    }
     if (this.refuseOnce) {
       this.refuseOnce = false;
       throw "The destination drive was replaced by another one with the same name. Look again.";

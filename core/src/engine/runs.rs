@@ -1122,6 +1122,7 @@ impl Survey {
             warnings: Vec::new(),
             holds: Vec::new(),
             needs_tick: false,
+            unfamiliar: false,
             housekeeping: Default::default(),
             made_at: Utc::now(),
         }

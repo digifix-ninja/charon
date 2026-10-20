@@ -1612,6 +1612,157 @@ fn a_job_with_full_automation_never_syncs_by_itself_while_its_list_is_open() {
     assert!(dst.join("new.txt").exists());
 }
 
+// ------------------------------------------------------------------ an empty list that ends a wait
+
+/// Copies the file `from` to `to` with its time, as the person copying it by hand would.
+fn copy_by_hand(from: &Path, to: &Path) {
+    fs::create_dir_all(to.parent().unwrap()).unwrap();
+    fs::copy(from, to).unwrap();
+    filetime::set_file_mtime(to, filetime::FileTime::from_last_modification_time(&fs::metadata(from).unwrap())).unwrap();
+}
+
+#[test]
+fn a_stopped_job_with_nothing_left_to_carry_is_confirmed_from_its_empty_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("a.txt"), "a");
+    let rig = Rig::open(&data);
+    let engine = &rig.engine;
+    let id = add(engine, job_setup(&src, &dst, SyncMode::Backup));
+
+    // The person stops the confirmed sync before it carried anything, then copies the file
+    // by hand: nothing is left to carry, but the job waits for their OK.
+    let review = engine.prepare_review(&id).unwrap();
+    let (stopper, stopped) = (engine.clone(), id.clone());
+    rig.at_first_step(move || stopper.cancel(&stopped));
+    let_progress_throttle_pass();
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(engine, &id);
+    assert!(rig.hook_fired());
+    copy_by_hand(&src.join("a.txt"), &dst.join("a.txt"));
+    let row = view(engine, &id);
+    assert!(row.job.held.is_some() && row.waiting.is_some(), "{}", describe(engine, &id));
+
+    // Its empty list says why it's worth confirming, and confirming it ends the wait.
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0, "{:?}", review.steps);
+    assert_eq!(review.confirm_anyway.as_deref(), Some("Confirm it, and the job stops waiting for your OK."));
+    engine.approve(&id, &review.review_id, review.needs_tick).unwrap();
+    wait_idle(engine, &id);
+    let row = view(engine, &id);
+    assert!(row.job.held.is_none() && row.waiting.is_none(), "{}", describe(engine, &id));
+    assert_eq!(row.status, JobStatus::InSync);
+    assert_eq!(engine.overview().waiting, 0);
+
+    // An empty list that ends no wait only says the folders match.
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.total_steps, review.confirm_anyway), (0, None));
+}
+
+#[test]
+fn a_held_job_with_full_automation_is_confirmed_from_its_empty_list_once_its_warnings_are_ticked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("a.txt"), "a");
+    let engine = plain_engine(&data);
+    let mut setup = job_setup(&src, &dst, SyncMode::Mirror);
+    setup.full_automation = true;
+    let id = add(&engine, setup);
+    confirm(&engine, &id);
+    assert!(view(&engine, &id).runs_by_itself);
+
+    // A cleanup tool removed Charon's marker from the destination; the files are as they were.
+    let marker = dst.join(".charon").join(format!("{id}.json"));
+    fs::remove_file(&marker).unwrap();
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait_idle(&engine, &id);
+    let row = view(&engine, &id);
+    assert!(row.job.held.is_some() && !row.runs_by_itself, "held for an OK: {}", describe(&engine, &id));
+
+    // The list has nothing to carry, but warns, needs the tick, and can be confirmed.
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0, "{:?}", review.steps);
+    assert!(review.needs_tick && review.warnings.iter().any(|w| w.level == Level::Danger), "{:?}", review.warnings);
+    assert_eq!(review.confirm_anyway.as_deref(), Some("Confirm once so Charon may sync this job by itself from now on."));
+    match engine.approve(&id, &review.review_id, false) {
+        Err(Error::Invalid(msg)) => assert_eq!(msg, "Tick “I've read the warnings above” first."),
+        other => panic!("confirmed without the tick: {other:?}"),
+    }
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    let row = view(&engine, &id);
+    assert!(row.runs_by_itself && row.job.held.is_none(), "{}", describe(&engine, &id));
+    assert!(marker.is_file(), "the confirmed sync left its marker again");
+    assert_eq!(read(&dst.join("a.txt")), "a");
+}
+
+#[test]
+fn a_destination_without_its_marker_is_taken_as_it_is_from_a_confirmed_empty_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("a.txt"), "a");
+    let engine = plain_engine(&data);
+    let id = add(&engine, job_setup(&src, &dst, SyncMode::Mirror));
+    confirm(&engine, &id);
+    let marker = dst.join(".charon").join(format!("{id}.json"));
+    fs::remove_file(&marker).unwrap();
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0, "{:?}", review.steps);
+    assert!(review.needs_tick);
+    assert_eq!(
+        review.confirm_anyway.as_deref(),
+        Some("If these are the right folders, confirm it: Charon then takes them as they are now.")
+    );
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait_idle(&engine, &id);
+    assert!(marker.is_file(), "the confirmed sync left its marker again");
+    let review = engine.prepare_review(&id).unwrap();
+    assert!(!review.needs_tick && review.warnings.iter().all(|w| w.level != Level::Danger), "{:?}", review.warnings);
+    assert_eq!(review.confirm_anyway, None);
+}
+
+#[test]
+fn a_new_job_over_matching_folders_is_confirmed_from_its_empty_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (photos, backup, data) = (tmp.path().join("photos"), tmp.path().join("backup"), tmp.path().join("data"));
+    let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+    for name in ["a.txt", "b.txt"] {
+        write(&photos.join(name), name);
+        write(&src.join(name), name);
+        copy_by_hand(&src.join(name), &dst.join(name));
+    }
+    copy_tree(&photos, &backup, &[]);
+    let engine = plain_engine(&data);
+
+    // One way: the first sync, though it has nothing to copy.
+    let id = add(&engine, job_setup(&photos, &backup, SyncMode::Backup));
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0, "{:?}", review.steps);
+    assert_eq!(review.confirm_anyway.as_deref(), Some("Confirm it as the job's first sync, so Charon knows both folders from now on."));
+    engine.approve(&id, &review.review_id, review.needs_tick).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(view(&engine, &id).status, JobStatus::InSync);
+
+    // Two-way: without a memory of both folders, nothing removed on one side is ever
+    // removed on the other. Confirming the empty list gives Charon that memory.
+    let id = add(&engine, job_setup(&src, &dst, SyncMode::TwoWay));
+    assert_eq!(view(&engine, &id).status, JobStatus::New);
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0, "{:?}", review.steps);
+    assert_eq!(
+        review.confirm_anyway.as_deref(),
+        Some("Confirm it, and Charon remembers both folders as they are now, so that later lists can carry what you remove on one side to the other.")
+    );
+    engine.approve(&id, &review.review_id, review.needs_tick).unwrap();
+    wait_idle(&engine, &id);
+    assert_eq!(view(&engine, &id).status, JobStatus::InSync);
+    fs::remove_file(src.join("a.txt")).unwrap();
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!((review.tally.destination.removed, review.tally.source.new_files), (1, 0), "{:?}", review.tally);
+    assert_eq!(review.confirm_anyway, None);
+}
+
 // ------------------------------------------------------------------ a list that can't be confirmed
 
 #[test]

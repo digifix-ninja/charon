@@ -41,8 +41,15 @@ pub struct Review {
     pub warnings: Vec<Warning>,
     /// Why this list can't be confirmed at all, if it can't (one side looks empty…).
     pub blocked: Option<String>,
-    /// Confirming needs "I've looked at the removals and replacements" ticked.
+    /// Confirming needs a tick: "I've looked at the removals and replacements", or for a list
+    /// without steps "I've read the warnings above".
     pub needs_tick: bool,
+    /// Why a list without steps is still worth confirming, in a sentence: it ends a wait
+    /// (the job's first sync, a run held back or stopped for an OK, the one confirmed list
+    /// full automation waits for) or takes the folders as they are now (another drive, a
+    /// missing marker, no two-way memory to trust). `None` for a list with steps, and for an
+    /// empty list that only says both folders match: that one can't be confirmed.
+    pub confirm_anyway: Option<String>,
     /// Whole folders removed, biggest first.
     pub clusters: Vec<Cluster>,
     /// What else the sync does besides the steps (emptying old trash…).
