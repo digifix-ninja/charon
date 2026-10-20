@@ -35,6 +35,13 @@ const FILTER_KINDS = {
   new: ["new", "folder"],
 };
 
+/**
+ * Whether a job needs the person, as Rust's JobView::needs_you says: an error or a conflict,
+ * whatever its row shows first, but not the reason a job is out of reach or syncing.
+ */
+const needsYou = j => j.status === "error" || j.status === "conflict" || j.conflicts.length > 0
+  || (!["offline", "syncing"].includes(j.status) && Boolean(j.problem || j.lastRun?.error));
+
 /** The order steps are listed in: what can hurt first. */
 const KIND_ORDER = ["conflict", "remove", "replace", "settle", "keep-both", "new", "folder"];
 
@@ -380,7 +387,7 @@ export class DemoBackend {
       syncing: count("syncing"),
       pending: count("pending"),
       waiting: this.jobs.filter(j => j.waiting).length,
-      attention: count("error", "conflict"),
+      attention: this.jobs.filter(needsYou).length,
       offline: count("offline"),
       looking: count("looking"),
       incomplete: this.jobs.filter(j => j.unreadable.length || j.notSyncedCount > 0).length,
