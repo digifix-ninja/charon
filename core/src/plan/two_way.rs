@@ -1,8 +1,9 @@
 //! Two-way sync: changes flow both ways.
 //!
 //! When a file is missing on one side, Charon has to know whether it was deleted there or
-//! newly created on the other side. So it keeps the *baseline*: the state both folders
-//! agreed on after the last sync. Comparing each side with the baseline tells who changed:
+//! newly created on the other side. So it keeps the *baseline*: how each side looked the
+//! last time both agreed (see `plan::baseline`). Comparing each side with its own record
+//! tells who changed:
 //!
 //! | source vs baseline | destination vs baseline | what happens                        |
 //! |--------------------|-------------------------|-------------------------------------|
@@ -11,120 +12,199 @@
 //! | same               | changed                 | the destination's change crosses    |
 //! | changed            | changed (differently)   | conflict, settled by the job's rule |
 //!
-//! A change can be a new file, an edit or a deletion. In a conflict between an edit and a
-//! deletion, the edit wins: Charon never throws away work.
+//! A change can be a new item, an edit or a deletion. In a conflict between an edit and a
+//! deletion, the edit wins: Charon never throws away work. A file meeting a folder, and a
+//! link taking a folder's place, are always a question for the person. When the newest
+//! version wins a conflict, the other version still goes to the trash; and when "newest"
+//! can't be told reliably (a FAT or exFAT drive, times whole hours apart, a time that went
+//! backwards), both versions are kept instead. Places that couldn't be read on either side
+//! are left alone completely, and their baseline is kept.
+//!
+//! A file whose time is now *older* than at the last sync isn't an ordinary change either:
+//! it was restored from an older copy, or the drive lost its last writes (pulled out too
+//! soon). Carrying it over would replace the newer version on the other side, so it's
+//! treated as a conflict, settled by the job's rule (never by "newest").
+//!
+//! Without a baseline (the first sync, or a memory Charon can't trust) every difference is
+//! a conflict or a copy: nothing is ever deleted.
 
 use crate::model::ConflictRule;
-use crate::plan::{Action, Plan, Side};
+use crate::plan::ground::Ground;
+use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::scan::{Entry, Snapshot};
 use std::collections::BTreeSet;
 
 pub struct TwoWayPlanner {
     rule: ConflictRule,
+    /// Pairs that changed on both sides and look alike, but were read and differ.
+    different: BTreeSet<String>,
 }
 
 impl TwoWayPlanner {
     pub fn new(rule: ConflictRule) -> Self {
-        Self { rule }
+        Self { rule, different: BTreeSet::new() }
     }
 
-    /// What it takes to bring both folders together, given the last agreed state.
-    pub fn plan(&self, source: &Snapshot, destination: &Snapshot, baseline: &Snapshot) -> Plan {
+    /// Pairs known to differ in contents though their sizes and dates match.
+    pub fn knowing_different(mut self, different: BTreeSet<String>) -> Self {
+        self.different = different;
+        self
+    }
+
+    /// What it takes to bring both folders together, given how each side looked when they
+    /// last agreed.
+    pub fn plan(&self, source: &Snapshot, destination: &Snapshot, baseline: &Baseline) -> Plan {
         let mut plan = Plan::default();
+        let mut ground = Ground::new(source, destination, &[Side::Source, Side::Destination], &mut plan);
         let all_paths: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(baseline.paths()).collect();
 
         for path in all_paths {
-            let s = source.get(path);
-            let d = destination.get(path);
-            if Entry::same(s, d) {
+            if ground.is_off_limits(path) {
                 continue;
             }
-            let b = baseline.get(path);
-            let source_changed = !Entry::same(s, b);
-            let destination_changed = !Entry::same(d, b);
+            let s = source.get(path);
+            let d = destination.get(path);
+            let source_changed = !Entry::still_on(s, baseline.side(path, Side::Source), source.shifts_times());
+            let destination_changed = !Entry::still_on(d, baseline.side(path, Side::Destination), destination.shifts_times());
 
             match (source_changed, destination_changed) {
-                (true, false) => Self::carry(&mut plan, path, s, d, Side::Destination),
-                (false, true) => Self::carry(&mut plan, path, d, s, Side::Source),
-                _ => self.settle_conflict(&mut plan, path, s, d),
+                // Both sides are as the last sync left them, even if they look different (a
+                // drive that doesn't keep times, or contents found identical).
+                (false, false) => {}
+                // Both changed (or there's no record yet) and now look alike: nothing to do.
+                (true, true) if Entry::same(s, d) && !self.different.contains(path.as_str()) => {}
+                // One side changed since the last sync: that change crosses, even when the two
+                // sides happen to look alike within the 2 seconds some drives round times to.
+                // Its time moved, so its contents may have too.
+                // Unless that side's file went back in time.
+                (true, false) if Self::went_back(s, baseline.side(path, Side::Source)) => {
+                    self.settle_conflict(&mut plan, &mut ground, baseline, path, s, d)
+                }
+                (false, true) if Self::went_back(d, baseline.side(path, Side::Destination)) => {
+                    self.settle_conflict(&mut plan, &mut ground, baseline, path, s, d)
+                }
+                (true, false) => self.carry(&mut plan, &mut ground, baseline, path, s, d, Side::Destination, false),
+                (false, true) => self.carry(&mut plan, &mut ground, baseline, path, s, d, Side::Source, false),
+                (true, true) => self.settle_conflict(&mut plan, &mut ground, baseline, path, s, d),
             }
         }
+        ground.finish(&mut plan);
         plan
     }
 
-    /// The baseline to remember after a run. Where both sides now agree, that's the new
-    /// baseline; where they still differ (a failed copy, a stopped run, an open conflict),
-    /// the old baseline stays, so the next run makes the same decision again.
-    pub fn next_baseline(source: &Snapshot, destination: &Snapshot, old: &Snapshot) -> Snapshot {
-        let all_paths: BTreeSet<&String> = source.paths().chain(destination.paths()).chain(old.paths()).collect();
-        all_paths
-            .into_iter()
-            .filter_map(|path| {
-                let (s, d) = (source.get(path), destination.get(path));
-                let kept = if Entry::same(s, d) { s } else { old.get(path) };
-                kept.map(|entry| (path.clone(), *entry))
-            })
-            .collect()
+    /// Whether a file's time is now older than the one recorded at the last sync.
+    fn went_back(now: Option<&Entry>, before: Option<&Entry>) -> bool {
+        matches!((now, before), (Some(now), Some(before))
+            if now.is_file() && before.is_file() && now.modified + crate::scan::MTIME_TOLERANCE_MS < before.modified)
     }
 
-    /// Makes side `to` match `wanted` (which comes from the other side).
-    pub(crate) fn carry(plan: &mut Plan, path: &str, wanted: Option<&Entry>, existing: Option<&Entry>, to: Side) {
-        let path = path.to_string();
-        match wanted {
+    /// Makes side `to` match the other side's version of `path`. `settles` marks a copy that
+    /// decides a conflict (the version it replaces always goes to the trash).
+    #[allow(clippy::too_many_arguments)]
+    fn carry(&self, plan: &mut Plan, ground: &mut Ground, baseline: &Baseline, path: &str, s: Option<&Entry>, d: Option<&Entry>, to: Side, settles: bool) {
+        let (wanted, existing) = match to {
+            Side::Destination => (s, d),
+            Side::Source => (d, s),
+        };
+        let here = ground.side(to);
+        match (wanted, existing) {
+            (None, None) => {}
             // Deleted on the other side.
-            None => {
-                if let Some(existing) = existing {
-                    plan.push(Action::Delete { side: to, path, dir: existing.is_dir(), whole: false });
-                }
-            }
-            Some(wanted) => {
-                if let Some(blocker) = existing.filter(|e| e.kind != wanted.kind) {
-                    plan.push(Action::Delete { side: to, path: path.clone(), dir: blocker.is_dir(), whole: true });
-                }
-                if wanted.is_dir() {
-                    plan.push(Action::CreateDir { side: to, path });
+            (None, Some(existing)) => {
+                if existing.is_dir() && here.is_occupied(path) {
+                    plan.note(
+                        NoteKind::KeptFolder,
+                        Some(to),
+                        here.spelling(path),
+                        "kept: it was removed on the other side, but it holds items Charon leaves alone",
+                    );
                 } else {
-                    let replaces = existing.is_some_and(|e| !e.is_dir());
-                    plan.push(Action::Copy { to, path, bytes: wanted.size, replaces });
+                    plan.push(Action::delete(to, path, *existing, None));
                 }
             }
+            // The other side changed the item into another kind (a folder became a file…).
+            (Some(wanted), Some(existing)) if wanted.kind != existing.kind => {
+                let folder_in_the_way = existing.is_dir() && (here.is_occupied(path) || ground.holds_changes(to, path, baseline));
+                // A link in a folder's place would take everything in the folder away on this
+                // side, while it stays reachable only through the link on the other.
+                if folder_in_the_way || (existing.is_dir() && wanted.is_link()) {
+                    Self::ask(plan, ground, path, s, d);
+                    return;
+                }
+                plan.push(Action::delete(to, path, *existing, Some(*wanted)));
+                Self::bring(plan, to, path, wanted, None, settles);
+            }
+            (Some(wanted), existing) => Self::bring(plan, to, path, wanted, existing.copied(), settles),
         }
     }
 
-    /// Both sides changed the item since the last sync.
-    fn settle_conflict(&self, plan: &mut Plan, path: &str, s: Option<&Entry>, d: Option<&Entry>) {
+    /// Creates the folder, or copies the file or link, on side `to`.
+    fn bring(plan: &mut Plan, to: Side, path: &str, wanted: &Entry, existing: Option<Entry>, settles: bool) {
+        if wanted.is_dir() {
+            plan.push(Action::CreateDir { side: to, path: path.to_string() });
+        } else {
+            plan.push(Action::copy(to, path, *wanted, existing).settling(settles));
+        }
+    }
+
+    /// Both sides changed the item since the last sync (or there is no last sync).
+    fn settle_conflict(&self, plan: &mut Plan, ground: &mut Ground, baseline: &Baseline, path: &str, s: Option<&Entry>, d: Option<&Entry>) {
         match (s, d) {
-            // Edited on one side, deleted on the other: the edit wins.
-            (Some(_), None) => Self::carry(plan, path, s, d, Side::Destination),
-            (None, Some(_)) => Self::carry(plan, path, d, s, Side::Source),
-            (Some(src), Some(dst)) if !src.is_dir() && !dst.is_dir() => match self.rule {
-                ConflictRule::NewestWins => {
-                    if dst.modified > src.modified {
-                        Self::carry(plan, path, d, s, Side::Source);
-                    } else {
-                        Self::carry(plan, path, s, d, Side::Destination);
-                    }
+            // Edited on one side, deleted on the other: the edit wins (new on one side, when
+            // there was no last sync).
+            (Some(_), None) => self.carry(plan, ground, baseline, path, s, d, Side::Destination, false),
+            (None, Some(_)) => self.carry(plan, ground, baseline, path, s, d, Side::Source, false),
+            (Some(src), Some(dst)) if src.kind == dst.kind && !src.is_dir() => match self.rule {
+                ConflictRule::NewestWins if Self::newest_is_clear(ground, baseline, path, src, dst) => {
+                    let to = if dst.modified > src.modified { Side::Source } else { Side::Destination };
+                    self.carry(plan, ground, baseline, path, s, d, to, true);
                 }
-                ConflictRule::KeepBoth => plan.push(Action::KeepBoth {
+                ConflictRule::KeepBoth | ConflictRule::NewestWins if src.is_file() => plan.push(Action::KeepBoth {
                     path: path.to_string(),
                     source_bytes: src.size,
                     destination_bytes: dst.size,
+                    source: *src,
+                    destination: *dst,
                 }),
-                ConflictRule::Ask => Self::ask(plan, path, s, d),
+                // Two different links have no "both": ask.
+                _ => Self::ask(plan, ground, path, s, d),
             },
             // A file on one side, a folder on the other: always a question.
-            _ => Self::ask(plan, path, s, d),
+            _ => Self::ask(plan, ground, path, s, d),
         }
     }
 
-    fn ask(plan: &mut Plan, path: &str, s: Option<&Entry>, d: Option<&Entry>) {
+    /// Whether the two times say which version is newer: not on network shares or drives
+    /// Charon doesn't know, not on drives that keep local
+    /// times (a time-zone change moves them by hours), not when they're whole hours apart or
+    /// too close to call, and not when either side's time went backwards (a restored file,
+    /// a wrong clock).
+    fn newest_is_clear(ground: &Ground, baseline: &Baseline, path: &str, src: &Entry, dst: &Entry) -> bool {
+        let shifting = ground.side(Side::Source).shifts_times() || ground.side(Side::Destination).shifts_times();
+        let comparable = |side: Side| ground.side(side).volume().is_none_or(|volume| volume.comparable_times());
+        if !comparable(Side::Source) || !comparable(Side::Destination) {
+            return false;
+        }
+        let backwards = |side: Side, now: &Entry| baseline.side(path, side).is_some_and(|before| now.modified < before.modified);
+        !shifting
+            && (src.modified - dst.modified).abs() > crate::scan::MTIME_TOLERANCE_MS
+            && !Entry::whole_hours_apart(src.modified, dst.modified)
+            && !backwards(Side::Source, src)
+            && !backwards(Side::Destination, dst)
+    }
+
+    /// Leaves the item (and anything inside it) for the person to decide.
+    fn ask(plan: &mut Plan, ground: &mut Ground, path: &str, s: Option<&Entry>, d: Option<&Entry>) {
         plan.push(Action::Conflict { path: path.to_string(), source: s.copied(), destination: d.copied() });
+        ground.block(path);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::Pair;
+    use crate::scan::EntryKind;
 
     fn file(size: u64, modified: i64) -> Entry {
         Entry::file(size, modified)
@@ -134,61 +214,185 @@ mod tests {
         items.iter().map(|(p, e)| (p.to_string(), *e)).collect()
     }
 
+    /// A baseline where both sides had exactly these items.
+    fn base(items: &[(&str, Entry)]) -> Baseline {
+        items.iter().map(|(p, e)| (p.to_string(), Pair::new(*e, *e))).collect()
+    }
+
+    #[test]
+    fn a_version_older_than_its_own_record_is_a_conflict_not_a_change() {
+        let synced = file(5, 1_000_000);
+        let older = file(4, 400_000);
+        let baseline = base(&[("a.txt", synced)]);
+        // The destination went back (restored, or its last writes were lost).
+        for rule in [ConflictRule::Ask, ConflictRule::KeepBoth, ConflictRule::NewestWins] {
+            let plan = TwoWayPlanner::new(rule).plan(&snap(&[("a.txt", synced)]), &snap(&[("a.txt", older)]), &baseline);
+            assert!(
+                !plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Source, .. })),
+                "{rule:?}: the older version must never replace the newer one: {:?}",
+                plan.actions
+            );
+            assert!(plan.actions.iter().any(|a| matches!(a, Action::Conflict { .. } | Action::KeepBoth { .. })), "{rule:?}");
+        }
+        // A newer edit still simply crosses.
+        let newer = file(6, 2_000_000);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[("a.txt", newer)]), &snap(&[("a.txt", synced)]), &baseline);
+        assert_eq!(plan.actions, vec![Action::copy(Side::Destination, "a.txt", newer, Some(synced))]);
+    }
+
     #[test]
     fn first_run_merges_both_sides() {
         let src = snap(&[("a.txt", file(1, 10_000))]);
         let dst = snap(&[("b.txt", file(2, 10_000))]);
-        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &Snapshot::new());
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &Baseline::new());
         let s = plan.summary();
         assert_eq!((s.to_destination, s.to_source, s.deletes), (1, 1, 0));
     }
 
     #[test]
+    fn without_a_baseline_differences_are_conflicts_never_deletions() {
+        let src = snap(&[("a.txt", file(1, 10_000))]);
+        let dst = snap(&[("a.txt", file(2, 90_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &Baseline::new());
+        assert_eq!(plan.conflicts().len(), 1);
+        assert_eq!(plan.summary().deletes, 0);
+    }
+
+    #[test]
     fn deletion_crosses_over() {
-        let base = snap(&[("a.txt", file(1, 10_000))]);
+        let b = base(&[("a.txt", file(1, 10_000))]);
         let src = snap(&[]);
-        let dst = base.clone();
-        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &base);
-        assert_eq!(plan.actions, vec![Action::Delete { side: Side::Destination, path: "a.txt".into(), dir: false, whole: false }]);
+        let dst = snap(&[("a.txt", file(1, 10_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        assert_eq!(plan.actions, vec![Action::delete(Side::Destination, "a.txt", file(1, 10_000), None)]);
     }
 
     #[test]
     fn edit_beats_deletion() {
-        let base = snap(&[("a.txt", file(1, 10_000))]);
+        let b = base(&[("a.txt", file(1, 10_000))]);
         let src = snap(&[]);
         let dst = snap(&[("a.txt", file(5, 90_000))]);
-        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &base);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert!(matches!(&plan.actions[0], Action::Copy { to: Side::Source, .. }));
     }
 
     #[test]
-    fn baseline_keeps_unfinished_decisions() {
-        let old = snap(&[("gone.txt", file(1, 10_000))]);
-        let src = snap(&[("new.txt", file(2, 20_000))]);
-        // The deletion of gone.txt on the destination failed; new.txt was copied.
-        let dst = snap(&[("gone.txt", file(1, 10_000)), ("new.txt", file(2, 20_000))]);
-        let next = TwoWayPlanner::next_baseline(&src, &dst, &old);
-        assert!(next.get("gone.txt").is_some());
-        assert!(next.get("new.txt").is_some());
-        // So the next run still deletes it instead of copying it back.
-        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &next);
-        assert!(matches!(&plan.actions[0], Action::Delete { side: Side::Destination, .. }));
+    fn each_side_is_compared_with_its_own_record() {
+        // The destination's drive rounds times by a second: that's not a change.
+        let s = file(4, 10_000);
+        let d = file(4, 11_000);
+        let b: Baseline = [("a.txt".to_string(), Pair::new(s, d))].into_iter().collect();
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[("a.txt", s)]), &snap(&[("a.txt", d)]), &b);
+        assert!(plan.actions.is_empty());
+        // An edit within the same 2 seconds on one side is still an edit.
+        let edited = file(4, 10_900);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&snap(&[("a.txt", edited)]), &snap(&[("a.txt", d)]), &b);
+        assert!(matches!(&plan.actions[0], Action::Copy { to: Side::Destination, .. }), "{:?}", plan.actions);
+    }
+
+    #[test]
+    fn a_drive_that_doesnt_keep_times_never_loops() {
+        // After Charon's copy, the destination's drive stamped its own time on the file.
+        let s = file(4, 10_000);
+        let d = file(4, 99_999_000);
+        let b: Baseline = [("a.txt".to_string(), Pair::new(s, d))].into_iter().collect();
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&snap(&[("a.txt", s)]), &snap(&[("a.txt", d)]), &b);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
     }
 
     #[test]
     fn conflict_rules() {
-        let base = snap(&[("a.txt", file(1, 10_000))]);
+        let b = base(&[("a.txt", file(1, 10_000))]);
         let src = snap(&[("a.txt", file(2, 50_000))]);
         let dst = snap(&[("a.txt", file(3, 90_000))]);
 
-        let newest = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&src, &dst, &base);
-        assert!(matches!(&newest.actions[0], Action::Copy { to: Side::Source, .. }));
+        let newest = TwoWayPlanner::new(ConflictRule::NewestWins).plan(&src, &dst, &b);
+        assert!(matches!(&newest.actions[0], Action::Copy { to: Side::Source, settles_conflict: true, .. }));
 
-        let both = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &base);
+        let both = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &b);
         assert!(matches!(&both.actions[0], Action::KeepBoth { .. }));
 
-        let ask = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &base);
+        let ask = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
         assert_eq!(ask.conflicts().len(), 1);
         assert!(ask.is_settled());
+    }
+
+    #[test]
+    fn newest_wins_keeps_both_when_newest_cant_be_told() {
+        let b = base(&[("a.txt", file(1, 10_000_000))]);
+        let rule = TwoWayPlanner::new(ConflictRule::NewestWins);
+        // Exactly an hour apart: a time-zone or daylight-saving shift, not a real "newer".
+        let src = snap(&[("a.txt", file(2, 20_000_000))]);
+        let dst = snap(&[("a.txt", file(3, 20_000_000 + 3_600_000))]);
+        assert!(matches!(&rule.plan(&src, &dst, &b).actions[0], Action::KeepBoth { .. }));
+        // The source's time went backwards (restored from an old copy).
+        let src = snap(&[("a.txt", file(2, 5_000_000))]);
+        let dst = snap(&[("a.txt", file(3, 20_000_000))]);
+        assert!(matches!(&rule.plan(&src, &dst, &b).actions[0], Action::KeepBoth { .. }));
+        // A FAT drive on one side.
+        let mut src = snap(&[("a.txt", file(2, 30_000_000))]);
+        src.facts_mut().volume = Some(crate::scan::Volume {
+            kind: crate::scan::FsKind::Fat,
+            fs: "msdos".into(),
+            mount: "/Volumes/STICK".into(),
+            name: "STICK".into(),
+            network: false,
+            case_sensitive: false,
+        });
+        let dst = snap(&[("a.txt", file(3, 20_000_000))]);
+        assert!(matches!(&rule.plan(&src, &dst, &b).actions[0], Action::KeepBoth { .. }));
+    }
+
+    #[test]
+    fn an_unreadable_folder_is_never_taken_for_a_deletion() {
+        let b = base(&[("work", Entry::dir()), ("work/plan.txt", file(1, 10_000))]);
+        let mut src = snap(&[("work", Entry::dir())]);
+        src.freeze("work", "permission denied");
+        let dst = snap(&[("work", Entry::dir()), ("work/plan.txt", file(1, 10_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        assert!(plan.actions.is_empty(), "{:?}", plan.actions);
+    }
+
+    #[test]
+    fn a_removed_folder_with_new_work_inside_is_kept() {
+        let b = base(&[("f", Entry::dir()), ("f/old.txt", file(1, 10_000))]);
+        let src = snap(&[]);
+        let dst = snap(&[("f", Entry::dir()), ("f/old.txt", file(1, 10_000)), ("f/new.txt", file(2, 20_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        // old.txt goes, new.txt crosses to the source, and the folder stays on the destination.
+        assert!(plan.actions.contains(&Action::delete(Side::Destination, "f/old.txt", file(1, 10_000), None)));
+        assert!(plan.actions.iter().any(|a| matches!(a, Action::Copy { to: Side::Source, path, .. } if path == "f/new.txt")));
+        assert!(!plan.actions.iter().any(|a| matches!(a, Action::Delete { item: EntryKind::Dir, .. })));
+    }
+
+    #[test]
+    fn a_folder_turned_file_over_new_work_is_a_question() {
+        let b = base(&[("x", Entry::dir()), ("x/a.txt", file(1, 10_000))]);
+        let src = snap(&[("x", file(9, 90_000))]);
+        let dst = snap(&[("x", Entry::dir()), ("x/a.txt", file(1, 10_000)), ("x/b.txt", file(2, 20_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &b);
+        assert_eq!(plan.actions.len(), 1, "{:?}", plan.actions);
+        assert!(matches!(&plan.actions[0], Action::Conflict { path, .. } if path == "x"));
+    }
+
+    #[test]
+    fn a_link_taking_a_folders_place_is_a_question() {
+        let b = base(&[("footage", Entry::dir()), ("footage/a.mov", file(1, 10_000))]);
+        let src = snap(&[("footage", Entry::link(b"/Volumes/SSD/footage", 50_000))]);
+        let dst = snap(&[("footage", Entry::dir()), ("footage/a.mov", file(1, 10_000))]);
+        let plan = TwoWayPlanner::new(ConflictRule::KeepBoth).plan(&src, &dst, &b);
+        assert_eq!(plan.actions.len(), 1, "{:?}", plan.actions);
+        assert!(matches!(&plan.actions[0], Action::Conflict { path, .. } if path == "footage"));
+    }
+
+    #[test]
+    fn excluded_items_keep_a_removed_folder() {
+        let b = base(&[("f", Entry::dir()), ("f/a.txt", file(1, 10_000))]);
+        let src = snap(&[]);
+        let mut dst = snap(&[("f", Entry::dir()), ("f/a.txt", file(1, 10_000))]);
+        dst.occupy("f"); // f/cache.tmp is excluded
+        let plan = TwoWayPlanner::new(ConflictRule::Ask).plan(&src, &dst, &b);
+        assert_eq!(plan.actions, vec![Action::delete(Side::Destination, "f/a.txt", file(1, 10_000), None)]);
+        assert_eq!(plan.notes[0].kind, NoteKind::KeptFolder);
     }
 }

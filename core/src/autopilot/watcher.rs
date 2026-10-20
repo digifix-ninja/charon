@@ -1,8 +1,8 @@
 //! Hears about changes inside the watched folders (FSEvents on macOS, ReadDirectoryChanges
-//! on Windows, inotify on Linux) and reports which job they belong to.
+//! on Windows, inotify on Linux) and reports which job they belong to, and where.
 
 use crate::model::JobId;
-use crate::scan::{PARTIAL_SUFFIX, TRASH_FOLDER};
+use crate::scan::{is_partial, MARKER_FOLDER, TRASH_FOLDER};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,8 +23,9 @@ pub struct FolderWatcher {
 }
 
 impl FolderWatcher {
-    /// A watcher that sends the id of the job whose folder changed to `changes`.
-    pub fn new(changes: Sender<JobId>) -> notify::Result<Self> {
+    /// A watcher that sends the id of the job whose folder changed, and the changed path,
+    /// to `changes`.
+    pub fn new(changes: Sender<(JobId, PathBuf)>) -> notify::Result<Self> {
         let routes: Routes = Arc::default();
         let lookup = routes.clone();
         let watcher = notify::recommended_watcher(move |result: notify::Result<Event>| {
@@ -37,7 +38,7 @@ impl FolderWatcher {
             for path in event.paths.iter().filter(|p| !Self::is_own_file(p)) {
                 for (root, id) in routes.iter() {
                     if path.starts_with(root) && told.insert(id) {
-                        let _ = changes.send(id.clone());
+                        let _ = changes.send((id.clone(), path.clone()));
                     }
                 }
             }
@@ -72,9 +73,9 @@ impl FolderWatcher {
         *self.routes.lock().expect("routes lock") = routes;
     }
 
-    /// Charon's trash and half-copied files: never a reason to sync.
+    /// Charon's trash, markers and half-copied files: never a reason to look again.
     fn is_own_file(path: &Path) -> bool {
-        path.components().any(|c| c.as_os_str() == TRASH_FOLDER)
-            || path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(PARTIAL_SUFFIX))
+        path.components().any(|c| c.as_os_str() == TRASH_FOLDER || c.as_os_str() == MARKER_FOLDER)
+            || path.file_name().is_some_and(|n| is_partial(&n.to_string_lossy()))
     }
 }

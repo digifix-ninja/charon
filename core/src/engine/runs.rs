@@ -1,66 +1,109 @@
-//! Syncing, previews (dry runs), checks for pending changes, and settling conflicts.
+//! Syncing: runs the person confirmed, and runs of jobs with full automation.
+//!
+//! A run carries out a plan made from a survey. A confirmed run uses the very survey the
+//! person looked at; a run nobody looked at makes a fresh one, and goes ahead only when
+//! nothing about it needs a look (`Survey::holds`). Otherwise it is held back: nothing is
+//! touched, and the job waits for the person's OK.
+//!
+//! While files are being carried, the job's record says so (`Job::run_in_progress`). Only
+//! when every change is on the drives does Charon write the markers, save the two-way
+//! memory and clear that mark. A run that never got there (Charon closed, the computer
+//! stopped) is recognised at the next look, which then doesn't trust the memory.
 
-use crate::engine::{Engine, EngineEvent};
+use crate::engine::survey::{Purpose, Survey};
+use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
-use crate::model::{
-    ConflictChoice, Finished, Job, JobId, Pending, Phase, Progress, RunSummary,
-};
-use crate::plan::{self, Action, Plan, PlanSummary, Side, TwoWayPlanner};
-use crate::run::{Executor, Outcome, ProgressMeter, Shores, Trash};
-use crate::scan::{Entry, ExcludeFilter, Scanner, Snapshot};
+use crate::model::{plural, Drives, Finished, Job, JobId, JobSetup, Mark, Phase, Progress, ReviewKind, RunSummary};
+use crate::plan::{Action, Baseline, NoteKind, Side};
+use crate::run::{Care, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
+use crate::store::{Landings, Memory};
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// A preview shows at most this many individual steps.
-const PREVIEW_STEPS: usize = 400;
+/// Why a job waits for an OK after the person stopped its sync.
+pub(crate) const STOPPED: &str = "You stopped the last sync. Nothing more happens until you confirm the list.";
+/// Why a job waits for an OK after a sync Charon couldn't record.
+pub(crate) const UNRECORDED: &str = "Charon couldn't record the last sync, so nothing more happens until you confirm the list.";
 /// Live progress reaches the window at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
-/// At most this many failed files are written to the log per run.
-const LOGGED_FAILURES: usize = 50;
+/// At most this many failed or skipped items are written to the log per run.
+const LOGGED_ITEMS: usize = 50;
 
-/// What a dry run found: the counts, and the first steps in detail.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Preview {
-    pub summary: PlanSummary,
-    pub steps: Vec<Action>,
-    pub total_steps: usize,
+/// What "Sync now" did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SyncStart {
+    /// The job runs by itself: its sync started.
+    Started,
+    /// The job waits for the person's OK: the window shows the list first.
+    Review,
 }
 
-/// Both folders as they are now, and what it takes to bring them together.
-struct Survey {
-    source: Snapshot,
-    destination: Snapshot,
-    baseline: Snapshot,
-    plan: Plan,
+/// How a run came about.
+#[derive(Debug, Clone)]
+pub(crate) struct Crossing {
+    pub kind: ReviewKind,
+    /// The person confirmed the list.
+    pub approved: bool,
+    /// For the log: "confirmed by you", "automatically on schedule".
+    pub reason: String,
+    /// The conflict this run settles (a resolution), by its key.
+    pub resolving: Option<String>,
+}
+
+/// For each other job: its setup as it was looked at, and whether it shares a folder with
+/// the job about to start (worked out before any lock is taken, since it asks the disk).
+pub(crate) struct Neighbours {
+    mine: JobSetup,
+    others: HashMap<JobId, (JobSetup, bool)>,
 }
 
 impl Engine {
-    // ---------------------------------------------------------------- syncing
+    // ---------------------------------------------------------------- starting
 
-    /// Starts a sync in the background. Works for paused jobs too: pausing only stops
-    /// automatic runs.
-    pub fn sync_now(&self, id: &JobId) -> Result<()> {
-        self.start_run(id, "started by hand")
+    /// "Sync now": starts the sync of a job that runs by itself; any other job shows its
+    /// list of changes first. Works for paused jobs too: pausing only stops automatic runs.
+    pub fn sync_now(&self, id: &JobId) -> Result<SyncStart> {
+        let job = self.stored_job(id)?;
+        if !job.runs_by_itself() {
+            return Ok(SyncStart::Review);
+        }
+        self.start_unreviewed(id, "started by hand")?;
+        Ok(SyncStart::Started)
     }
 
-    /// Starts a sync of every job that isn't paused and whose folders are reachable.
-    pub fn sync_all(&self) {
+    /// "Sync all": starts every job that runs by itself (not paused, folders reachable)
+    /// and returns the other jobs that could sync now: their lists need the person's OK.
+    pub fn sync_all(&self) -> Vec<JobId> {
+        let mut asking = Vec::new();
         for job in self.job_list() {
-            if !job.paused && job.setup.source.is_dir() && job.setup.destination.is_dir() {
-                let _ = self.start_run(&job.id, "started with Sync all");
+            if job.paused || !job.setup.source.is_dir() || !job.setup.destination.is_dir() || self.is_running(&job.id) {
+                continue;
+            }
+            if job.runs_by_itself() {
+                // Another job using the folders makes it wait, not give up (see `start_wanted`).
+                self.want(&job.id, "started with Sync all");
+                self.start_wanted(&job.id);
+            } else {
+                asking.push(job.id);
             }
         }
+        asking
     }
 
-    /// Stops a running sync (what's already copied stays).
+    /// Stops a running sync (what's already carried stays). The next sync of the job waits
+    /// for the person's OK.
     pub fn cancel(&self, id: &JobId) {
-        if let Some(cancel) = self.runtime().get(id).and_then(|rt| rt.cancel.clone()) {
-            cancel.store(true, Ordering::Relaxed);
+        if let Some(rt) = self.runtime().get_mut(id) {
+            if let Some(cancel) = &rt.cancel {
+                cancel.store(true, Ordering::Relaxed);
+                rt.stopped_by_person = true;
+            }
         }
     }
 
@@ -77,134 +120,556 @@ impl Engine {
             .is_some_and(|rt| rt.is_running() || rt.finished_at.is_some_and(|t| t.elapsed() < quiet))
     }
 
-    pub(crate) fn start_run(&self, id: &JobId, reason: &str) -> Result<()> {
-        let job = self.stored_job(id)?;
-        let cancel = Arc::new(AtomicBool::new(false));
+    /// Notes that a job with full automation should sync (`reason` is for the log). The run
+    /// starts with `start_wanted`, now or as soon as nothing stands in its way.
+    pub fn want(&self, id: &JobId, reason: &str) {
         self.change_runtime(id, |rt| {
-            if rt.is_running() {
-                return Err(Error::Busy);
+            if rt.wanted.is_none() {
+                rt.wanted = Some(format!("automatically {reason}"));
             }
-            rt.cancel = Some(cancel.clone());
-            rt.progress = Some(Progress::scanning());
-            rt.problem = None;
+        });
+    }
+
+    /// Forgets a wanted run (the job can't run by itself now: paused, offline, or it waits
+    /// for the person's OK).
+    pub fn unwant(&self, id: &JobId) {
+        let changed = self.change_runtime(id, |rt| {
+            let had = rt.wanted.take().is_some() || rt.waiting_for.is_some();
+            rt.waiting_for = None;
+            had
+        });
+        if changed {
+            self.publish(id);
+        }
+    }
+
+    /// Starts the job's wanted run, if it has one. While another job uses the folders it
+    /// keeps waiting (the row says for which job); any other refusal drops it.
+    pub fn start_wanted(&self, id: &JobId) {
+        let Some(reason) = self.runtime().get(id).and_then(|rt| rt.wanted.clone()) else { return };
+        let result = self.start_unreviewed(id, &reason);
+        let (now_waiting, changed) = self.change_runtime(id, |rt| {
+            let before = rt.waiting_for.clone();
+            match &result {
+                Err(Error::FoldersBusy(name)) => rt.waiting_for = Some(name.clone()),
+                Err(Error::Busy) => {}
+                _ => {
+                    rt.wanted = None;
+                    rt.waiting_for = None;
+                }
+            }
+            (rt.waiting_for.clone(), before != rt.waiting_for)
+        });
+        match result {
+            Ok(()) => {}
+            Err(Error::FoldersBusy(_)) | Err(Error::Busy) if changed => {
+                log::info!("job {id}: automatic sync waits for {}", now_waiting.unwrap_or_default());
+                self.publish(id);
+            }
+            Err(Error::FoldersBusy(_)) | Err(Error::Busy) => {}
+            Err(e) => {
+                log::info!("job {id}: automatic sync not started: {e}");
+                if changed {
+                    self.publish(id);
+                }
+            }
+        }
+    }
+
+    /// Starts a run nobody looks at (full automation): it surveys first, and holds back for
+    /// the person's OK when anything about the plan needs a look.
+    pub(crate) fn start_unreviewed(&self, id: &JobId, reason: &str) -> Result<()> {
+        let (job, cancel) = self.begin_run(id, |job, rt| {
+            if !job.runs_by_itself() || rt.must_ask {
+                return Err(Error::Invalid("This job waits for your OK before it syncs.".into()));
+            }
+            if rt.preparing.is_some() || rt.review.as_ref().is_some_and(|review| Utc::now() < review.expires_at) {
+                return Err(Error::Invalid("A list of this job's changes is open, waiting for your OK.".into()));
+            }
             Ok(())
         })?;
         self.publish(id);
+        let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: reason.to_string(), resolving: None };
+        self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
+            Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
+            Ok(survey) => engine.cross(&job, &survey, &cancel, &crossing),
+            Err(e) => engine.unfinished(&job, &crossing, e),
+        })
+    }
 
+    /// Marks the job as running, if it may run now: it isn't running already, and no
+    /// running job uses one of its folders. `check` adds the caller's own conditions.
+    pub(crate) fn begin_run(&self, id: &JobId, check: impl FnOnce(&Job, &mut JobRuntime) -> Result<()>) -> Result<(Job, Arc<AtomicBool>)> {
+        let neighbours = self.neighbours(id);
+        let state = self.state();
+        let job = state.jobs.iter().find(|job| &job.id == id).cloned().ok_or_else(|| Error::UnknownJob(id.clone()))?;
+        let mut runtime = self.runtime();
+        if self.is_shutting_down() {
+            return Err(Error::Invalid("Charon is quitting.".into()));
+        }
+        if runtime.get(id).is_some_and(|rt| rt.is_running()) {
+            return Err(Error::Busy);
+        }
+        if let Some(name) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours) {
+            return Err(Error::FoldersBusy(name));
+        }
+        let rt = runtime.entry(id.clone()).or_default();
+        check(&job, rt)?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        rt.cancel = Some(cancel.clone());
+        rt.stopped_by_person = false;
+        rt.progress = Some(Progress::scanning());
+        rt.problem = None;
+        // A look at folders that are about to change would be wrong at once.
+        rt.stop_looking();
+        Ok((job, cancel))
+    }
+
+    /// Which other jobs share a folder with `id` (asks the disk; done before locking).
+    pub(crate) fn neighbours(&self, id: &JobId) -> Neighbours {
+        let jobs = self.job_list();
+        let Some(me) = jobs.iter().find(|job| &job.id == id) else {
+            return Neighbours { mine: Self::nowhere(), others: HashMap::new() };
+        };
+        let others = jobs
+            .iter()
+            .filter(|other| other.id != me.id)
+            .map(|other| (other.id.clone(), (other.setup.clone(), me.setup.shares_folders_with(&other.setup))))
+            .collect();
+        Neighbours { mine: me.setup.clone(), others }
+    }
+
+    /// The name of a running job that shares a folder with `job`, if there is one. A job
+    /// whose setup changed since the neighbours were worked out counts as sharing.
+    pub(crate) fn busy_neighbour(jobs: &[Job], runtime: &HashMap<JobId, JobRuntime>, job: &Job, neighbours: &Neighbours) -> Option<String> {
+        jobs.iter()
+            .filter(|other| other.id != job.id && runtime.get(&other.id).is_some_and(|rt| rt.is_running()))
+            .find(|other| match neighbours.others.get(&other.id) {
+                Some((setup, shares)) if *setup == other.setup && neighbours.mine == job.setup => *shares,
+                _ => true,
+            })
+            .map(|other| other.setup.name.clone())
+    }
+
+    fn nowhere() -> JobSetup {
+        JobSetup {
+            name: String::new(),
+            source: Default::default(),
+            destination: Default::default(),
+            mode: crate::model::SyncMode::Backup,
+            conflict: crate::model::ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        }
+    }
+
+    /// Runs `work` on its own thread for a job marked as running.
+    pub(crate) fn spawn_crossing(
+        &self,
+        job: Job,
+        cancel: Arc<AtomicBool>,
+        crossing: Crossing,
+        work: impl FnOnce(&Engine, Job, Arc<AtomicBool>, Crossing) + Send + 'static,
+    ) -> Result<()> {
         let engine = self.clone();
-        let reason = reason.to_string();
-        thread::Builder::new()
-            .name("charon-sync".into())
-            .spawn(move || engine.run_job(job, cancel, &reason))
-            .map_err(Error::Io)?;
+        let id = job.id.clone();
+        let spawned = thread::Builder::new().name("charon-sync".into()).spawn(move || work(&engine, job, cancel, crossing));
+        if let Err(e) = spawned {
+            self.change_runtime(&id, |rt| {
+                rt.cancel = None;
+                rt.progress = None;
+            });
+            self.publish(&id);
+            return Err(Error::Io(e));
+        }
         Ok(())
     }
 
-    /// The whole life of one run, on its own thread.
-    fn run_job(&self, job: Job, cancel: Arc<AtomicBool>, reason: &str) {
-        let id = job.id.clone();
+    // ---------------------------------------------------------------- carrying out
+
+    /// Carries out the plan of `survey`, makes it durable and records it. Runs on the
+    /// job's sync thread, with the job marked as running.
+    pub(crate) fn cross(&self, job: &Job, survey: &Survey, cancel: &AtomicBool, crossing: &Crossing) {
+        let id = &job.id;
         let journal = &self.inner.journal;
-        journal.info(&id, &format!("sync {reason}"));
         let started_at = Utc::now();
+        let mut summary = RunSummary::starting(started_at, crossing.approved);
+        let steps = survey.plan.work().count() as u64;
+        journal.info(id, &format!("sync {}: {}", crossing.reason, plural(steps, "step")));
 
-        let result = self.cross(&job, &cancel);
-        let summary = Self::summarise(&result, started_at);
+        // Until this run is recorded, the job's record says files are being carried.
+        if let Err(e) = self.change_job(id, |job| job.run_in_progress = true) {
+            summary.error = Some(format!("Charon couldn't save its state before syncing ({e}), so it changed nothing."));
+            self.finish(job, survey, crossing, summary, None);
+            return;
+        }
 
-        // Stored state: the summary, and when it was last fully synced.
-        let _ = self.change_job(&id, |job| {
-            if summary.error.is_none() && !summary.cancelled {
-                job.last_synced = Some(summary.finished_at);
+        let two_way = survey.setup.mode.is_two_way();
+        let resolving = crossing.kind == ReviewKind::Resolve;
+        let shores = Shores { source: survey.setup.source.clone(), destination: survey.setup.destination.clone() };
+        let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving };
+        let observer = |progress: &Progress| self.report_progress(id, progress);
+        let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
+        let executor = Executor::new(&shores, &survey.source, &survey.destination, care, cancel);
+        let outcome = executor.run(&survey.plan, &mut meter);
+
+        // The housekeeping the list named, only after a run that went all the way.
+        let complete = !outcome.cancelled && outcome.stopped.is_none();
+        let mut tidied = 0;
+        if complete {
+            for (side, leftovers) in &survey.housekeeping.leftovers {
+                tidied += executor.tidy(*side, leftovers);
             }
-            job.last_run = Some(summary.clone());
-        });
+        }
+        let flushed = executor.flush();
+        if complete && flushed.is_ok() {
+            for (side, expired) in &survey.housekeeping.expired {
+                let names: Vec<String> = expired.iter().map(|e| e.name.clone()).collect();
+                Trash::sweep(survey.setup.root(*side), &names);
+            }
+        }
 
-        // The log.
+        summary.copied = outcome.copied;
+        summary.deleted = outcome.deleted;
+        summary.bytes = outcome.bytes;
+        summary.conflicts = survey.plan.conflicts().len() as u64;
+        summary.failed = outcome.failed.len() as u64;
+        summary.skipped = outcome.skipped.len() as u64;
+        summary.kept = outcome.kept.len() as u64;
+        summary.unreadable = survey.plan.notes.iter().filter(|n| n.kind == NoteKind::Unreadable).count() as u64;
+        summary.cancelled = outcome.cancelled;
+        let settled = if crossing.kind == ReviewKind::Sync { Self::settled_by_newest(survey, &outcome) } else { Vec::new() };
+        summary.settled = settled.len() as u64;
+
+        let mut problems: Vec<String> = outcome.stopped.iter().cloned().collect();
+        let recorded = match &flushed {
+            Ok(()) => match self.remember(job, survey, &outcome, crossing) {
+                Ok(()) => true,
+                Err(problem) => {
+                    problems.push(problem);
+                    false
+                }
+            },
+            Err(e) => {
+                problems.push(format!("Charon couldn't make sure the changes reached the drive ({e}). Its next look compares both folders afresh."));
+                false
+            }
+        };
+        if !problems.is_empty() {
+            summary.error = Some(problems.join(" "));
+        }
+        for (path, reason) in outcome.failed.iter().take(LOGGED_ITEMS) {
+            journal.warn(id, &format!("{path}: {reason}"));
+        }
+        for (path, reason) in outcome.skipped.iter().take(LOGGED_ITEMS) {
+            journal.info(id, &format!("{path}: {reason}"));
+        }
+        for (path, to) in settled.iter().take(LOGGED_ITEMS) {
+            journal.info(
+                id,
+                &format!(
+                    "{path}: changed on both sides; Newest wins kept the {} version, and the {}'s is in .charon-trash",
+                    to.opposite().word(),
+                    to.word()
+                ),
+            );
+        }
+        if tidied > 0 {
+            journal.info(id, &format!("moved {} into .charon-trash", plural(tidied, "half-copied leftover")));
+        }
+        self.change_runtime(id, |rt| {
+            for side in &outcome.no_links {
+                match side {
+                    Side::Source => rt.no_links.0 = true,
+                    Side::Destination => rt.no_links.1 = true,
+                }
+            }
+        });
+        let drives = match (survey.volume(Side::Source), survey.volume(Side::Destination)) {
+            (Some(source), Some(destination)) if recorded => Some(Drives { source: source.clone(), destination: destination.clone() }),
+            _ => None,
+        };
+        let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty();
+        self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left }));
+    }
+
+    /// The conflicts this run settled by Newest wins, with the side the newer version was
+    /// copied to (the other version went to .charon-trash).
+    fn settled_by_newest<'a>(survey: &'a Survey, outcome: &Outcome) -> Vec<(&'a str, Side)> {
+        let done: BTreeSet<&str> = outcome.settled.iter().map(|step| step.path.as_str()).collect();
+        survey
+            .plan
+            .actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Copy { to, path, settles_conflict: true, .. } if done.contains(path.as_str()) => Some((path.as_str(), *to)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Saves what this run did: the markers, then the memory (two-way), or the markers of a
+    /// Mirror or Backup. Each happens only once the run's changes are on the drives, and only
+    /// while both folders still carry the markers the survey found: otherwise another drive
+    /// came in under the same name, and recording this sync would make the next one treat
+    /// that drive's differences as changes to carry. The error says why nothing was recorded.
+    fn remember(&self, job: &Job, survey: &Survey, outcome: &Outcome, crossing: &Crossing) -> std::result::Result<(), String> {
+        let id = &job.id;
+        let setup = &survey.setup;
+        let now = Markers::read(&setup.source, &setup.destination, id);
+        if let Some(side) = now.changed_since(&survey.markers) {
+            let _ = self.inner.baselines.forget(id);
+            return Err(format!(
+                "Charon's marker in the {} folder changed during the sync, so it may be another drive under the same name. \
+                 Charon recorded nothing of this sync: its next look compares both folders afresh and waits for your OK.",
+                side.word()
+            ));
+        }
+        if !setup.mode.is_two_way() {
+            return self.remember_one_way(job, survey, outcome);
+        }
+        let memory = survey.memory.clone().unwrap_or_default();
+        let next = match crossing.kind {
+            ReviewKind::Sync => Baseline::after_run(&survey.baseline, &survey.source, &survey.destination, &survey.plan, &outcome.settled),
+            // Settling one item changes the memory of that item only, when there is a memory.
+            // Whatever under the settled item didn't make it (a failed copy, a stop) has no
+            // record afterwards, so the next look copies it rather than removing it.
+            ReviewKind::Resolve if survey.trusted => {
+                let mut baseline = memory.baseline.clone();
+                if let Some(key) = &crossing.resolving {
+                    baseline.forget_within(key);
+                }
+                baseline.record(&outcome.settled);
+                baseline
+            }
+            ReviewKind::Resolve => return Ok(()),
+        };
+        let (tokens, generation) = match (&memory.tokens, survey.trusted) {
+            (Some(tokens), true) => (tokens.clone(), memory.generation + 1),
+            _ => ((Marker::fresh_token(), Marker::fresh_token()), 1),
+        };
+        let fail = |what: String| {
+            // Without both markers and the memory, the next look starts afresh (it removes nothing).
+            let _ = self.inner.baselines.forget(id);
+            format!("The changes were synced, but Charon {what}, so it won't remember this sync: its next look compares both folders afresh and waits for your OK.")
+        };
+        for (side, token) in [(Side::Source, &tokens.0), (Side::Destination, &tokens.1)] {
+            if let Err(e) = Marker::new(id, side, token, generation).write(setup.root(side)) {
+                return Err(fail(format!("couldn't leave its marker in the {} ({e})", side.word())));
+            }
+        }
+        let memory = Memory { baseline: next, tokens: Some(tokens), generation, folded: survey.folded, distrust: None };
+        self.inner.baselines.save(id, setup, &memory).map_err(|e| fail(format!("couldn't save what was synced ({e})")))
+    }
+
+    /// Mirror and Backup: the destination's marker, then the source's where Charon can
+    /// write there. Each is written to the folder before the job's record names it, so a
+    /// record that couldn't be saved leaves the next look asking, never trusting.
+    fn remember_one_way(&self, job: &Job, survey: &Survey, outcome: &Outcome) -> std::result::Result<(), String> {
+        let id = &job.id;
+        let setup = &survey.setup;
+        let token = job.destination_token.clone().unwrap_or_else(Marker::fresh_token);
+        if let Err(e) = Marker::new(id, Side::Destination, &token, 0).write(&setup.destination) {
+            // The job keeps the token it had: the next look then finds the folder without
+            // it and asks.
+            return Err(format!(
+                "The files were synced, but Charon couldn't leave its marker in the destination ({e}), so it can't recognise that folder next time and will ask first."
+            ));
+        }
+        self.remember_landings(job, survey, outcome, &token);
+        let mark = match &job.source_mark {
+            Some(mark) => Mark { token: mark.token.clone(), generation: mark.generation + 1 },
+            None => Mark { token: Marker::fresh_token(), generation: 1 },
+        };
+        // A source Charon can't write to (a card, a read-only share) simply has no marker;
+        // its record then stays as it was, and so does what the next look expects.
+        let source_marked = match Marker::new(id, Side::Source, &mark.token, mark.generation).write(&setup.source) {
+            Ok(()) => true,
+            Err(e) => {
+                log::info!("no marker in the source of {} ({e})", setup.name);
+                false
+            }
+        };
+        self.change_job(id, |job| {
+            job.destination_token = Some(token);
+            if source_marked {
+                job.source_mark = Some(mark);
+            }
+        })
+        .map_err(|e| format!("The files were synced, but Charon couldn't save its record of this sync ({e}), so it will ask before the next one."))
+    }
+
+    /// Mirror and Backup: records the copies whose dates didn't stick on the destination,
+    /// so the next look doesn't copy them again while neither side changes (see
+    /// `store::Landings`). Losing this record only means copying those files once more.
+    fn remember_landings(&self, job: &Job, survey: &Survey, outcome: &Outcome, destination_token: &str) {
+        let (landed, undated) = Landings::after_run(&survey.landed, &outcome.settled, &survey.source);
+        if undated > 0 {
+            self.inner.journal.info(
+                &job.id,
+                &format!(
+                    "{} got other dates on the destination's drive than in the source (the drive doesn't keep the dates Charon sets); Charon remembers them, so they aren't copied again until one side changes",
+                    plural(undated, "copied file")
+                ),
+            );
+        }
+        if let Err(e) = self.inner.landings.save(&job.id, &survey.setup, survey.folded, destination_token, &landed) {
+            log::warn!("couldn't save the copies whose dates didn't stick for job {}: {e}", job.id);
+            let _ = self.inner.landings.forget(&job.id);
+        }
+    }
+
+    /// Records the end of a run: the job's record, the log, the live state, and the window.
+    fn finish(&self, job: &Job, survey: &Survey, crossing: &Crossing, mut summary: RunSummary, recorded: Option<Recorded>) {
+        let id = &job.id;
+        // A Stop from the person means something looked wrong: the next sync waits for an
+        // OK. A run stopped only because Charon quit carries on as before next time.
+        let stopped_by_person =
+            self.runtime().get(id).is_some_and(|rt| rt.stopped_by_person) || (summary.cancelled && !self.is_shutting_down());
+        let syncing = crossing.kind == ReviewKind::Sync;
+        let confirmed_clean = syncing && crossing.approved && summary.error.is_none() && !summary.cancelled && !stopped_by_person;
+        // Files were carried, but what they did couldn't be recorded (or another drive came
+        // in): the next sync waits for an OK.
+        let unrecorded = recorded.as_ref().is_some_and(|recorded| !recorded.recorded);
+        summary.finished_at = Utc::now();
+        let finished_at = summary.finished_at;
+        let saved = self.change_job(id, |stored| {
+            stored.last_run = Some(summary.clone());
+            if summary.error.is_none() && !summary.cancelled {
+                stored.last_synced = Some(finished_at);
+            }
+            if let Some(recorded) = &recorded {
+                // A run that couldn't be made durable leaves the mark: the next look won't
+                // trust the two-way memory.
+                stored.run_in_progress = !recorded.recorded;
+                if syncing {
+                    // What still waits after this run is for the next look to say.
+                    stored.waiting_since = None;
+                }
+                // A settled conflict says nothing about the drives as a whole.
+                if let Some(drives) = recorded.drives.as_ref().filter(|_| syncing) {
+                    stored.drives = Some(drives.clone());
+                }
+                if !crossing.approved {
+                    stored.note_automatic(finished_at, &recorded.destroyed.0, &recorded.destroyed.1);
+                }
+            }
+            // Settling one conflict doesn't confirm the rest of the job's changes.
+            if stopped_by_person {
+                stored.needs_review = true;
+                stored.held = Some(STOPPED.into());
+            } else if unrecorded {
+                stored.needs_review = true;
+                stored.held = Some(UNRECORDED.into());
+            } else if confirmed_clean {
+                stored.needs_review = false;
+                stored.held = None;
+                // The person just confirmed a list that counted what automatic syncs did
+                // today (see `Guard::concerns`): the count starts again from here.
+                if stored.setup.full_automation {
+                    stored.automatic_changes.clear();
+                }
+            }
+        });
+        if let Err(e) = saved {
+            log::error!("couldn't save the result of a sync of {}: {e}", job.setup.name);
+        }
         let line = summary.describe();
         match (&summary.error, summary.failed) {
-            (Some(_), _) => journal.error(&id, &line),
-            (None, 0) => journal.info(&id, &line),
-            (None, _) => journal.warn(&id, &line),
+            (Some(_), _) => self.inner.journal.error(id, &line),
+            (None, 0) => self.inner.journal.info(id, &line),
+            (None, _) => self.inner.journal.warn(id, &line),
         }
-        if let Ok((outcome, _)) = &result {
-            for (path, reason) in outcome.failed.iter().take(LOGGED_FAILURES) {
-                journal.warn(&id, &format!("{path}: {reason}"));
-            }
+        if stopped_by_person {
+            self.inner.journal.info(id, "stopped: the next sync waits for your OK");
+        } else if summary.cancelled {
+            self.inner.journal.info(id, "stopped because Charon quit");
         }
 
-        // Live state: the run is over. This comes last, after the summary and the log are
-        // written, so whoever sees the run end also finds its results.
-        let conflicts = result.as_ref().map(|(_, survey)| survey.plan.conflicts()).unwrap_or_default();
-        self.change_runtime(&id, |rt| {
+        // Live state last: whoever sees the run end finds its results.
+        let carried = recorded.is_some();
+        let left = recorded.as_ref().is_some_and(|r| r.left);
+        let mut look = Look::of(survey);
+        let resolved: Vec<String> = survey.plan.actions.iter().map(|a| a.path().to_string()).collect();
+        self.change_runtime(id, |rt| {
+            rt.cancel = None;
+            rt.stopped_by_person = false;
+            if stopped_by_person || unrecorded {
+                rt.must_ask = true;
+            } else if confirmed_clean {
+                rt.must_ask = false;
+            }
+            rt.progress = None;
+            rt.finished_at = Some(Instant::now());
+            rt.problem = summary.error.clone();
+            match crossing.kind {
+                // A run that never got to carry anything leaves the last look as it was.
+                _ if !carried => {}
+                ReviewKind::Sync => {
+                    look.items = 0;
+                    look.bytes = 0;
+                    look.removals = Default::default();
+                    look.replacements = Default::default();
+                    rt.reminder.count = 0;
+                    rt.look = Some(look);
+                }
+                ReviewKind::Resolve => {
+                    if let Some(look) = rt.look.as_mut() {
+                        look.conflicts.retain(|c| !resolved.contains(&c.key));
+                    }
+                }
+            }
+            // After a stopped run, or a confirmed run that left something, look again at once,
+            // so the row shows what's still waiting. Runs by themselves wait for the regular
+            // look: a file that fails every time mustn't start a run every few seconds.
+            if summary.cancelled || (crossing.approved && (left || summary.error.is_some())) {
+                rt.last_checked = None;
+            } else {
+                rt.last_checked = Some(Instant::now());
+            }
+        });
+        self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name.clone(), summary }));
+        self.publish(id);
+    }
+
+    /// A run that ended before carrying anything (a folder went away, it was stopped).
+    fn unfinished(&self, job: &Job, crossing: &Crossing, error: Error) {
+        let mut summary = RunSummary::starting(Utc::now(), crossing.approved);
+        match error {
+            Error::Cancelled => summary.cancelled = true,
+            e => summary.error = Some(e.to_string()),
+        }
+        let empty = Survey::empty(job);
+        self.finish(job, &empty, crossing, summary, None);
+    }
+
+    /// Holds back a run nobody looked at: nothing is touched, and the job waits for the
+    /// person's OK, saying why.
+    fn hold(&self, job: &Job, survey: &Survey) {
+        let id = &job.id;
+        let mut reason = survey.refusal.clone().unwrap_or_else(|| survey.holds[0].clone());
+        let more = survey.holds.len().saturating_sub(1);
+        if more > 0 {
+            reason.push_str(&format!(" ({} more {} in the list.)", more, if more == 1 { "reason" } else { "reasons" }));
+        }
+        self.inner.journal.warn(id, &format!("held back for your OK: {reason}"));
+        if let Err(e) = self.change_job(id, |job| {
+            job.needs_review = true;
+            job.held = Some(reason.clone());
+        }) {
+            log::error!("couldn't save that {} was held back: {e}", job.setup.name);
+        }
+        self.note_look(job, survey);
+        self.change_runtime(id, |rt| {
             rt.cancel = None;
             rt.progress = None;
             rt.finished_at = Some(Instant::now());
-            rt.last_checked = Some(Instant::now());
-            rt.problem = summary.error.clone();
-            if result.is_ok() {
-                rt.conflicts = conflicts;
-                rt.pending = None;
-            }
+            rt.must_ask = true;
         });
-
-        self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name.clone(), summary }));
-        self.publish(&id);
-    }
-
-    /// Scans, plans and carries the files over.
-    fn cross(&self, job: &Job, cancel: &AtomicBool) -> Result<(Outcome, Survey)> {
-        let filter = ExcludeFilter::new(&job.setup.excludes)?;
-        let survey = self.survey(job, &filter, Some(cancel))?;
-        Self::refuse_wiping(&survey)?;
-
-        let shores = Shores { source: job.setup.source.clone(), destination: job.setup.destination.clone() };
-        let id = job.id.clone();
-        let observer = |progress: &Progress| self.report_progress(&id, progress);
-        let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
-        let outcome = Executor::new(&shores, job.setup.safe_delete, &filter, cancel).run(&survey.plan, &mut meter);
-
-        if job.setup.mode.is_two_way() {
-            self.remember_agreement(job, &filter, &survey.baseline);
-        }
-        let trash_days = self.settings().trash_days;
-        Trash::sweep(&shores.source, trash_days);
-        Trash::sweep(&shores.destination, trash_days);
-        Ok((outcome, survey))
-    }
-
-    /// After a two-way run: what both sides agree on now becomes the baseline.
-    fn remember_agreement(&self, job: &Job, filter: &ExcludeFilter, old: &Snapshot) {
-        let scanner = Scanner::new(filter);
-        let (Ok(source), Ok(destination)) = (scanner.scan(&job.setup.source), scanner.scan(&job.setup.destination)) else {
-            return; // a folder went away: keep the old baseline, the next run decides again
-        };
-        let next = TwoWayPlanner::next_baseline(&source, &destination, old);
-        if let Err(e) = self.inner.baselines.save(&job.id, &next) {
-            self.inner.journal.error(&job.id, &format!("couldn't save the two-way state: {e}"));
-        }
-    }
-
-    /// Refuses a run that would delete every file on one side because the other side is
-    /// completely empty, which is almost always an unmounted drive or a wrong folder.
-    fn refuse_wiping(survey: &Survey) -> Result<()> {
-        let deletes_on = |side: Side| survey.plan.actions.iter().any(|a| matches!(a, Action::Delete { side: s, .. } if *s == side));
-        let wipes = |emptied: &Snapshot, other: &Snapshot, side: Side| {
-            other.file_count() == 0 && emptied.file_count() > 0 && deletes_on(side)
-        };
-        if wipes(&survey.destination, &survey.source, Side::Destination) {
-            return Err(Error::Invalid(
-                "The source folder is empty, so this sync would delete everything in the destination. \
-                 Charon stopped to be safe. If that's really what you want, empty the destination yourself."
-                    .into(),
-            ));
-        }
-        if wipes(&survey.source, &survey.destination, Side::Source) {
-            return Err(Error::Invalid(
-                "The destination folder is empty, so this sync would delete everything in the source. \
-                 Charon stopped to be safe."
-                    .into(),
-            ));
-        }
-        Ok(())
+        self.emit(EngineEvent::Held { id: id.clone(), name: job.setup.name.clone(), reason });
+        self.publish(id);
     }
 
     /// Keeps the latest progress and sends it to the window now and then.
@@ -222,188 +687,40 @@ impl Engine {
             self.emit(EngineEvent::Progress { id: id.clone(), progress: progress.clone() });
         }
     }
+}
 
-    fn summarise(result: &Result<(Outcome, Survey)>, started_at: chrono::DateTime<Utc>) -> RunSummary {
-        let finished_at = Utc::now();
-        match result {
-            Ok((outcome, survey)) => RunSummary {
-                started_at,
-                finished_at,
-                copied: outcome.copied,
-                deleted: outcome.deleted,
-                bytes: outcome.bytes,
-                conflicts: survey.plan.conflicts().len() as u64,
-                failed: outcome.failed.len() as u64,
-                cancelled: outcome.cancelled,
-                error: None,
-            },
-            Err(Error::Cancelled) => RunSummary { started_at, finished_at, cancelled: true, ..Self::empty_summary(started_at) },
-            Err(e) => RunSummary { error: Some(e.to_string()), ..Self::empty_summary(started_at) },
+/// What a finished run left for the job's record.
+struct Recorded {
+    /// The run's changes are on the drives.
+    recorded: bool,
+    drives: Option<Drives>,
+    /// Files removed or replaced on the source and on the destination.
+    destroyed: (Vec<String>, Vec<String>),
+    /// Steps failed or were skipped.
+    left: bool,
+}
+
+impl Survey {
+    /// A survey of nothing, for a run that ended before it could look.
+    fn empty(job: &Job) -> Survey {
+        Survey {
+            setup: job.setup.clone(),
+            source: Default::default(),
+            destination: Default::default(),
+            folded: false,
+            markers: Markers { source: Found::Missing, destination: Found::Missing },
+            memory: None,
+            trusted: false,
+            baseline: Baseline::new(),
+            landed: Baseline::new(),
+            plan: Default::default(),
+            agreed: 0,
+            refusal: None,
+            warnings: Vec::new(),
+            holds: Vec::new(),
+            needs_tick: false,
+            housekeeping: Default::default(),
+            made_at: Utc::now(),
         }
-    }
-
-    fn empty_summary(started_at: chrono::DateTime<Utc>) -> RunSummary {
-        RunSummary {
-            started_at,
-            finished_at: Utc::now(),
-            copied: 0,
-            deleted: 0,
-            bytes: 0,
-            conflicts: 0,
-            failed: 0,
-            cancelled: false,
-            error: None,
-        }
-    }
-
-    // ---------------------------------------------------------------- looking without touching
-
-    /// A dry run: what the next sync would do, without changing anything.
-    pub fn preview(&self, id: &JobId) -> Result<Preview> {
-        let job = self.stored_job(id)?;
-        let filter = ExcludeFilter::new(&job.setup.excludes)?;
-        let survey = self.survey(&job, &filter, None)?;
-        self.note_pending(id, &survey.plan);
-        let steps: Vec<Action> = survey.plan.ordered().into_iter().take(PREVIEW_STEPS).cloned().collect();
-        Ok(Preview { summary: survey.plan.summary(), steps, total_steps: survey.plan.actions.len() })
-    }
-
-    /// Looks for pending changes in the background (no-op while the job runs or checks).
-    pub fn check(&self, id: &JobId) {
-        let Ok(job) = self.stored_job(id) else { return };
-        let busy = self.change_runtime(id, |rt| {
-            let busy = rt.is_running() || rt.checking;
-            if !busy {
-                rt.checking = true;
-            }
-            busy
-        });
-        if busy {
-            return;
-        }
-        let engine = self.clone();
-        let spawned = thread::Builder::new().name("charon-check".into()).spawn(move || {
-            let result = ExcludeFilter::new(&job.setup.excludes).and_then(|filter| engine.survey(&job, &filter, None));
-            match result {
-                Ok(survey) => engine.note_pending(&job.id, &survey.plan),
-                Err(Error::Offline(_)) => {}
-                Err(e) => engine.change_runtime(&job.id, |rt| rt.problem = Some(e.to_string())),
-            }
-            engine.change_runtime(&job.id, |rt| {
-                rt.checking = false;
-                rt.last_checked = Some(Instant::now());
-            });
-            engine.publish(&job.id);
-        });
-        if spawned.is_err() {
-            self.change_runtime(id, |rt| rt.checking = false);
-        }
-    }
-
-    /// Whether the last check is older than `minutes` (or there was none).
-    pub fn check_due(&self, id: &JobId, minutes: u32) -> bool {
-        let interval = Duration::from_secs(minutes.max(1) as u64 * 60);
-        self.runtime()
-            .get(id)
-            .is_none_or(|rt| !rt.checking && !rt.is_running() && rt.last_checked.is_none_or(|t| t.elapsed() >= interval))
-    }
-
-    /// Whether the last check found changes waiting.
-    pub fn has_pending(&self, id: &JobId) -> bool {
-        self.runtime().get(id).and_then(|rt| rt.pending.as_ref()).is_some_and(|p| p.items > 0)
-    }
-
-    fn note_pending(&self, id: &JobId, plan: &Plan) {
-        let summary = plan.summary();
-        let conflicts = plan.conflicts();
-        self.change_runtime(id, |rt| {
-            rt.pending = Some(Pending { items: summary.changes(), bytes: summary.copy_bytes, checked_at: Utc::now() });
-            rt.conflicts = conflicts;
-            if rt.problem.as_deref().is_some_and(|p| p.contains("isn't reachable")) {
-                rt.problem = None;
-            }
-        });
-    }
-
-    /// Scans both folders and plans the run.
-    fn survey(&self, job: &Job, filter: &ExcludeFilter, cancel: Option<&AtomicBool>) -> Result<Survey> {
-        let mut scanner = Scanner::new(filter);
-        if let Some(cancel) = cancel {
-            scanner = scanner.cancellable(cancel);
-        }
-        let source = scanner.scan(&job.setup.source)?;
-        let destination = scanner.scan(&job.setup.destination)?;
-        let baseline = if job.setup.mode.is_two_way() { self.inner.baselines.load(&job.id) } else { Snapshot::new() };
-        let plan = plan::plan_for(&job.setup, &source, &destination, &baseline);
-        Ok(Survey { source, destination, baseline, plan })
-    }
-
-    // ---------------------------------------------------------------- conflicts
-
-    /// Settles one two-way conflict the way the person chose.
-    pub fn resolve_conflict(&self, id: &JobId, path: &str, choice: ConflictChoice) -> Result<()> {
-        if self.is_running(id) {
-            return Err(Error::Busy);
-        }
-        let job = self.stored_job(id)?;
-        let shores = Shores { source: job.setup.source.clone(), destination: job.setup.destination.clone() };
-        let filter = ExcludeFilter::new(&job.setup.excludes)?;
-        let s = Self::stat(&shores, Side::Source, path);
-        let d = Self::stat(&shores, Side::Destination, path);
-
-        let mut plan = Plan::default();
-        match choice {
-            ConflictChoice::KeepSource => TwoWayPlanner::carry(&mut plan, path, s.as_ref(), d.as_ref(), Side::Destination),
-            ConflictChoice::KeepDestination => TwoWayPlanner::carry(&mut plan, path, d.as_ref(), s.as_ref(), Side::Source),
-            ConflictChoice::KeepBoth => match (s, d) {
-                (Some(src), Some(dst)) if !src.is_dir() && !dst.is_dir() => plan.push(Action::KeepBoth {
-                    path: path.to_string(),
-                    source_bytes: src.size,
-                    destination_bytes: dst.size,
-                }),
-                _ => return Err(Error::Invalid("Only files can be kept twice. Choose one side.".into())),
-            },
-        }
-
-        let never = AtomicBool::new(false);
-        let quiet = |_: &Progress| {};
-        let mut meter = ProgressMeter::for_plan(&plan, &quiet);
-        let outcome = Executor::new(&shores, job.setup.safe_delete, &filter, &never).run(&plan, &mut meter);
-        if let Some((_, reason)) = outcome.failed.first() {
-            return Err(Error::Invalid(reason.clone()));
-        }
-
-        // Both sides agree on this path now: remember it.
-        let mut baseline = self.inner.baselines.load(id);
-        match Self::stat(&shores, Side::Source, path) {
-            Some(entry) => baseline.insert(path, entry),
-            None => baseline.remove(path),
-        }
-        self.inner.baselines.save(id, &baseline)?;
-
-        let word = match choice {
-            ConflictChoice::KeepSource => "kept the source's version of",
-            ConflictChoice::KeepDestination => "kept the destination's version of",
-            ConflictChoice::KeepBoth => "kept both versions of",
-        };
-        self.inner.journal.info(id, &format!("{word} {path}"));
-        self.change_runtime(id, |rt| rt.conflicts.retain(|c| c.path != path));
-        self.publish(id);
-        Ok(())
-    }
-
-    /// One item as it is on disk right now.
-    fn stat(shores: &Shores, side: Side, path: &str) -> Option<Entry> {
-        let meta = std::fs::symlink_metadata(shores.path(side, path)).ok()?;
-        if meta.is_dir() {
-            return Some(Entry::dir());
-        }
-        let modified = meta
-            .modified()
-            .ok()?
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()?
-            .as_millis() as i64;
-        Some(Entry::file(meta.len(), modified))
     }
 }

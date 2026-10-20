@@ -1,12 +1,13 @@
 // The title bar's status line, the "Pause all" button and the overview tiles.
 
 import { Dom } from "../dom.js";
-import { GROUPS } from "../store.js";
+import { GROUPS, needsYou } from "../store.js";
 import { Counter } from "../effects/counter.js";
 
 const TONES = {
   syncing: "var(--syncing)",
   attention: "var(--error)",
+  review: "var(--review)",
   paused: "var(--paused)",
   pending: "var(--pending)",
   calm: "var(--in-sync)",
@@ -37,10 +38,11 @@ export class Header {
   render() {
     const overview = this.store.overview;
     if (!overview) return;
-    this.headline.querySelector(".text").textContent = this.describe(overview);
-    this.headline.style.setProperty("--tone", TONES[this.mood(overview)]);
+    const o = this.facts(overview);
+    this.headline.querySelector(".text").textContent = this.describe(o);
+    this.headline.style.setProperty("--tone", TONES[this.mood(o)]);
 
-    const paused = overview.pausedAll;
+    const paused = o.pausedAll;
     this.pauseButton.classList.toggle("on", paused);
     this.pauseButton.querySelector(".label").textContent = paused ? "Resume all" : "Pause all";
     this.pauseButton.querySelector(".ico").dataset.icon = paused ? "resume" : "pause";
@@ -52,21 +54,40 @@ export class Header {
     }
   }
 
+  /**
+   * The overview, checked against the rows: the title bar never looks calmer than the
+   * jobs it sums up, even when an overview event is a moment behind.
+   */
+  facts(overview) {
+    const jobs = this.store.all();
+    const waiting = jobs.filter(job => job.waiting).length;
+    const attention = jobs.filter(needsYou).length;
+    return {
+      ...overview,
+      waiting: Math.max(overview.waiting ?? 0, waiting),
+      attention: Math.max(overview.attention ?? 0, attention),
+      pausedAll: this.store.pausedAll(),
+    };
+  }
+
   mood(o) {
     if (o.jobs === 0) return "empty";
     if (o.syncing) return "syncing";
     if (o.attention) return "attention";
+    if (o.waiting) return "review";
     if (o.pausedAll) return "paused";
     if (o.pending) return "pending";
     return "calm";
   }
 
   describe(o) {
+    const waits = o.waiting === 1 ? "1 job waits for your OK" : `${o.waiting} jobs wait for your OK`;
     if (o.jobs === 0) return "No crossings yet. Create your first sync job.";
     if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing`;
     if (o.attention) return `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
-    if (o.pausedAll) return "Everything is paused";
-    if (o.pending) return `${o.pending} ${o.pending === 1 ? "job has" : "jobs have"} changes waiting`;
+    if (o.pausedAll) return o.waiting ? `Everything is paused · ${waits}` : "Everything is paused";
+    if (o.waiting) return waits;
+    if (o.pending) return `${o.pending} ${o.pending === 1 ? "job has" : "jobs have"} changes queued`;
     return o.offline ? `All reachable jobs in sync · ${o.offline} offline` : "All in sync. The river is calm.";
   }
 }

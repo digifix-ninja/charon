@@ -1,33 +1,48 @@
-//! The engine: owns the jobs, runs them and tells the window what changed.
+//! The engine: owns the jobs, looks at their folders, syncs them and tells the window what
+//! changed.
 //!
 //! * `mod.rs`     – `Engine`: opening, settings, reading rows, events
 //! * `jobs.rs`    – adding, editing, pausing and removing jobs
-//! * `runs.rs`    – syncing, previews (dry runs), checks for pending changes, conflicts
+//! * `survey.rs`  – looking at both folders and planning, with every safety check
+//! * `review.rs`  – the list of changes waiting for the person's OK, and confirming it
+//! * `runs.rs`    – syncing: confirmed runs, full automation, held-back runs
+//! * `checks.rs`  – background looks for changes, and reminders when changes wait
 //! * `status.rs`  – turning a job and its live state into the row the window shows
-//! * `runtime.rs` – the live state of each job (running, progress, pending, problems)
+//! * `runtime.rs` – the live state of each job (running, progress, last look, review)
 //!
-//! `Engine` is cheap to clone; all clones share the same jobs.
+//! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
+//! the same order, the stored state before the live state. Nothing that looks at a job's
+//! folders or tells the window happens while either is held (saving the state file in the
+//! app's own data folder does, so a change counts only once it's saved).
 
+mod checks;
 mod jobs;
+mod review;
 mod runs;
 mod runtime;
 mod status;
+mod survey;
 
-pub use runs::Preview;
+pub use review::{NotePage, StepPage};
+pub use runs::SyncStart;
 
-use crate::error::Result;
-use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings};
-use crate::store::{Baselines, DataFolder, Journal, LogLine, StateFile, StoredState};
-use runtime::JobRuntime;
+use crate::error::{Error, Result};
+use crate::model::{Finished, Job, JobId, JobView, Overview, Progress, Settings, UpgradeNotice, WaitingJob};
+use crate::plan::Side;
+use crate::store::{Baselines, DataFolder, DataLock, Journal, Landings, LogLine, StateFile, StoredState};
+use runtime::{JobRuntime, Look};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread;
+use std::time::{Duration, Instant};
 
 /// Something the window (or the tray, or notifications) may want to know.
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
     /// A job's row changed.
-    Job(JobView),
+    Job(Box<JobView>),
     /// A job was removed.
     JobRemoved(JobId),
     /// Live progress of a running sync (frequent, small).
@@ -36,6 +51,20 @@ pub enum EngineEvent {
     Finished(Finished),
     /// The overall picture changed (for the tray icon and the header).
     Overview(Overview),
+    /// The settings changed.
+    Settings(Settings),
+    /// Items counted so far while looking at one side of a job.
+    ScanProgress { id: JobId, side: Side, items: u64 },
+    /// Pairs of files read so far to tell whether they are identical (after the scans, when
+    /// some files differ only by date).
+    CompareProgress { id: JobId, files: u64, total_files: u64, bytes: u64, total_bytes: u64 },
+    /// Something changed in the job's folders after its list was made: it can't be
+    /// confirmed anymore.
+    ReviewStale { id: JobId, review_id: String },
+    /// Jobs whose changes wait for the person's OK and are due a mention (one notification).
+    Waiting(Vec<WaitingJob>),
+    /// A run nobody looked at was held back for the person's OK.
+    Held { id: JobId, name: String, reason: String },
 }
 
 /// Receives every engine event. The app shell forwards them to the window.
@@ -44,10 +73,20 @@ pub type Emitter = Arc<dyn Fn(EngineEvent) + Send + Sync>;
 struct Inner {
     state_file: StateFile,
     baselines: Baselines,
+    /// Mirror and Backup: copies whose dates didn't stick on the destination.
+    landings: Landings,
     journal: Journal,
     state: Mutex<StoredState>,
     runtime: Mutex<HashMap<JobId, JobRuntime>>,
     emit: Emitter,
+    /// Every view gets the next number (see `JobView::rev`).
+    rev: AtomicU64,
+    /// Charon is quitting: nothing new starts.
+    quitting: AtomicBool,
+    /// When this engine opened (reminders wait for the first looks after a start).
+    opened: Instant,
+    /// Only one Charon works with the data folder at a time.
+    _lock: DataLock,
 }
 
 #[derive(Clone)]
@@ -56,21 +95,48 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Opens (or creates) Charon's data in `data_folder`.
+    /// Opens (or creates) Charon's data in `data_folder`. Fails with
+    /// `Error::AlreadyRunning` while another Charon works with the same folder.
     pub fn open(data_folder: impl Into<PathBuf>, emit: Emitter) -> Result<Self> {
         let folder = DataFolder::new(data_folder);
-        let state_file = StateFile::new(folder.state_file());
+        let lock = DataLock::acquire(folder.root())?;
+        let state_file = StateFile::new(folder.state_file(), folder.legacy_state_file());
         let state = state_file.load()?;
-        Ok(Self {
+        let engine = Self {
             inner: Arc::new(Inner {
                 state_file,
                 baselines: Baselines::new(folder.baselines()),
+                landings: Landings::new(folder.landings()),
                 journal: Journal::new(folder.logs()),
                 state: Mutex::new(state),
                 runtime: Mutex::new(HashMap::new()),
                 emit,
+                rev: AtomicU64::new(0),
+                quitting: AtomicBool::new(false),
+                opened: Instant::now(),
+                _lock: lock,
             }),
-        })
+        };
+        engine.journal_upgrade();
+        Ok(engine)
+    }
+
+    /// Writes the move to confirm-first syncing into the log of each job it changed (once).
+    fn journal_upgrade(&self) {
+        let Some(notice) = self.state().upgrade_notice.clone().filter(|notice| !notice.journaled) else { return };
+        for job in &notice.jobs {
+            self.inner.journal.info(
+                &job.id,
+                &format!("Charon {}: this job no longer syncs by itself; it looks for changes and waits for your OK", notice.version),
+            );
+        }
+        if let Err(e) = self.change_state(|state| {
+            if let Some(notice) = state.upgrade_notice.as_mut() {
+                notice.journaled = true;
+            }
+        }) {
+            log::warn!("couldn't save that the update was logged: {e}");
+        }
     }
 
     // ---------------------------------------------------------------- reading
@@ -81,17 +147,24 @@ impl Engine {
 
     /// Every job as a row, in the order they were added.
     pub fn jobs(&self) -> Vec<JobView> {
-        let (jobs, settings) = {
+        let (snapshots, settings) = {
             let state = self.state();
-            (state.jobs.clone(), state.settings.clone())
+            let runtime = self.runtime();
+            let snapshots: Vec<_> = state.jobs.iter().map(|job| self.snapshot(job, runtime.get(&job.id))).collect();
+            (snapshots, state.settings.clone())
         };
-        jobs.into_iter().map(|job| self.view_of(job, &settings)).collect()
+        snapshots.into_iter().map(|snapshot| self.view_of(snapshot, &settings)).collect()
     }
 
     /// One job as a row.
     pub fn job(&self, id: &JobId) -> Result<JobView> {
-        let job = self.stored_job(id)?;
-        Ok(self.view_of(job, &self.settings()))
+        let (snapshot, settings) = {
+            let state = self.state();
+            let runtime = self.runtime();
+            let job = state.jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
+            (self.snapshot(job, runtime.get(id)), state.settings.clone())
+        };
+        Ok(self.view_of(snapshot, &settings))
     }
 
     /// The stored jobs, without live state (for the autopilot).
@@ -108,30 +181,82 @@ impl Engine {
         self.inner.journal.read(id, limit)
     }
 
+    /// The notice shown once after the move to 0.3, while it hasn't been dismissed.
+    pub fn upgrade_notice(&self) -> Option<UpgradeNotice> {
+        let state = self.state();
+        let mut notice = state.upgrade_notice.clone()?;
+        // Only jobs that still exist.
+        notice.jobs.retain(|upgraded| state.jobs.iter().any(|job| job.id == upgraded.id));
+        (!notice.jobs.is_empty()).then_some(notice)
+    }
+
+    pub fn dismiss_upgrade_notice(&self) -> Result<()> {
+        self.change_state(|state| state.upgrade_notice = None)
+    }
+
     // ---------------------------------------------------------------- settings
 
-    /// Saves new settings. Every row is resent, since "pause everything" changes them all.
-    pub fn set_settings(&self, settings: Settings) -> Result<()> {
-        self.change_state(|state| state.settings = settings)?;
+    /// Saves new settings. "Pause everything" only changes through `set_all_paused`, so a
+    /// window with an old copy of the settings can never resume everything by accident.
+    pub fn set_settings(&self, mut settings: Settings) -> Result<()> {
+        self.change_state(|state| {
+            settings.paused_all = state.settings.paused_all;
+            state.settings = settings;
+        })?;
+        self.emit(EngineEvent::Settings(self.settings()));
         self.publish_all();
         Ok(())
     }
 
     /// Pauses or resumes every job at once.
     pub fn set_all_paused(&self, paused: bool) -> Result<()> {
-        let mut settings = self.settings();
-        settings.paused_all = paused;
-        self.set_settings(settings)
+        self.change_state(|state| state.settings.paused_all = paused)?;
+        self.emit(EngineEvent::Settings(self.settings()));
+        self.publish_all();
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- quitting
+
+    /// Before Charon quits: nothing new starts from now on, every look stops, and every
+    /// running sync stops between two steps, recording what it carried as usual. Waits at
+    /// most `wait` for the syncs; returns whether they all stopped in time.
+    pub fn shut_down(&self, wait: Duration) -> bool {
+        self.inner.quitting.store(true, Ordering::SeqCst);
+        for rt in self.runtime().values_mut() {
+            rt.stop_looking();
+            if let Some(cancel) = &rt.cancel {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        let deadline = Instant::now() + wait;
+        while self.runtime().values().any(|rt| rt.is_running()) {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        true
+    }
+
+    /// Whether Charon is quitting.
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.quitting.load(Ordering::SeqCst)
+    }
+
+    /// The jobs syncing right now.
+    pub fn running(&self) -> Vec<JobId> {
+        self.runtime().iter().filter(|(_, rt)| rt.is_running()).map(|(id, _)| id.clone()).collect()
     }
 
     // ---------------------------------------------------------------- internals
 
     fn state(&self) -> MutexGuard<'_, StoredState> {
-        self.inner.state.lock().expect("state lock")
+        self.inner.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn runtime(&self) -> MutexGuard<'_, HashMap<JobId, JobRuntime>> {
-        self.inner.runtime.lock().expect("runtime lock")
+        self.inner.runtime.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn stored_job(&self, id: &JobId) -> Result<Job> {
@@ -140,21 +265,40 @@ impl Engine {
             .iter()
             .find(|job| &job.id == id)
             .cloned()
-            .ok_or_else(|| crate::Error::UnknownJob(id.clone()))
+            .ok_or_else(|| Error::UnknownJob(id.clone()))
     }
 
-    /// Changes the stored state and saves it.
+    /// Changes the stored state: the changed copy is saved first, and only then becomes the
+    /// state Charon works with. A failed save changes nothing.
     fn change_state<R>(&self, change: impl FnOnce(&mut StoredState) -> R) -> Result<R> {
         let mut state = self.state();
-        let result = change(&mut state);
-        self.inner.state_file.save(&state)?;
+        let mut next = state.clone();
+        let result = change(&mut next);
+        self.inner.state_file.save(&next)?;
+        *state = next;
         Ok(result)
     }
 
     /// Changes one stored job and saves.
     fn change_job(&self, id: &JobId, change: impl FnOnce(&mut Job)) -> Result<()> {
         self.change_state(|state| state.jobs.iter_mut().find(|job| &job.id == id).map(change))?
-            .ok_or_else(|| crate::Error::UnknownJob(id.clone()))
+            .ok_or_else(|| Error::UnknownJob(id.clone()))
+    }
+
+    /// Changes the stored state and the job's live state together, but only while the job
+    /// isn't syncing (refused with `busy`). The stored change is saved before it counts.
+    fn with_job_at_rest(&self, id: &JobId, busy: &str, change: impl FnOnce(&mut StoredState, &mut JobRuntime) -> Result<()>) -> Result<()> {
+        let mut state = self.state();
+        let mut runtime = self.runtime();
+        let rt = runtime.entry(id.clone()).or_default();
+        if rt.is_running() {
+            return Err(Error::Invalid(busy.to_string()));
+        }
+        let mut next = state.clone();
+        change(&mut next, rt)?;
+        self.inner.state_file.save(&next)?;
+        *state = next;
+        Ok(())
     }
 
     /// Changes one job's live state.
@@ -169,7 +313,7 @@ impl Engine {
     /// Sends a job's fresh row, and the overview.
     pub fn publish(&self, id: &JobId) {
         if let Ok(view) = self.job(id) {
-            self.emit(EngineEvent::Job(view));
+            self.emit(EngineEvent::Job(Box::new(view)));
         }
         self.emit(EngineEvent::Overview(self.overview()));
     }
@@ -178,7 +322,7 @@ impl Engine {
         let views = self.jobs();
         let overview = Overview::of(&views, self.settings().paused_all);
         for view in views {
-            self.emit(EngineEvent::Job(view));
+            self.emit(EngineEvent::Job(Box::new(view)));
         }
         self.emit(EngineEvent::Overview(overview));
     }

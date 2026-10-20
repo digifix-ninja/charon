@@ -1,12 +1,22 @@
 // The window's data: jobs, settings and what the person is looking at.
 
-/** The overview tiles and which statuses each one counts. */
+const isAny = (...statuses) => job => statuses.includes(job.status);
+
+/**
+ * Errors and conflicts. Rust shows "paused" before "conflict" and "error", so a paused job
+ * still counts when it has conflicts or its last run failed.
+ */
+export const needsYou = job => job.status === "error" || job.status === "conflict" || job.conflicts?.length > 0
+  || (job.status !== "offline" && job.status !== "syncing" && Boolean(job.problem || job.lastRun?.error));
+
+/** The overview tiles and which jobs each one counts. */
 export const GROUPS = [
-  { key: "all", label: "Jobs", tone: "var(--text-dim)", statuses: null },
-  { key: "in-sync", label: "In sync", tone: "var(--in-sync)", statuses: ["in-sync"] },
-  { key: "syncing", label: "Crossing", tone: "var(--syncing)", statuses: ["syncing"] },
-  { key: "waiting", label: "Waiting", tone: "var(--pending)", statuses: ["pending", "new", "paused", "offline"] },
-  { key: "attention", label: "Need you", tone: "var(--error)", statuses: ["error", "conflict"] },
+  { key: "all", label: "Jobs", tone: "var(--text-dim)", match: () => true },
+  { key: "in-sync", label: "In sync", tone: "var(--in-sync)", match: isAny("in-sync") },
+  { key: "syncing", label: "Crossing", tone: "var(--syncing)", match: isAny("syncing") },
+  { key: "your-ok", label: "Your OK", tone: "var(--review)", match: job => Boolean(job.waiting) },
+  { key: "queued", label: "Queued", tone: "var(--pending)", match: isAny("pending", "new", "paused", "offline") },
+  { key: "attention", label: "Need you", tone: "var(--error)", match: needsYou },
 ];
 
 export class JobStore {
@@ -21,6 +31,7 @@ export class JobStore {
     this.open = new Set();      // ids of expanded rows
     this.tabs = new Map();      // id → open tab in the expanded row
     this.logs = new Map();      // id → log lines
+    this.scans = new Map();     // id → {source, destination}: items counted while looking
     this.listeners = [];
   }
 
@@ -34,9 +45,11 @@ export class JobStore {
     this.changed();
   }
 
-  /** A new or changed row. */
+  /** A new or changed row. A view older than the one we have (lower `rev`) is ignored. */
   put(view) {
-    if (!this.jobs.has(view.id)) this.order.push(view.id);
+    const known = this.jobs.get(view.id);
+    if (known && (view.rev ?? 0) < (known.rev ?? 0)) return;
+    if (!known) this.order.push(view.id);
     this.jobs.set(view.id, view);
     this.changed({ id: view.id });
   }
@@ -46,21 +59,50 @@ export class JobStore {
     this.jobs.delete(id);
     this.order = this.order.filter(other => other !== id);
     this.open.delete(id);
+    this.tabs.delete(id);
+    this.logs.delete(id);
+    this.scans.delete(id);
     this.changed();
   }
 
-  /** Live progress of a running sync (doesn't redraw the whole list). */
+  /**
+   * Live progress of a running sync (doesn't redraw the whole list). Only a `job` event
+   * marks a row as syncing, so progress for a row that isn't syncing is ignored.
+   */
   setProgress(id, progress) {
     const job = this.jobs.get(id);
-    if (!job) return;
+    if (!job || job.status !== "syncing") return;
     job.progress = progress;
-    job.status = "syncing";
     this.changed({ id, progressOnly: true });
+  }
+
+  /** Items counted so far on one side while a job's folders are looked at. */
+  setScan(id, side, items) {
+    const scan = this.scans.get(id) ?? { source: 0, destination: 0 };
+    scan[side] = items;
+    this.scans.set(id, scan);
+    this.changed({ id, scanOnly: true });
+  }
+
+  /** Forgets the counts, before a new look starts. */
+  clearScan(id) {
+    this.scans.delete(id);
   }
 
   setOverview(overview) {
     this.overview = overview;
     this.changed({ overviewOnly: true });
+  }
+
+  /** The settings as Rust has them now; they replace ours, `pausedAll` included. */
+  setSettings(settings) {
+    this.settings = settings;
+    this.changed({ settings: true });
+  }
+
+  /** Whether "Pause everything" is on. */
+  pausedAll() {
+    return Boolean(this.settings?.pausedAll ?? this.overview?.pausedAll);
   }
 
   setLog(id, lines) {
@@ -79,7 +121,10 @@ export class JobStore {
   /** The open tab of an expanded row. */
   tabOf(id) {
     const job = this.jobs.get(id);
-    return this.tabs.get(id) ?? (job?.conflicts?.length ? "conflicts" : "activity");
+    const tab = this.tabs.get(id);
+    if (tab === "conflicts" && !job?.conflicts?.length) return "activity";
+    if (tab === "unreadable" && !job?.unreadable?.length) return "activity";
+    return tab ?? (job?.conflicts?.length ? "conflicts" : "activity");
   }
 
   setTab(id, tab) {
@@ -92,12 +137,17 @@ export class JobStore {
     return this.order.map(id => this.jobs.get(id)).filter(Boolean);
   }
 
+  /** The jobs whose changes wait for the person's OK. */
+  waiting() {
+    return this.all().filter(job => job.waiting);
+  }
+
   /** The jobs the current tile and search let through. */
   visible() {
-    const group = GROUPS.find(g => g.key === this.group);
+    const group = GROUPS.find(g => g.key === this.group) ?? GROUPS[0];
     const query = this.query.toLowerCase();
     return this.all().filter(job => {
-      if (group?.statuses && !group.statuses.includes(job.status)) return false;
+      if (!group.match(job)) return false;
       if (!query) return true;
       return [job.name, job.source, job.destination].some(text => String(text).toLowerCase().includes(query));
     });
@@ -106,7 +156,7 @@ export class JobStore {
   /** How many jobs each tile counts. */
   counts() {
     const jobs = this.all();
-    return Object.fromEntries(GROUPS.map(g => [g.key, g.statuses ? jobs.filter(j => g.statuses.includes(j.status)).length : jobs.length]));
+    return Object.fromEntries(GROUPS.map(g => [g.key, jobs.filter(g.match).length]));
   }
 
   subscribe(listener) {

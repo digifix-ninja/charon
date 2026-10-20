@@ -11,7 +11,10 @@ pub struct Schedule;
 impl Schedule {
     /// The next automatic run of an interval or daily job.
     pub fn next_run(job: &Job) -> Option<DateTime<Utc>> {
-        let reference = job.schedule_reference();
+        Self::next_from(job, job.schedule_reference())
+    }
+
+    fn next_from(job: &Job, reference: DateTime<Utc>) -> Option<DateTime<Utc>> {
         match job.setup.trigger {
             Trigger::Interval { minutes } => Some(reference + Duration::minutes(minutes as i64)),
             Trigger::Daily { hour, minute } => Self::next_daily(reference, hour, minute),
@@ -22,6 +25,16 @@ impl Schedule {
     /// Whether the job's schedule says it should run now.
     pub fn is_due(job: &Job, now: DateTime<Utc>) -> bool {
         Self::next_run(job).is_some_and(|next| now >= next)
+    }
+
+    /// `is_due`, also counting from `since` (when the schedule last came due, if that's
+    /// later than the job's record says).
+    pub fn is_due_after(job: &Job, since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+        let reference = match since {
+            Some(since) if since > job.schedule_reference() => since,
+            _ => job.schedule_reference(),
+        };
+        Self::next_from(job, reference).is_some_and(|next| now >= next)
     }
 
     /// The first local `hour:minute` after `after`.
@@ -57,6 +70,7 @@ mod tests {
             trigger,
             excludes: vec![],
             safe_delete: true,
+            full_automation: false,
         })
     }
 

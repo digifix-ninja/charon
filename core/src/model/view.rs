@@ -1,6 +1,8 @@
 //! What the window receives: one row per job, live progress and run summaries.
 
 use crate::model::{Job, JobId};
+use crate::plan::{NoteKind, Side};
+use crate::scan::{Entry, EntryKind, Volume};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -12,8 +14,11 @@ pub enum JobStatus {
     New,
     /// Green check: both folders match.
     InSync,
-    /// Amber: changes are waiting to cross.
+    /// Amber: changes are waiting to cross, and the job will carry them by itself
+    /// (full automation).
     Pending,
+    /// Changes wait for the person's OK, or a run nobody looked at was held back for one.
+    Review,
     /// Blue, spinning: a sync is running.
     Syncing,
     /// Grey: won't run by itself.
@@ -71,15 +76,36 @@ pub struct Pending {
     pub checked_at: DateTime<Utc>,
 }
 
-/// A file that changed on both sides and waits for a decision.
+/// An item that changed on both sides and waits for a decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConflictItem {
+    /// The item's key in the plan (see `scan::Keys`).
+    pub key: String,
+    /// The path as spelled on disk, for the person.
     pub path: String,
+    /// What each side has: a file, a folder or a link (`None`: deleted there).
+    pub source_kind: Option<EntryKind>,
+    pub destination_kind: Option<EntryKind>,
     pub source_modified: Option<i64>,
     pub destination_modified: Option<i64>,
     pub source_size: Option<u64>,
     pub destination_size: Option<u64>,
+}
+
+impl ConflictItem {
+    pub fn new(key: &str, path: &str, source: Option<Entry>, destination: Option<Entry>) -> Self {
+        Self {
+            key: key.to_string(),
+            path: path.to_string(),
+            source_kind: source.map(|e| e.kind),
+            destination_kind: destination.map(|e| e.kind),
+            source_modified: source.map(|e| e.modified),
+            destination_modified: destination.map(|e| e.modified),
+            source_size: source.map(|e| e.size),
+            destination_size: destination.map(|e| e.size),
+        }
+    }
 }
 
 /// How the person settles a conflict.
@@ -102,13 +128,50 @@ pub struct RunSummary {
     pub bytes: u64,
     pub conflicts: u64,
     pub failed: u64,
+    /// Steps left out because the item changed after the scan (or the review). The next
+    /// look picks them up again.
+    #[serde(default)]
+    pub skipped: u64,
+    /// Folders kept because something is still in them.
+    #[serde(default)]
+    pub kept: u64,
+    /// Places that couldn't be read, so nothing in them was synced.
+    #[serde(default)]
+    pub unreadable: u64,
+    /// Conflicts settled by Newest wins: the older version went to .charon-trash.
+    #[serde(default)]
+    pub settled: u64,
     pub cancelled: bool,
     /// Why the whole run failed, if it did.
     pub error: Option<String>,
+    /// The person confirmed this run's list (rather than a run by itself).
+    #[serde(default)]
+    pub approved: bool,
 }
 
 impl RunSummary {
-    /// Whether the run finished without any problem.
+    /// An empty summary of a run that started at `started_at`.
+    pub fn starting(started_at: DateTime<Utc>, approved: bool) -> Self {
+        Self {
+            started_at,
+            finished_at: started_at,
+            copied: 0,
+            deleted: 0,
+            bytes: 0,
+            conflicts: 0,
+            failed: 0,
+            skipped: 0,
+            kept: 0,
+            unreadable: 0,
+            settled: 0,
+            cancelled: false,
+            error: None,
+            approved,
+        }
+    }
+
+    /// Whether the run finished without a problem. Places that couldn't be read are not a
+    /// problem of the run (nothing there was touched); the row shows them on their own.
     pub fn is_clean(&self) -> bool {
         self.error.is_none() && self.failed == 0 && !self.cancelled
     }
@@ -132,11 +195,23 @@ impl RunSummary {
         if self.deleted > 0 {
             parts.push(format!("removed {}", plural(self.deleted, "item")));
         }
+        if self.settled > 0 {
+            parts.push(format!("{} settled by Newest wins", plural(self.settled, "conflict")));
+        }
         if self.conflicts > 0 {
             parts.push(format!("{} to resolve", plural(self.conflicts, "conflict")));
         }
         if self.failed > 0 {
             parts.push(format!("{} failed", plural(self.failed, "file")));
+        }
+        if self.skipped > 0 {
+            parts.push(format!("{} skipped (changed meanwhile)", plural(self.skipped, "item")));
+        }
+        if self.kept > 0 {
+            parts.push(format!("kept {} that still hold files", plural(self.kept, "folder")));
+        }
+        if self.unreadable > 0 {
+            parts.push(format!("{} couldn't be read", plural(self.unreadable, "place")));
         }
         if parts.is_empty() {
             "already in sync".into()
@@ -146,22 +221,118 @@ impl RunSummary {
     }
 }
 
+/// A number for each of the two folders.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerSide {
+    pub source: u64,
+    pub destination: u64,
+}
+
+impl PerSide {
+    pub fn on(&self, side: Side) -> u64 {
+        match side {
+            Side::Source => self.source,
+            Side::Destination => self.destination,
+        }
+    }
+
+    pub fn add(&mut self, side: Side, n: u64) {
+        match side {
+            Side::Source => self.source += n,
+            Side::Destination => self.destination += n,
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.source + self.destination
+    }
+}
+
+/// Changes that wait for the person's OK. Shown on the row whatever its status is (a paused
+/// job, or one with conflicts or errors, can have changes waiting too).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Waiting {
+    pub items: u64,
+    pub bytes: u64,
+    /// Files and links that would be removed on each side.
+    pub removals: PerSide,
+    /// Files and links that would be replaced on each side.
+    pub replacements: PerSide,
+    pub conflicts: u64,
+    /// Why a run nobody looked at was held back for a look, if one was.
+    pub held: Option<String>,
+    /// Since when changes have been waiting.
+    pub since: DateTime<Utc>,
+}
+
+/// A place the last look couldn't read or had to leave out: nothing there is synced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Place {
+    /// Unreadable, left out (the other drive can't hold it, a special file), a name clash,
+    /// or blocked (a file meeting a folder).
+    pub kind: NoteKind,
+    pub side: Side,
+    /// As spelled on disk, relative to the job's folder.
+    pub path: String,
+    pub reason: String,
+    /// macOS refused to let Charon read it (Privacy & Security settings).
+    pub privacy: bool,
+}
+
+/// The most places a row lists (unreadable, and not synced); the rest are counted.
+pub const PLACES_SHOWN: usize = 100;
+
+/// A drive, the way the person knows it: "Backup SSD", "exFAT".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeLabel {
+    pub name: String,
+    pub kind: String,
+}
+
+impl VolumeLabel {
+    pub fn of(volume: &Volume) -> Self {
+        Self { name: volume.name.clone(), kind: volume.kind_label() }
+    }
+}
+
 /// The row the window shows for one job.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobView {
     #[serde(flatten)]
     pub job: Job,
+    /// Grows with every view the engine makes; the window ignores a view older than the one
+    /// it has.
+    pub rev: u64,
     pub status: JobStatus,
+    /// Full automation is on and nothing waits for a look first.
+    pub runs_by_itself: bool,
+    pub waiting: Option<Waiting>,
+    /// Changes the job will carry by itself (full automation).
     pub pending: Option<Pending>,
     pub progress: Option<Progress>,
     pub conflicts: Vec<ConflictItem>,
+    /// Places the last look couldn't read (at most `PLACES_SHOWN`).
+    pub unreadable: Vec<Place>,
+    /// Items the last look had to leave out, name clashes and blocked items: they aren't
+    /// synced (at most `PLACES_SHOWN`; `not_synced_count` counts them all).
+    pub not_synced: Vec<Place>,
+    pub not_synced_count: u64,
     /// What's wrong, in words, when the status is Error or Offline.
     pub problem: Option<String>,
     pub source_online: bool,
     pub destination_online: bool,
-    /// When the job will run by itself next, if it has a schedule.
+    pub source_volume: Option<VolumeLabel>,
+    pub destination_volume: Option<VolumeLabel>,
+    /// When the schedule next comes due: a sync if the job runs by itself, else a look.
     pub next_run: Option<DateTime<Utc>>,
+    /// "Not synced for 3 days", "Changes have waited for your OK since Monday".
+    pub stale: Option<String>,
+    /// A sync is due but waits for this other job, which is syncing the same folders.
+    pub waiting_for: Option<String>,
 }
 
 /// One line per state for the tray icon and the header.
@@ -171,8 +342,12 @@ pub struct Overview {
     pub jobs: usize,
     pub syncing: usize,
     pub pending: usize,
+    /// Jobs with changes waiting for the person's OK.
+    pub waiting: usize,
     pub attention: usize,
     pub offline: usize,
+    /// Jobs that sync, but leave places out (unreadable, left out, name clashes).
+    pub incomplete: usize,
     pub paused_all: bool,
 }
 
@@ -184,8 +359,10 @@ impl Overview {
             jobs: views.len(),
             syncing: count(&[JobStatus::Syncing]),
             pending: count(&[JobStatus::Pending]),
+            waiting: views.iter().filter(|v| v.waiting.is_some()).count(),
             attention: count(&[JobStatus::Error, JobStatus::Conflict]),
             offline: count(&[JobStatus::Offline]),
+            incomplete: views.iter().filter(|v| !v.unreadable.is_empty() || v.not_synced_count > 0).count(),
             paused_all,
         }
     }
@@ -198,23 +375,40 @@ impl Overview {
             format!("Syncing {}", plural(self.syncing as u64, "job"))
         } else if self.attention > 0 {
             format!("{} need{} attention", plural(self.attention as u64, "job"), if self.attention == 1 { "s" } else { "" })
+        } else if self.waiting > 0 {
+            format!("{} wait{} for your OK", plural(self.waiting as u64, "job"), if self.waiting == 1 { "s" } else { "" })
         } else if self.paused_all {
             "Everything paused".into()
         } else if self.pending > 0 {
             format!("{} with changes waiting", plural(self.pending as u64, "job"))
+        } else if self.incomplete > 0 {
+            format!("{} {} sync everything", plural(self.incomplete as u64, "job"), if self.incomplete == 1 { "doesn't" } else { "don't" })
         } else {
             "All in sync".into()
         }
     }
 }
 
-/// "1 file", "3 files".
+/// "1 file", "3 files", "1,240 files".
 pub fn plural(n: u64, word: &str) -> String {
     if n == 1 {
         format!("1 {word}")
     } else {
-        format!("{n} {word}s")
+        format!("{} {word}s", human_count(n))
     }
+}
+
+/// "1,240".
+pub fn human_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// "8.2 MB".

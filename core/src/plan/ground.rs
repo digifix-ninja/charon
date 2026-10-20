@@ -1,0 +1,205 @@
+//! What both planners need besides the items themselves: the places they must not touch,
+//! and a last look at folder removals once every step is known.
+
+use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
+use crate::scan::{Entry, EntryKind, Keys, Snapshot};
+use std::collections::{BTreeSet, HashSet};
+use unicode_normalization::UnicodeNormalization;
+
+pub(crate) struct Ground<'a> {
+    source: &'a Snapshot,
+    destination: &'a Snapshot,
+    /// Places nothing may touch on either side: unreadable on one side, names written two
+    /// ways, items the receiving drive can't hold. Everything inside them is off-limits too.
+    frozen: BTreeSet<String>,
+    /// Places a planning decision put off-limits (a file meeting a folder), with everything inside.
+    blocked: BTreeSet<String>,
+}
+
+impl<'a> Ground<'a> {
+    /// The ground for a plan that may copy onto the sides in `receiving`, with a note in
+    /// `plan` for every place left alone.
+    pub fn new(source: &'a Snapshot, destination: &'a Snapshot, receiving: &[Side], plan: &mut Plan) -> Self {
+        let mut ground = Self { source, destination, frozen: BTreeSet::new(), blocked: BTreeSet::new() };
+        for side in [Side::Source, Side::Destination] {
+            let snapshot = ground.side(side);
+            for (key, reason) in snapshot.frozen_places() {
+                let kind = if snapshot.is_clash(key) { NoteKind::NameClash } else { NoteKind::Unreadable };
+                plan.note(kind, Some(side), snapshot.spelling(key), reason.clone());
+                ground.frozen.insert(key.clone());
+            }
+            for skipped in snapshot.skipped() {
+                plan.note(NoteKind::LeftOut, Some(side), skipped.path.clone(), skipped.reason.clone());
+            }
+        }
+        for &to in receiving {
+            for (key, reason) in ground.unholdable(to) {
+                let from = ground.side(to.opposite());
+                plan.note(NoteKind::LeftOut, Some(to.opposite()), from.spelling(&key), reason);
+                ground.frozen.insert(key);
+            }
+        }
+        ground
+    }
+
+    /// The same ground, without notes (for working out a baseline).
+    pub fn quiet(source: &'a Snapshot, destination: &'a Snapshot, receiving: &[Side]) -> Self {
+        Self::new(source, destination, receiving, &mut Plan::default())
+    }
+
+    /// Items on the other side that side `to`'s drive can't hold: names it can't take, files
+    /// too big for it, links where it has none. Only the topmost such place is listed.
+    fn unholdable(&self, to: Side) -> Vec<(String, String)> {
+        let (from, here) = (self.side(to.opposite()), self.side(to));
+        let Some(volume) = here.volume() else { return Vec::new() };
+        let mut found: Vec<(String, String)> = Vec::new();
+        for (key, entry) in from.iter() {
+            if self.is_frozen(key) || found.last().is_some_and(|(top, _)| Keys::is_within(key, top)) {
+                continue;
+            }
+            let existing = here.get(key);
+            let reason = if existing.is_none() {
+                let name: String = Keys::name(from.spelling(key)).nfc().collect();
+                volume.cannot_hold(&name).or_else(|| match entry.kind {
+                    EntryKind::Link if !here.holds_links() => {
+                        Some(format!("it's a symbolic link, and the {} can't hold links", volume.describe()))
+                    }
+                    EntryKind::File => volume.too_big(entry.size),
+                    _ => None,
+                })
+            } else if entry.is_file() && existing.is_some_and(Entry::is_file) {
+                volume.too_big(entry.size)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                found.push((key.clone(), format!("left out: {reason}")));
+            }
+        }
+        found
+    }
+
+    fn is_frozen(&self, key: &str) -> bool {
+        self.frozen.contains(key) || Keys::ancestors(key).any(|folder| self.frozen.contains(folder))
+    }
+
+    pub fn side(&self, side: Side) -> &'a Snapshot {
+        match side {
+            Side::Source => self.source,
+            Side::Destination => self.destination,
+        }
+    }
+
+    /// Whether `key` is in a place nothing may touch.
+    pub fn is_off_limits(&self, key: &str) -> bool {
+        self.is_frozen(key) || self.blocked.contains(key) || Keys::ancestors(key).any(|folder| self.blocked.contains(folder))
+    }
+
+    /// Puts `key` and everything inside it off-limits for the rest of the plan.
+    pub fn block(&mut self, key: &str) {
+        self.blocked.insert(key.to_string());
+    }
+
+    /// Whether anything inside `folder` on `side` differs from that side's record in the
+    /// baseline (was added or edited there since the last sync).
+    pub fn holds_changes(&self, side: Side, folder: &str, baseline: &Baseline) -> bool {
+        let snapshot = self.side(side);
+        let shifting = snapshot.shifts_times();
+        snapshot.inside(folder).any(|(key, entry)| !Entry::still_on(Some(entry), baseline.side(key, side), shifting))
+    }
+
+    /// A folder is only removed when everything inside it is removed by this plan too.
+    /// Otherwise the removal is dropped (whatever stays keeps it), and anything that wanted
+    /// to take the folder's place is dropped with a note.
+    pub fn finish(&self, plan: &mut Plan) {
+        let deleted: HashSet<(Side, String)> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Delete { side, path, .. } => Some((*side, path.clone())),
+                _ => None,
+            })
+            .collect();
+        let kept: Vec<(Side, String)> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Delete { side, path, item: EntryKind::Dir, .. } => {
+                    let snapshot = self.side(*side);
+                    let all_go = !snapshot.is_occupied(path)
+                        && snapshot.inside(path).all(|(inner, _)| deleted.contains(&(*side, inner.clone())));
+                    (!all_go).then(|| (*side, path.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if kept.is_empty() {
+            return;
+        }
+        let kept: HashSet<(Side, String)> = kept.into_iter().collect();
+        let mut clashes = Vec::new();
+        plan.actions.retain(|a| match a {
+            Action::Delete { side, path, item: EntryKind::Dir, .. } => !kept.contains(&(*side, path.clone())),
+            Action::Copy { to, path, .. } if kept.contains(&(*to, path.clone())) => {
+                clashes.push((*to, path.clone()));
+                false
+            }
+            _ => true,
+        });
+        for (side, path) in clashes {
+            plan.note(
+                NoteKind::Blocked,
+                Some(side),
+                self.side(side).spelling(&path).to_string(),
+                "left alone: a folder with this name is still in the way",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan::{FsKind, Volume};
+
+    fn snap(items: &[(&str, Entry)], kind: FsKind) -> Snapshot {
+        let mut s: Snapshot = items.iter().map(|(k, e)| (k.to_string(), *e)).collect();
+        s.facts_mut().volume = Some(Volume { kind, fs: "x".into(), mount: "/m".into(), name: "Stick".into(), network: false, case_sensitive: false });
+        s
+    }
+
+    #[test]
+    fn items_the_receiving_drive_cant_hold_are_left_alone() {
+        let source = snap(
+            &[
+                ("a:b.txt", Entry::file(1, 1)),
+                ("big.mov", Entry::file(5_000_000_000, 1)),
+                ("shortcut", Entry::link(b"x", 1)),
+                ("fine.txt", Entry::file(1, 1)),
+            ],
+            FsKind::Apfs,
+        );
+        let destination = snap(&[], FsKind::Fat);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("a:b.txt"));
+        assert!(ground.is_off_limits("big.mov"));
+        assert!(ground.is_off_limits("shortcut"));
+        assert!(!ground.is_off_limits("fine.txt"));
+        assert_eq!(plan.notes.len(), 3);
+        // The source never receives anything in a one-way job: nothing to check there.
+        let ground = Ground::new(&destination, &source, &[], &mut Plan::default());
+        assert!(!ground.is_off_limits("a:b.txt"));
+    }
+
+    #[test]
+    fn unreadable_places_are_off_limits_with_everything_inside() {
+        let mut source = snap(&[("a", Entry::dir()), ("a/b.txt", Entry::file(1, 1))], FsKind::Ext);
+        source.freeze("a", "permission denied");
+        let destination = snap(&[], FsKind::Ext);
+        let mut plan = Plan::default();
+        let ground = Ground::new(&source, &destination, &[Side::Destination], &mut plan);
+        assert!(ground.is_off_limits("a/b.txt"));
+        assert_eq!(plan.notes[0].kind, NoteKind::Unreadable);
+    }
+}
