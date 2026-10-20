@@ -408,11 +408,18 @@ mod system {
         let text = |buffer: &[u16]| String::from_utf16_lossy(&buffer[..buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len())]);
         let fs = text(&fs_name);
         let label = text(&label);
-        let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let plain: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let mut mount = [0u16; 1024];
-        // SAFETY: `wide` is NUL-terminated and `mount` is valid for its length.
-        let has_mount = unsafe { GetVolumePathNameW(wide.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } != 0;
+        // SAFETY: the path is NUL-terminated and `mount` is valid for its length.
+        let ask = |path: &[u16], mount: &mut [u16; 1024]| unsafe { GetVolumePathNameW(path.as_ptr(), mount.as_mut_ptr(), mount.len() as u32) } != 0;
+        // A path longer than 260 characters only works in its long form (`\\?\C:\…`), which
+        // then comes back in the answer too.
+        let has_mount = ask(&plain, &mut mount) || ask(&crate::run::rename::wide(root), &mut mount);
         let mount_text = if has_mount { text(&mount) } else { String::new() };
+        let mount_text = match mount_text.strip_prefix(r"\\?\UNC\") {
+            Some(share) => format!(r"\\{share}"),
+            None => mount_text.strip_prefix(r"\\?\").map(str::to_string).unwrap_or(mount_text),
+        };
         let spelled = root.as_os_str().to_string_lossy();
         let unc = spelled.starts_with(r"\\?\UNC\") || (spelled.starts_with(r"\\") && !spelled.starts_with(r"\\?\"));
         // SAFETY: `mount` is NUL-terminated when `has_mount`.

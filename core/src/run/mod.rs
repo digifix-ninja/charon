@@ -2,8 +2,9 @@
 //!
 //! * `executor.rs` – `Executor`: checks each step against the disk, runs it, reports progress
 //! * `copier.rs`   – `Copier`: copies one file or link safely (partial file, then rename)
-//! * `rename.rs`   – renaming without ever replacing what's at the new name
-//! * `trash.rs`    – `Trash`: safe deletes into `.charon-trash`, and its clean-up
+//! * `rename.rs`   – renaming without ever replacing what's at the new name, and swapping two names
+//! * `trash.rs`    – `Trash`: safe deletes into `.charon-trash`, what each run put there, and its clean-up
+//! * `room.rs`     – `Room`: how much room a drive has left, so a sync never fills one up
 //! * `durable.rs`  – making a run's changes durable on the drive before they're recorded
 //! * `marker.rs`   – `Marker`: tells Charon a folder is the one it synced with
 //! * `meter.rs`    – `ProgressMeter`: counts what's done for the progress bar
@@ -15,11 +16,13 @@ mod executor;
 mod marker;
 mod meter;
 mod names;
-mod rename;
+pub(crate) mod rename;
+mod room;
 mod trash;
 
-pub use copier::Copier;
+pub use copier::{Copier, Written};
 pub use executor::{Care, Executor, Outcome, Shores, Spellings};
 pub use marker::{Found, Marker, Markers};
 pub use meter::ProgressMeter;
-pub use trash::{Expired, Trash};
+pub use room::Room;
+pub use trash::{Expired, Trash, TrashLook};

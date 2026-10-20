@@ -152,6 +152,10 @@ pub struct RunSummary {
     /// Conflicts settled by Newest wins: the older version went to .charon-trash.
     #[serde(default)]
     pub settled: u64,
+    /// Files copied without some of their details (Finder tags, a resource fork, extended
+    /// attributes), because the receiving drive can't keep them.
+    #[serde(default)]
+    pub unkept: u64,
     pub cancelled: bool,
     /// Why the whole run failed, if it did.
     pub error: Option<String>,
@@ -175,6 +179,7 @@ impl RunSummary {
             kept: 0,
             unreadable: 0,
             settled: 0,
+            unkept: 0,
             cancelled: false,
             error: None,
             approved,
@@ -223,6 +228,10 @@ impl RunSummary {
         }
         if self.unreadable > 0 {
             parts.push(format!("{} couldn't be read", plural(self.unreadable, "place")));
+        }
+        if self.unkept > 0 {
+            let their = if self.unkept == 1 { "its" } else { "their" };
+            parts.push(format!("{} arrived without {their} Finder tags or other details", plural(self.unkept, "file")));
         }
         if parts.is_empty() {
             "already in sync".into()

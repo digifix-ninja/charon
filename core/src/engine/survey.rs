@@ -8,8 +8,8 @@ use crate::engine::{runs, Engine, EngineEvent};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
-use crate::run::{Expired, Found, Markers, Trash};
-use crate::scan::{never_download_on_this_thread, Contents, Entry, EntryKind, ExcludeFilter, Scanner, Snapshot, Volume};
+use crate::run::{Found, Markers, Room, Trash, TrashLook};
+use crate::scan::{never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, FsKind, Keys, Scanner, Snapshot, Volume};
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
@@ -38,8 +38,9 @@ pub(crate) enum Purpose {
 /// What a sync also does besides its steps, on the sides it writes to.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Housekeeping {
-    /// Dated trash folders old enough to be emptied, per side.
-    pub expired: Vec<(Side, Vec<Expired>)>,
+    /// What each side's trash holds: the dated folders old enough to be emptied, and files
+    /// changed after they went in.
+    pub trash: Vec<(Side, TrashLook)>,
     /// Half-copied files left by an interrupted sync, per side (on-disk path, item).
     pub leftovers: Vec<(Side, Vec<(String, Entry)>)>,
 }
@@ -48,7 +49,8 @@ impl Housekeeping {
     /// The lines a review shows.
     pub fn lines(&self, trash_days: u32) -> Vec<String> {
         let mut lines = Vec::new();
-        for (side, expired) in &self.expired {
+        for (side, look) in &self.trash {
+            let expired = &look.expired;
             if expired.is_empty() {
                 continue;
             }
@@ -346,7 +348,40 @@ impl Engine {
             )));
         }
 
-        let housekeeping = self.housekeeping(&setup, &source, &destination);
+        let housekeeping = self.housekeeping(&setup, &source, &destination, purpose);
+        for (side, look) in &housekeeping.trash {
+            if let Some(text) = Self::revived_warning(*side, look) {
+                holds.push(text.clone());
+                warnings.push(Warning::caution(text));
+            }
+            if purpose != Purpose::Check {
+                if let Some(text) = self.trash_size_warning(&setup, *side, look) {
+                    warnings.push(Warning::info(text));
+                }
+            }
+        }
+        for &side in Survey::written_sides(&setup) {
+            let clones = match side {
+                Side::Source => &source,
+                Side::Destination => &destination,
+            }
+            .volume()
+            .is_some_and(|v| v.kind == FsKind::Apfs);
+            let bytes = Self::bytes_onto(&setup, &plan, side, clones);
+            if bytes == 0 {
+                continue;
+            }
+            if let Some(why) = Room::shortage(setup.root(side), bytes, &format!("the {}'s drive", side.word())) {
+                let text = format!(
+                    "{}{}. Copies that don't fit will fail, and while copies to the {} fail, nothing is removed there. Make room on the drive first.",
+                    why[..1].to_uppercase(),
+                    &why[1..],
+                    side.word()
+                );
+                holds.push(text.clone());
+                warnings.push(Warning::caution(text));
+            }
+        }
         Ok(Survey {
             setup,
             source,
@@ -590,7 +625,8 @@ impl Engine {
     }
 
     /// Old trash to empty and half-copied leftovers to tidy, on the sides the job writes to.
-    fn housekeeping(&self, setup: &JobSetup, source: &Snapshot, destination: &Snapshot) -> Housekeeping {
+    /// A background look only looks into the trash folders old enough to be emptied.
+    fn housekeeping(&self, setup: &JobSetup, source: &Snapshot, destination: &Snapshot, purpose: Purpose) -> Housekeeping {
         let trash_days = self.settings().trash_days;
         let now = Utc::now().timestamp_millis();
         let mut housekeeping = Housekeeping::default();
@@ -599,12 +635,82 @@ impl Engine {
                 Side::Source => (&setup.source, source),
                 Side::Destination => (&setup.destination, destination),
             };
-            housekeeping.expired.push((side, Trash::expired(root, trash_days)));
-            let leftovers: Vec<(String, Entry)> =
-                snapshot.partials().iter().filter(|(_, entry)| now - entry.modified > LEFTOVER_AGE_MS).cloned().collect();
+            housekeeping.trash.push((side, Trash::look(root, trash_days, purpose != Purpose::Check)));
+            // Old by its time and by when its copy started: a long copy carries the old time
+            // of its original at the end, and may belong to another computer's sync.
+            let old = |path: &str, entry: &Entry| {
+                now - entry.modified > LEFTOVER_AGE_MS && partial_started(Keys::name(path), now).is_none_or(|started| now - started > LEFTOVER_AGE_MS)
+            };
+            let leftovers: Vec<(String, Entry)> = snapshot.partials().iter().filter(|(path, entry)| old(path, entry)).cloned().collect();
             housekeeping.leftovers.push((side, leftovers));
         }
         housekeeping
+    }
+
+    /// Files saved into the trash after Charon put them there: an app that had a file open
+    /// may have followed it into the trash and gone on saving someone's work there.
+    fn revived_warning(side: Side, look: &TrashLook) -> Option<String> {
+        let count = look.revived.len() as u64;
+        if count == 0 {
+            return None;
+        }
+        let one = count == 1;
+        let shown: Vec<String> = look.revived.iter().take(3).map(|path| format!("“{path}”")).collect();
+        let more = if count > 3 { format!(", and {} more", human_count(count - 3)) } else { String::new() };
+        Some(format!(
+            "{} in .charon-trash on the {} changed after Charon put {} there: an app that had {} open may have saved someone's work into {}. \
+             Charon won't empty {}; move what you need back, or delete {} yourself: {}{more}.",
+            plural(count, "file"),
+            side.word(),
+            if one { "it" } else { "them" },
+            if one { "it" } else { "them" },
+            if one { "it" } else { "them" },
+            if one { "it" } else { "them" },
+            if one { "it" } else { "them" },
+            shown.join(", ")
+        ))
+    }
+
+    /// A trash that takes a large share of its drive.
+    fn trash_size_warning(&self, setup: &JobSetup, side: Side, look: &TrashLook) -> Option<String> {
+        let room = Room::of(setup.root(side))?;
+        if look.bytes < 1_000_000_000 || look.bytes < room.total / 10 {
+            return None;
+        }
+        let days = self.settings().trash_days;
+        let emptied = if days == 0 {
+            "Settings keep removed files there for good".to_string()
+        } else {
+            format!("Charon empties what's older than {}", plural(days as u64, "day"))
+        };
+        Some(format!(
+            ".charon-trash on the {} holds {} ({}% of its drive). {emptied}; to make room sooner, delete older dated folders from it yourself.",
+            side.word(),
+            human_bytes(look.bytes),
+            look.bytes.saturating_mul(100) / room.total.max(1)
+        ))
+    }
+
+    /// What a sync writes onto `side`'s drive: its copies there, and the copies of the
+    /// versions they replace that go into .charon-trash (none where those are clones).
+    fn bytes_onto(setup: &JobSetup, plan: &Plan, side: Side, clones: bool) -> u64 {
+        let keeps_replaced = setup.safe_delete || setup.mode.is_two_way();
+        plan.work()
+            .map(|action| match action {
+                Action::Copy { to, bytes, existing, settles_conflict, .. } if *to == side => {
+                    let kept = match existing {
+                        Some(old) if old.is_file() && !clones && (keeps_replaced || *settles_conflict) => old.size,
+                        _ => 0,
+                    };
+                    bytes + kept
+                }
+                Action::KeepBoth { source_bytes, destination_bytes, .. } => match side {
+                    Side::Destination => *source_bytes,
+                    Side::Source => *destination_bytes,
+                },
+                _ => 0,
+            })
+            .fold(0u64, u64::saturating_add)
     }
 
     /// Whether a folder is on the same drive as before (unknown details never count as a change).

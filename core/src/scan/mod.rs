@@ -19,7 +19,7 @@ mod volume;
 pub use contents::Contents;
 pub use entry::{Entry, EntryKind, ScanFacts, Skipped, Snapshot, MTIME_TOLERANCE_MS};
 pub use filter::{
-    is_clutter, is_partial, is_system_folder, ExcludeFilter, MARKER_FOLDER, PARTIAL_EXTENSION, PARTIAL_PREFIX, PARTIAL_SUFFIX,
+    is_clutter, is_partial, is_system_folder, partial_started, ExcludeFilter, MARKER_FOLDER, PARTIAL_EXTENSION, PARTIAL_PREFIX, PARTIAL_SUFFIX,
     TRASH_FOLDER,
 };
 pub use keys::Keys;

@@ -17,9 +17,9 @@ use crate::error::{Error, Result};
 use crate::plan::{Action, Pair, Plan, Settled, Side, Unit};
 use crate::run::durable;
 use crate::run::names;
-use crate::run::rename::rename_new;
-use crate::run::{Copier, ProgressMeter, Trash};
-use crate::scan::{is_clutter, Entry, EntryKind, Keys, RootId, Scanner, Snapshot};
+use crate::run::rename::{rename_new, swap};
+use crate::run::{Copier, ProgressMeter, Room, Trash};
+use crate::scan::{is_clutter, Entry, EntryKind, FsKind, Keys, RootId, Scanner, Snapshot};
 use chrono::Local;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -78,6 +78,9 @@ pub struct Outcome {
     pub destroyed: (Vec<String>, Vec<String>),
     /// Sides whose drive turned out not to hold symbolic links.
     pub no_links: Vec<Side>,
+    /// `(path, what)` for every copy that arrived without some of the original's details
+    /// ("Finder tags", "resource fork"…), because the receiving drive can't keep them.
+    pub unkept: Vec<(String, String)>,
 }
 
 /// What one step did.
@@ -101,6 +104,40 @@ struct Staged {
     relative: String,
     target: PathBuf,
     partial: PathBuf,
+    /// The original's details the copy couldn't take along.
+    unkept: BTreeSet<&'static str>,
+}
+
+/// Which file an item is on its drive (its device and inode numbers), to tell it from
+/// another file saved under the same name. Known on macOS and Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Identity(u64, u64);
+
+impl Identity {
+    fn of(meta: &fs::Metadata) -> Option<Identity> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(Identity(meta.dev(), meta.ino()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = meta;
+            None
+        }
+    }
+
+    fn at(path: &Path) -> Option<Identity> {
+        fs::symlink_metadata(path).ok().as_ref().and_then(Self::of)
+    }
+}
+
+/// The two files of a swap (see `Executor::replace`): the one checked at the target a
+/// moment before, and the copy taking its place.
+#[derive(Debug, Clone, Copy)]
+struct Swapped {
+    checked: Option<Identity>,
+    copy: Option<Identity>,
 }
 
 /// What the folders above an item are.
@@ -177,6 +214,7 @@ pub struct Executor<'a> {
     touched: RefCell<BTreeSet<PathBuf>>,
     settled: RefCell<Vec<Settled>>,
     destroyed: RefCell<(Vec<String>, Vec<String>)>,
+    unkept: RefCell<Vec<(String, String)>>,
 }
 
 impl<'a> Executor<'a> {
@@ -194,6 +232,7 @@ impl<'a> Executor<'a> {
             touched: RefCell::new(BTreeSet::new()),
             settled: RefCell::new(Vec::new()),
             destroyed: RefCell::default(),
+            unkept: RefCell::default(),
         }
     }
 
@@ -257,6 +296,7 @@ impl<'a> Executor<'a> {
         meter.finishing();
         outcome.settled = self.settled.take();
         outcome.destroyed = self.destroyed.take();
+        outcome.unkept = self.unkept.take();
         outcome
     }
 
@@ -456,9 +496,12 @@ impl<'a> Executor<'a> {
         moved
     }
 
-    /// Makes everything this run changed durable: every folder it touched, then each drive.
-    /// Until this succeeds, nothing about the run may be recorded as done.
+    /// Makes everything this run changed durable: every folder it touched (and the trash's
+    /// lists of what went in), then each drive. Until this succeeds, nothing about the run
+    /// may be recorded as done.
     pub fn flush(&self) -> Result<()> {
+        self.trash.write_lists();
+        self.touched.borrow_mut().extend(self.trash.folders());
         for folder in self.touched.borrow().iter() {
             match durable::sync_folder(folder) {
                 Ok(()) => {}
@@ -560,16 +603,18 @@ impl<'a> Executor<'a> {
         }
         self.prepare_parents(root, &relative)?;
 
-        let partial = match from.kind {
+        let (partial, unkept) = match from.kind {
             EntryKind::File => {
+                self.room_for(to, from.size)?;
                 let coarse = self.spellings.snapshot(to.opposite()).volume().is_some_and(|v| v.coarse_times());
                 let mut copier = Copier::new(self.cancel).coarse_source_times(coarse);
                 if !self.holds_attributes(to) {
                     copier = copier.without_attributes();
                 }
-                copier.file(&from_path, &target, from, &mut |n| meter.add_bytes(n))?
+                let written = copier.file(&from_path, &target, from, &mut |n| meter.add_bytes(n))?;
+                (written.partial, written.unkept)
             }
-            EntryKind::Link => Copier::link(&from_path, &target, from)?,
+            EntryKind::Link => (Copier::link(&from_path, &target, from)?, BTreeSet::new()),
             EntryKind::Dir => return Err(Error::Invalid("a folder can't be copied as a file".into())),
         };
         self.touch(&target);
@@ -578,13 +623,13 @@ impl<'a> Executor<'a> {
             Copier::discard(&partial);
             return Ok(None);
         }
-        Ok(Some(Staged { to, key: key.to_string(), from: *from, existing: existing.copied(), settles, relative, target, partial }))
+        Ok(Some(Staged { to, key: key.to_string(), from: *from, existing: existing.copied(), settles, relative, target, partial, unkept }))
     }
 
     /// The second half of a copy: the new version takes the target's place. Returns the
     /// bytes carried and the item as it landed, or `None` when the target changed meanwhile.
     fn commit(&self, staged: Staged) -> Result<Option<(u64, Entry)>> {
-        let Staged { to, key, from, existing, settles, relative, target, partial } = staged;
+        let Staged { to, key, from, existing, settles, relative, target, partial, unkept } = staged;
         let root = self.shores.root(to);
         let keep_old = self.care.safe_delete || self.care.keep_replaced || settles;
         match existing {
@@ -595,21 +640,18 @@ impl<'a> Executor<'a> {
             }
             Some(old) if keep_old && old.is_file() => {
                 // Keep a copy of the old version, then replace it in place (see `Trash`).
-                let kept = match self.trash.preserve(root, &relative) {
+                let kept = match self.room_for_kept_copy(to, old.size).and_then(|()| self.trash.preserve(root, &relative).map_err(|e| Error::file(&target, e))) {
                     Ok(kept) => kept,
                     Err(e) => {
                         Copier::discard(&partial);
-                        return Err(Error::file(&target, e));
+                        return Err(e);
                     }
                 };
                 self.touch(&kept);
-                if !Entry::still(self.look_fresh(to, &target)?.as_ref(), existing.as_ref()) {
+                if !self.replace(to, &partial, &target, &relative, &old)? {
                     let _ = fs::remove_file(&kept);
-                    Copier::discard(&partial);
                     return Ok(None);
                 }
-                Self::make_writable(&target);
-                Copier::commit_over(&partial, &target)?;
             }
             Some(_) if keep_old => {
                 // A link: moved to the trash as it is.
@@ -622,9 +664,10 @@ impl<'a> Executor<'a> {
                 }
                 Copier::commit_new(&partial, &target)?;
             }
-            Some(_) => {
-                Self::make_writable(&target);
-                Copier::commit_over(&partial, &target)?;
+            Some(old) => {
+                if !self.replace(to, &partial, &target, &relative, &old)? {
+                    return Ok(None);
+                }
             }
         }
         if existing.is_some() {
@@ -632,7 +675,190 @@ impl<'a> Executor<'a> {
         }
         let landed = Self::look(&target)?.ok_or_else(|| Error::Invalid(format!("{} vanished right after it was copied", target.display())))?;
         self.on_its_drive(to, &target)?;
+        if !unkept.is_empty() {
+            self.unkept.borrow_mut().push((key, unkept.into_iter().collect::<Vec<_>>().join(", ")));
+        }
         Ok(Some((if from.is_file() { from.size } else { 0 }, landed)))
+    }
+
+    /// Puts the finished copy `partial` in the place of `target` (`relative` in `to`'s
+    /// folder), which must still be `expected`. Returns `false`, with the copy thrown away,
+    /// when it isn't: an app saved over it a moment ago.
+    ///
+    /// Where the drive can swap two names in one step, the copy and the old item swap, and
+    /// the old item, now under the copy's temporary name, is checked: if it isn't the one
+    /// that was checked a moment before (an app saved a new version at that very instant),
+    /// the two swap back. Elsewhere the old item is renamed aside and checked first, and
+    /// only then does the copy take the name, which it never takes from anything that
+    /// appeared there meanwhile. Either way, nothing an app saved is ever written over: it's
+    /// put back where it was, or kept in the trash.
+    fn replace(&self, to: Side, partial: &Path, target: &Path, relative: &str, expected: &Entry) -> Result<bool> {
+        // One last look, fresh from the drive, and which file it is.
+        let checked = match self.look_fresh(to, target) {
+            Ok(now) if Entry::still(now.as_ref(), Some(expected)) => fs::symlink_metadata(target).ok().filter(|meta| {
+                Self::entry_of(target, meta).is_ok_and(|now| now.unchanged(expected))
+            }),
+            Ok(_) => None,
+            Err(e) => {
+                Copier::discard(partial);
+                return Err(e);
+            }
+        };
+        let Some(checked) = checked else {
+            Copier::discard(partial);
+            return Ok(false);
+        };
+        Self::make_writable(target);
+        let swapped = Swapped { checked: Identity::of(&checked), copy: Identity::at(partial) };
+        match swap(partial, target) {
+            Ok(()) => self.check_swapped(to, partial, target, relative, expected, swapped),
+            Err(e) if e.kind() == io::ErrorKind::Unsupported => self.replace_aside(to, partial, target, relative, expected),
+            Err(e) => {
+                Copier::discard(partial);
+                Err(Error::file(target, e))
+            }
+        }
+    }
+
+    /// After a swap, `partial` holds what was at `target`: removed if it's what was checked
+    /// (the same file, as it was), swapped back otherwise.
+    fn check_swapped(&self, to: Side, partial: &Path, target: &Path, relative: &str, expected: &Entry, swapped: Swapped) -> Result<bool> {
+        let swapped_out = fs::symlink_metadata(partial).ok();
+        let same = swapped_out.as_ref().is_some_and(|meta| {
+            swapped.checked.is_none_or(|checked| Identity::of(meta) == Some(checked))
+                && Self::entry_of(partial, meta).is_ok_and(|found| Self::same_after_rename(&found, expected))
+        });
+        if same {
+            if let Err(e) = Self::remove_item(partial) {
+                // It stays under the temporary name, and the next sync moves it into the trash.
+                log::warn!("couldn't remove the replaced version of {}: {e}", target.display());
+            }
+            return Ok(true);
+        }
+        log::info!("{} was saved again while Charon replaced it; that version stays", target.display());
+        match swap(partial, target) {
+            Ok(()) if swapped.copy.is_some() && Identity::at(partial) == swapped.copy => {
+                Copier::discard(partial);
+                Ok(false)
+            }
+            // Yet another version took the name in between: the one swapped out is kept too.
+            Ok(()) => {
+                self.keep_aside(to, partial, relative);
+                Ok(false)
+            }
+            Err(e) => {
+                self.keep_aside(to, partial, relative);
+                Err(Error::Changed(format!("an app saved a new version while Charon replaced it ({e}); that version is in .charon-trash")))
+            }
+        }
+    }
+
+    /// `replace` on a drive that can't swap names: the old item is renamed aside and checked,
+    /// then the copy takes the free name.
+    fn replace_aside(&self, to: Side, partial: &Path, target: &Path, relative: &str, expected: &Entry) -> Result<bool> {
+        let aside = match Self::move_aside(target) {
+            Ok(Some(aside)) => aside,
+            // Removed meanwhile: not what the plan saw anymore.
+            Ok(None) => {
+                Copier::discard(partial);
+                return Ok(false);
+            }
+            Err(e) => {
+                Copier::discard(partial);
+                return Err(e);
+            }
+        };
+        let moved = self.look_fresh(to, &aside);
+        if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, expected)) {
+            Copier::discard(partial);
+            self.put_back(to, &aside, target, relative);
+            return moved.map(|_| false);
+        }
+        match rename_new(partial, target) {
+            Ok(()) => {
+                if let Err(e) = Self::remove_item(&aside) {
+                    log::warn!("couldn't remove the replaced version of {}: {e}", target.display());
+                }
+                Ok(true)
+            }
+            Err(e) => {
+                Copier::discard(partial);
+                self.put_back(to, &aside, target, relative);
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    Ok(false)
+                } else {
+                    Err(Error::file(target, e))
+                }
+            }
+        }
+    }
+
+    /// Renames the item at `path` to a fresh temporary name next to it, and returns that
+    /// name; `None` if nothing is there anymore.
+    fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
+        for _ in 0..5 {
+            let aside = Copier::partial_path(path);
+            match rename_new(path, &aside) {
+                Ok(()) => return Ok(Some(aside)),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(None),
+                Err(e) => return Err(Error::file(path, e)),
+            }
+        }
+        Err(Error::Invalid(format!("no free temporary name next to {}", path.display())))
+    }
+
+    /// Puts an item Charon renamed aside back under its name, or, when something new took
+    /// the name meanwhile, into the trash: never lost, never written over.
+    fn put_back(&self, side: Side, aside: &Path, target: &Path, relative: &str) {
+        if let Err(e) = rename_new(aside, target) {
+            log::info!("couldn't put {} back ({e}); it goes into the trash", target.display());
+            self.keep_aside(side, aside, relative);
+        }
+    }
+
+    /// Moves an item Charon renamed aside into the trash, under its own name.
+    fn keep_aside(&self, side: Side, aside: &Path, relative: &str) {
+        match self.trash.put_from(aside, self.shores.root(side), relative) {
+            Ok(kept) => self.touch(&kept),
+            // Under its temporary name, the next sync moves it into the trash.
+            Err(e) => log::error!("couldn't move {} into the trash: {e}; it stays at {}", relative, aside.display()),
+        }
+    }
+
+    /// Whether an item found after it was renamed is still the one seen before: the same
+    /// in everything but its change time, which a rename moves.
+    fn same_after_rename(found: &Entry, before: &Entry) -> bool {
+        found.changed_at(0).unchanged(before)
+    }
+
+    /// Removes a file or link for good.
+    fn remove_item(path: &Path) -> io::Result<()> {
+        Self::make_writable(path);
+        fs::remove_file(path)
+    }
+
+    /// The room for a new file of `bytes` on `side`'s drive.
+    fn room_for(&self, side: Side, bytes: u64) -> Result<()> {
+        match Room::shortage(self.shores.root(side), bytes, &format!("the {}'s drive", side.word())) {
+            Some(why) => Err(Error::NoRoom(why)),
+            None => Ok(()),
+        }
+    }
+
+    /// The room for keeping a copy of a replaced version of `bytes`: none on a drive where
+    /// that copy is a clone.
+    fn room_for_kept_copy(&self, side: Side, bytes: u64) -> Result<()> {
+        if self.clones(side) {
+            Ok(())
+        } else {
+            self.room_for(side, bytes).map_err(|e| Error::NoRoom(format!("{e} (to keep the replaced version in .charon-trash)")))
+        }
+    }
+
+    /// Whether copies on `side`'s drive are clones, instant and taking no room (APFS).
+    fn clones(&self, side: Side) -> bool {
+        self.spellings.snapshot(side).volume().is_some_and(|v| v.kind == FsKind::Apfs)
     }
 
     /// What a step just wrote must be on the drive the folder was on at the scan. When a
@@ -698,11 +924,12 @@ impl<'a> Executor<'a> {
             Some(_) => {}
         }
         let done = if planned.is_dir() {
-            self.remove_folder(root, &relative, &target)?
-        } else {
-            self.remove(root, &relative, &target, self.care.safe_delete)?;
+            self.remove_folder(side, &relative, &target)?
+        } else if self.remove(side, &relative, &target, self.care.safe_delete, Some(planned))? {
             self.destroyed_on(side, key);
             Done::Deleted
+        } else {
+            return Ok(Done::Skipped(format!("changed on the {} side since the scan", side.word())));
         };
         if matches!(done, Done::Deleted) {
             self.touch(&target);
@@ -747,25 +974,80 @@ impl<'a> Executor<'a> {
 
     // ---------------------------------------------------------------- removing
 
-    /// Into the trash (`keep`), or deleted for good. Links are removed as links.
-    fn remove(&self, root: &Path, relative: &str, target: &Path, keep: bool) -> Result<()> {
-        if keep {
-            let kept = self.trash.put(root, relative).map_err(|e| Error::file(target, e))?;
+    /// Into the trash (`keep`), or deleted for good. Links are removed as links. With the
+    /// item the plan saw (`planned`), it's renamed aside before it goes, and checked once
+    /// more: a version an app saved there at that very moment stays. Returns `false` when
+    /// that happened.
+    ///
+    /// On APFS a kept file isn't moved into the trash but cloned there (instant, and it takes
+    /// no room), and then removed: an app that has it open follows the file itself, not its
+    /// name, so a moved file would take the person's next saves into the trash with it.
+    /// Removed, the app saves again where the file was, and the next sync sees it.
+    fn remove(&self, side: Side, relative: &str, target: &Path, keep: bool, planned: Option<&Entry>) -> Result<bool> {
+        let root = self.shores.root(side);
+        let Some(planned) = planned else {
+            if keep {
+                let kept = self.trash.put(root, relative).map_err(|e| Error::file(target, e))?;
+                self.touch(&kept);
+            } else {
+                Self::remove_item(target).map_err(|e| Error::file(target, e))?;
+            }
+            return Ok(true);
+        };
+        if keep && planned.is_file() && self.clones(side) {
+            let kept = self.trash.preserve(root, relative).map_err(|e| Error::file(target, e))?;
             self.touch(&kept);
-            Ok(())
-        } else {
-            Self::make_writable(target);
-            fs::remove_file(target).map_err(|e| Error::file(target, e))
+            let removed = self.remove_checked(side, relative, target, planned);
+            if !matches!(removed, Ok(true)) {
+                let _ = fs::remove_file(&kept);
+            }
+            return removed;
+        }
+        if keep {
+            let Some(aside) = Self::move_aside(target)? else { return Ok(true) };
+            let moved = self.look_fresh(side, &aside);
+            if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
+                self.put_back(side, &aside, target, relative);
+                return moved.map(|_| false);
+            }
+            let kept = self.trash.put_from(&aside, root, relative).map_err(|e| {
+                self.put_back(side, &aside, target, relative);
+                Error::file(target, e)
+            })?;
+            self.touch(&kept);
+            return Ok(true);
+        }
+        self.remove_checked(side, relative, target, planned)
+    }
+
+    /// Removes the file or link at `target` for good, if it's still `planned`: renamed aside,
+    /// checked, then removed. `false` when it isn't (it's put back).
+    fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+        Self::make_writable(target);
+        // Gone already: what the plan wanted.
+        let Some(aside) = Self::move_aside(target)? else { return Ok(true) };
+        let moved = self.look_fresh(side, &aside);
+        if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
+            self.put_back(side, &aside, target, relative);
+            return moved.map(|_| false);
+        }
+        match Self::remove_item(&aside) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                self.put_back(side, &aside, target, relative);
+                Err(Error::file(target, e))
+            }
         }
     }
 
-    /// Windows refuses to replace or delete a read-only file; the file was checked to be
-    /// exactly what the plan saw, so its read-only mark is lifted first.
+    /// Windows refuses to replace or delete a read-only file or folder (Explorer marks
+    /// customised folders so); the item was checked to be exactly what the plan saw, so its
+    /// read-only mark is lifted first.
     fn make_writable(path: &Path) {
         #[cfg(windows)]
         if let Ok(meta) = fs::symlink_metadata(path) {
             let mut permissions = meta.permissions();
-            if meta.is_file() && permissions.readonly() {
+            if (meta.is_file() || meta.is_dir()) && permissions.readonly() {
                 #[allow(clippy::permissions_set_readonly_false)]
                 permissions.set_readonly(false);
                 if let Err(e) = fs::set_permissions(path, permissions) {
@@ -779,7 +1061,7 @@ impl<'a> Executor<'a> {
 
     /// Removes a folder whose contents were removed by earlier steps. If anything besides
     /// system clutter is still inside (a file added meanwhile, an excluded item), it stays.
-    fn remove_folder(&self, root: &Path, relative: &str, target: &Path) -> Result<Done> {
+    fn remove_folder(&self, side: Side, relative: &str, target: &Path) -> Result<Done> {
         let mut clutter = Vec::new();
         for item in fs::read_dir(target).map_err(|e| Error::file(target, e))? {
             let item = item.map_err(|e| Error::file(target, e))?;
@@ -794,10 +1076,12 @@ impl<'a> Executor<'a> {
         }
         // System files nobody listed (.DS_Store, desktop.ini…) always go to .charon-trash:
         // the person never saw them in the list, so they're never gone for good.
+        let root = self.shores.root(side);
         for item in &clutter {
-            self.remove(root, item, &root.join(item), true)?;
+            self.remove(side, item, &root.join(item), true, None)?;
         }
         self.real_folders.borrow_mut().clear();
+        Self::make_writable(target);
         match fs::remove_dir(target) {
             Ok(()) => Ok(Done::Deleted),
             // Something appeared inside at the last moment: the folder stays.
@@ -869,18 +1153,22 @@ impl<'a> Executor<'a> {
     /// The item at `path` as it is now, without following links; `None` if nothing is there.
     /// Any other answer (no permission, a drive error) is an error: it never counts as "gone".
     fn look(path: &Path) -> Result<Option<Entry>> {
-        let meta = match fs::symlink_metadata(path) {
-            Ok(meta) => meta,
-            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => return Ok(None),
-            Err(e) => return Err(Error::file(path, e)),
-        };
+        match fs::symlink_metadata(path) {
+            Ok(meta) => Self::entry_of(path, &meta).map(Some),
+            Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => Ok(None),
+            Err(e) => Err(Error::file(path, e)),
+        }
+    }
+
+    /// The item at `path`, from its details `meta`.
+    fn entry_of(path: &Path, meta: &fs::Metadata) -> Result<Entry> {
         let kind = meta.file_type();
         if kind.is_dir() {
-            Ok(Some(Entry::dir()))
+            Ok(Entry::dir())
         } else if kind.is_file() {
-            Ok(Some(Entry::file(meta.len(), Scanner::modified_ms(&meta)).changed_at(Scanner::change_time(&meta))))
+            Ok(Entry::file(meta.len(), Scanner::modified_ms(meta)).changed_at(Scanner::change_time(meta)))
         } else if kind.is_symlink() {
-            Ok(Some(Self::link_entry(path, &meta)?))
+            Self::link_entry(path, meta)
         } else {
             Err(Error::Invalid(format!("{} isn't a file or a folder", path.display())))
         }
@@ -1027,5 +1315,186 @@ mod tests {
         let empty = Snapshot::new();
         let spell = Spellings::new(&source, &empty);
         assert_eq!(spell.disk(Side::Destination, "caf\u{e9}/menu.txt"), "caf\u{e9}/menu.txt");
+    }
+
+    const KEEP: Care = Care { safe_delete: true, keep_replaced: true };
+
+    /// Two empty folders for an executor to work in.
+    fn shores() -> (tempfile::TempDir, Shores) {
+        let tmp = tempfile::tempdir().unwrap();
+        let shores = Shores { source: tmp.path().join("source"), destination: tmp.path().join("destination") };
+        fs::create_dir_all(&shores.source).unwrap();
+        fs::create_dir_all(&shores.destination).unwrap();
+        (tmp, shores)
+    }
+
+    fn write(path: &Path, text: &str, seconds: i64) {
+        fs::write(path, text).unwrap();
+        filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+    }
+
+    fn seen(path: &Path) -> Entry {
+        Executor::look(path).unwrap().unwrap()
+    }
+
+    /// The names in a folder, Charon's own trash left out.
+    fn names_in(folder: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(folder).unwrap().flatten().map(|i| i.file_name().to_string_lossy().into_owned()).filter(|n| n != crate::scan::TRASH_FOLDER).collect();
+        names.sort();
+        names
+    }
+
+    /// An app saves a new version (a new file under the same name, even with the same size
+    /// and time) at the very instant Charon swaps its copy in: the app's version goes back.
+    #[test]
+    fn a_version_saved_while_replacing_is_swapped_back() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let (planned, checked) = (seen(&target), Identity::at(&target));
+        let saved = shores.destination.join("saved-by-the-app");
+        write(&saved, "app", 1_600_000_000);
+        fs::rename(&saved, &target).unwrap();
+        let partial = Copier::partial_path(&target);
+        write(&partial, "new version", 1_700_000_000);
+        let swapped = Swapped { checked, copy: Identity::at(&partial) };
+        if swap(&partial, &target).is_err() {
+            return; // a drive that can't swap: `replace_aside` covers it
+        }
+        assert!(!executor.check_swapped(Side::Destination, &partial, &target, "notes.txt", &planned, swapped).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "app");
+        assert_eq!(names_in(&shores.destination), vec!["notes.txt"], "the copy is gone, nothing else is left");
+    }
+
+    #[test]
+    fn a_checked_version_is_replaced_and_nothing_is_left_behind() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let planned = seen(&target);
+        let partial = Copier::partial_path(&target);
+        write(&partial, "new version", 1_700_000_000);
+        assert!(executor.replace(Side::Destination, &partial, &target, "notes.txt", &planned).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new version");
+        assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
+
+        // Where the drive can't swap names, the old version goes aside first.
+        let partial = Copier::partial_path(&target);
+        write(&partial, "newest", 1_800_000_000);
+        assert!(executor.replace_aside(Side::Destination, &partial, &target, "notes.txt", &seen(&target)).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "newest");
+        assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
+    }
+
+    #[test]
+    fn a_changed_file_is_never_replaced_aside_either() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let planned = seen(&target);
+        write(&target, "saved by an app", 1_600_000_100);
+        let partial = Copier::partial_path(&target);
+        write(&partial, "new version", 1_700_000_000);
+        assert!(!executor.replace_aside(Side::Destination, &partial, &target, "notes.txt", &planned).unwrap());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "saved by an app");
+        assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
+        assert!(!executor.replace(Side::Destination, &Copier::partial_path(&target), &target, "notes.txt", &planned).unwrap());
+    }
+
+    /// Something new took the name while the old item was aside: the old item goes into the
+    /// trash rather than over it.
+    #[test]
+    fn an_item_put_back_never_replaces_a_newer_one() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let aside = Executor::move_aside(&target).unwrap().unwrap();
+        write(&target, "newer", 1_700_000_000);
+        executor.put_back(Side::Destination, &aside, &target, "notes.txt");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "newer");
+        assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
+        let trash = Trash::look(&shores.destination, 0, true);
+        assert_eq!(trash.bytes, 3, "the old one is in the trash");
+    }
+
+    #[test]
+    fn a_removal_leaves_a_file_that_changed_at_the_last_moment() {
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        for (care, keep) in [(KEEP, true), (Care { safe_delete: false, keep_replaced: false }, false)] {
+            let (_tmp, shores) = shores();
+            let executor = Executor::new(&shores, &empty, &empty, care, &cancel);
+            let target = shores.destination.join("plan.txt");
+            write(&target, "old", 1_600_000_000);
+            let planned = seen(&target);
+            write(&target, "saved again", 1_600_000_100);
+            assert!(!executor.remove(Side::Destination, "plan.txt", &target, keep, Some(&planned)).unwrap());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "saved again");
+            assert_eq!(names_in(&shores.destination), vec!["plan.txt"]);
+
+            let planned = seen(&target);
+            assert!(executor.remove(Side::Destination, "plan.txt", &target, keep, Some(&planned)).unwrap());
+            assert!(names_in(&shores.destination).is_empty());
+            assert_eq!(Trash::look(&shores.destination, 0, true).bytes > 0, keep, "kept in the trash only with safe deletes");
+        }
+    }
+
+    /// Windows: a path of over 300 characters and read-only files and folders are replaced,
+    /// kept and removed like any others.
+    #[cfg(windows)]
+    #[test]
+    fn long_paths_and_read_only_items_work_on_windows() {
+        fn read_only(path: &Path) {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_readonly(true);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        for care in [KEEP, Care { safe_delete: false, keep_replaced: false }] {
+            let (_tmp, shores) = shores();
+            let executor = Executor::new(&shores, &empty, &empty, care, &cancel);
+            let folder = (0..6).map(|i| format!("{i}{}", "x".repeat(50))).collect::<Vec<_>>().join("/");
+            let relative = format!("{folder}/notes.txt");
+            let target = shores.destination.join(&relative);
+            assert!(target.as_os_str().len() > 300);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            write(&target, "old", 1_600_000_000);
+            read_only(&target);
+
+            if care.keep_replaced {
+                let kept = executor.trash.preserve(&shores.destination, &relative).unwrap();
+                assert_eq!(fs::read_to_string(kept).unwrap(), "old");
+            }
+            let partial = Copier::partial_path(&target);
+            write(&partial, "new", 1_700_000_000);
+            assert!(executor.replace(Side::Destination, &partial, &target, &relative, &seen(&target)).unwrap());
+            assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+
+            read_only(&target);
+            assert!(executor.remove(Side::Destination, &relative, &target, care.safe_delete, Some(&seen(&target))).unwrap());
+            assert!(!target.exists());
+
+            let emptied = shores.destination.join("0".to_string() + &"x".repeat(50));
+            let inner = folder.split('/').skip(1).collect::<Vec<_>>();
+            for depth in (0..inner.len()).rev() {
+                let path = emptied.join(inner[..=depth].join("/"));
+                read_only(&path);
+                let relative = path.strip_prefix(&shores.destination).unwrap().to_string_lossy().replace('\\', "/");
+                assert!(matches!(executor.remove_folder(Side::Destination, &relative, &path).unwrap(), Done::Deleted));
+            }
+        }
     }
 }

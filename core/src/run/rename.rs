@@ -3,30 +3,63 @@
 //!
 //! The systems offer this directly (Linux `renameat2` with `RENAME_NOREPLACE`, macOS
 //! `renamex_np` with `RENAME_EXCL`, Windows `MoveFileExW` without `REPLACE_EXISTING`).
-//! Where a drive doesn't support it (some network shares), Charon looks first and then
-//! renames: the gap is a few microseconds.
+//! Where a drive doesn't support it (some network shares), a file gets its new name as a
+//! hard link first, which can't replace anything either, and then loses the old name. Only
+//! where a drive has neither does Charon look first and then rename: the gap is a few
+//! microseconds.
+//!
+//! Replacing a file goes through `swap` where the drive can exchange two names in one step
+//! (Linux `RENAME_EXCHANGE`, macOS `RENAME_SWAP`): what was swapped out can then be checked,
+//! and swapped back if it isn't what Charon meant to replace (see `Executor::replace`).
 
 use std::fs;
 use std::io;
 use std::path::Path;
 
-/// Renames `from` to `to` in one step, replacing what's at `to` (used only right after
-/// checking that `to` is exactly what the plan saw). Written through to the drive on Windows.
-pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-    system::rename_over(from, to)
-}
-
 /// Renames `from` to `to`, failing with `AlreadyExists` if something is at `to`.
 pub fn rename_new(from: &Path, to: &Path) -> io::Result<()> {
     match system::rename_no_replace(from, to) {
-        Err(e) if is_unsupported(&e) => {
-            if fs::symlink_metadata(to).is_ok() {
-                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "something is already there"));
+        Err(e) if is_unsupported(&e) => match link_then_unlink(from, to) {
+            Err(e) if is_unsupported(&e) => {
+                log::debug!("{} can't be renamed without a look first: {e}", to.display());
+                if fs::symlink_metadata(to).is_ok() {
+                    return Err(io::Error::new(io::ErrorKind::AlreadyExists, "something is already there"));
+                }
+                fs::rename(from, to)
             }
-            fs::rename(from, to)
-        }
+            other => other,
+        },
         other => other,
     }
+}
+
+/// Exchanges the items at `a` and `b` in one step. Fails with `Unsupported` where the system
+/// or the drive can't (Windows, FAT and exFAT, most network shares).
+pub fn swap(a: &Path, b: &Path) -> io::Result<()> {
+    match system::swap(a, b) {
+        Err(e) if is_unsupported(&e) => Err(io::Error::new(io::ErrorKind::Unsupported, e.to_string())),
+        other => other,
+    }
+}
+
+/// `rename_new` for drives without a renaming call that refuses to replace: a hard link
+/// under the new name (refused if anything is there), then the old name goes. Regular files
+/// only; anything else, or a drive without hard links, answers `Unsupported`.
+fn link_then_unlink(from: &Path, to: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(from)?.is_file() {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "only files are linked"));
+    }
+    match fs::hard_link(from, to) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
+        Err(e) => return Err(io::Error::new(io::ErrorKind::Unsupported, e.to_string())),
+    }
+    if let Err(e) = fs::remove_file(from) {
+        // Both names lead to the same file: the new one goes again, and nothing moved.
+        let _ = fs::remove_file(to);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// `path` as a NUL-terminated UTF-16 string for a direct Windows call: absolute, with `\`
@@ -82,8 +115,16 @@ mod system {
         }
     }
 
-    pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    pub fn swap(a: &Path, b: &Path) -> io::Result<()> {
+        let a = CString::new(a.as_os_str().as_bytes())?;
+        let b = CString::new(b.as_os_str().as_bytes())?;
+        // SAFETY: both paths are valid NUL-terminated strings that live through the call.
+        let result = unsafe { libc::renameat2(libc::AT_FDCWD, a.as_ptr(), libc::AT_FDCWD, b.as_ptr(), libc::RENAME_EXCHANGE) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 
@@ -106,8 +147,16 @@ mod system {
         }
     }
 
-    pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    pub fn swap(a: &Path, b: &Path) -> io::Result<()> {
+        let a = CString::new(a.as_os_str().as_bytes())?;
+        let b = CString::new(b.as_os_str().as_bytes())?;
+        // SAFETY: both paths are valid NUL-terminated strings that live through the call.
+        let result = unsafe { libc::renamex_np(a.as_ptr(), b.as_ptr(), libc::RENAME_SWAP) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }
 
@@ -116,7 +165,7 @@ mod system {
     use super::wide;
     use std::io;
     use std::path::Path;
-    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
     fn move_file(from: &Path, to: &Path, flags: u32) -> io::Result<()> {
         let (from, to) = (wide(from), wide(to));
@@ -134,9 +183,9 @@ mod system {
         move_file(from, to, MOVEFILE_WRITE_THROUGH)
     }
 
-    /// A file another program has open can't be replaced: Windows refuses, which is safe.
-    pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-        move_file(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+    /// Windows has no call that exchanges two names.
+    pub fn swap(_a: &Path, _b: &Path) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "Windows can't exchange two names"))
     }
 }
 
@@ -149,8 +198,8 @@ mod system {
         Err(io::Error::new(io::ErrorKind::Unsupported, "not on this system"))
     }
 
-    pub fn rename_over(from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    pub fn swap(_a: &Path, _b: &Path) -> io::Result<()> {
+        Err(io::Error::new(io::ErrorKind::Unsupported, "not on this system"))
     }
 }
 
@@ -169,5 +218,38 @@ mod tests {
         fs::remove_file(&b).unwrap();
         rename_new(&a, &b).unwrap();
         assert_eq!(fs::read_to_string(&b).unwrap(), "new");
+    }
+
+    #[test]
+    fn linking_never_replaces_either() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&a, "new").unwrap();
+        fs::write(&b, "precious").unwrap();
+        assert_eq!(link_then_unlink(&a, &b).unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&b).unwrap(), "precious");
+        assert!(a.exists());
+        fs::remove_file(&b).unwrap();
+        link_then_unlink(&a, &b).unwrap();
+        assert_eq!(fs::read_to_string(&b).unwrap(), "new");
+        assert!(!a.exists());
+    }
+
+    #[test]
+    fn swapping_exchanges_two_names_where_the_drive_can() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        fs::write(&a, "one").unwrap();
+        fs::write(&b, "two").unwrap();
+        match swap(&a, &b) {
+            Ok(()) => {
+                assert_eq!(fs::read_to_string(&a).unwrap(), "two");
+                assert_eq!(fs::read_to_string(&b).unwrap(), "one");
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+                assert_eq!(fs::read_to_string(&a).unwrap(), "one");
+            }
+        }
     }
 }

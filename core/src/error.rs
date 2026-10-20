@@ -50,6 +50,10 @@ pub enum Error {
     #[error("{0}")]
     Changed(String),
 
+    /// The drive hasn't enough room left for a step (see `run::Room`).
+    #[error("{0}")]
+    NoRoom(String),
+
     /// The drive can't hold symbolic links (FAT, exFAT, some network shares).
     #[error("this drive can't hold symbolic links")]
     NoLinks,

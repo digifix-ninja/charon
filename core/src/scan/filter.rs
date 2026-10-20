@@ -21,8 +21,24 @@ pub fn is_partial(name: &str) -> bool {
     if name.ends_with(PARTIAL_SUFFIX) {
         return true;
     }
-    let digits = name.strip_prefix(PARTIAL_PREFIX).and_then(|rest| rest.strip_suffix(PARTIAL_EXTENSION));
-    digits.is_some_and(|d| d.len() == 16 && d.bytes().all(|b| b.is_ascii_hexdigit()))
+    partial_digits(name).is_some()
+}
+
+/// When the copy written under the temporary name `name` was started, in milliseconds since
+/// 1970: its first 8 hex digits count the seconds (see `Copier::partial_path`). `None` for
+/// other names, and for the temporary names of earlier versions, whose digits were all
+/// random (a time that isn't within the last ten years is taken for one of those).
+pub fn partial_started(name: &str, now_ms: i64) -> Option<i64> {
+    const TEN_YEARS_MS: i64 = 10 * 366 * 24 * 3_600_000;
+    let seconds = i64::from_str_radix(&partial_digits(name)?[..8], 16).ok()?;
+    let started = seconds * 1000;
+    (now_ms - TEN_YEARS_MS..=now_ms + 24 * 3_600_000).contains(&started).then_some(started)
+}
+
+/// The 16 hex digits of a temporary name `.charon-0123456789abcdef.part`.
+fn partial_digits(name: &str) -> Option<&str> {
+    let digits = name.strip_prefix(PARTIAL_PREFIX).and_then(|rest| rest.strip_suffix(PARTIAL_EXTENSION))?;
+    (digits.len() == 16 && digits.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digits)
 }
 
 /// Files the operating system scatters into folders by itself (Finder and Explorer
@@ -109,7 +125,17 @@ impl ExcludeFilter {
     /// Whether the item at `path` (relative, `/`-separated) is left alone.
     pub fn excludes(&self, path: &str) -> bool {
         let name = path.rsplit('/').next().unwrap_or(path);
-        Self::is_internal(path, name) || self.names.is_match(name) || self.paths.is_match(path)
+        Self::is_internal(path, name) || Self::is_apple_double(name) || self.names.is_match(name) || self.paths.is_match(path)
+    }
+
+    /// On a Mac, `._report.pdf` next to `report.pdf` on a drive that isn't a Mac drive
+    /// (exFAT, FAT, many network shares) holds the details of `report.pdf` that drive can't
+    /// keep itself: its Finder tags, its resource fork. macOS reads and writes it along with
+    /// the file. Copied or removed as a file of its own, it would overwrite or strip the
+    /// details of another file, so on a Mac it's never synced, whatever the patterns say.
+    /// It goes along with its folder when everything else in it is removed.
+    fn is_apple_double(name: &str) -> bool {
+        cfg!(target_os = "macos") && name.len() > 2 && name.starts_with("._")
     }
 
     /// Charon's own folders and half-copied files, at any depth (a folder of another job
@@ -178,6 +204,25 @@ mod tests {
         assert!(is_system_folder("$RECYCLE.BIN"));
         assert!(is_system_folder(".Trash-1000"));
         assert!(!is_system_folder("Photos"));
+    }
+
+    #[test]
+    fn a_temporary_name_tells_when_its_copy_started() {
+        let now = 1_760_000_000_000;
+        let name = format!(".charon-{:08x}{:08x}.part", now / 1000 - 60, 0xabcdefu32);
+        assert!(is_partial(&name));
+        assert_eq!(partial_started(&name, now), Some(now - 60_000));
+        assert_eq!(partial_started(".charon-ffffffff00000000.part", now), None, "random digits of an older version");
+        assert_eq!(partial_started(".charon-0000000100000000.part", now), None);
+        assert_eq!(partial_started("report.pdf", now), None);
+    }
+
+    #[test]
+    fn apple_double_files_are_left_alone_on_a_mac() {
+        let f = filter(&[]);
+        assert_eq!(f.excludes("photos/._cat.jpg"), cfg!(target_os = "macos"));
+        assert!(!f.excludes("photos/._"));
+        assert!(!f.excludes("photos/_cat.jpg"));
     }
 
     #[test]

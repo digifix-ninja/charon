@@ -325,8 +325,8 @@ impl Engine {
         }
         let flushed = executor.flush();
         if complete && flushed.is_ok() {
-            for (side, expired) in &survey.housekeeping.expired {
-                let names: Vec<String> = expired.iter().map(|e| e.name.clone()).collect();
+            for (side, look) in &survey.housekeeping.trash {
+                let names: Vec<String> = look.expired.iter().map(|e| e.name.clone()).collect();
                 Trash::sweep(survey.setup.root(*side), &names);
             }
         }
@@ -342,6 +342,7 @@ impl Engine {
         summary.cancelled = outcome.cancelled;
         let settled = if crossing.kind == ReviewKind::Sync { Self::settled_by_newest(survey, &outcome) } else { Vec::new() };
         summary.settled = settled.len() as u64;
+        summary.unkept = outcome.unkept.len() as u64;
 
         let mut problems: Vec<String> = outcome.stopped.iter().cloned().collect();
         let recorded = match &flushed {
@@ -375,6 +376,9 @@ impl Engine {
                     to.word()
                 ),
             );
+        }
+        for (path, what) in outcome.unkept.iter().take(LOGGED_ITEMS) {
+            journal.info(id, &format!("{path}: copied without its {what}, which the receiving drive can't keep"));
         }
         if tidied > 0 {
             journal.info(id, &format!("moved {} into .charon-trash", plural(tidied, "half-copied leftover")));

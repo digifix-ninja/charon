@@ -815,3 +815,75 @@ fn a_library_changed_on_both_sides_is_kept_whole_from_one_side() {
     assert_eq!(next.total_steps, 0, "{:?}", next.steps);
     assert_eq!(next.tally.conflicts, 0);
 }
+
+/// An app that had a removed file open follows it into .charon-trash and saves the person's
+/// work there: Charon says so, never empties it, and stops running by itself until then.
+#[test]
+fn work_saved_into_the_trash_is_shown_and_kept() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    for i in 0..10 {
+        write(&a.join(format!("f{i}.txt")), "x");
+    }
+    write(&a.join("report.txt"), "the report");
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+
+    // Renamed on one computer: removed from the other one, into its trash.
+    fs::rename(a.join("report.txt"), a.join("report-final.txt")).unwrap();
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    assert!(engine.job(&id).unwrap().job.held.is_none());
+    let trashed = walk(&b.join(".charon-trash"));
+    let kept = trashed.iter().find(|p| p.ends_with("report.txt")).expect("in the trash").clone();
+    assert!(trashed.iter().any(|p| p.file_name().is_some_and(|n| n == ".charon")), "the run listed what it put there: {trashed:?}");
+
+    // The app that had it open saves into it.
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&kept, "the report, with today's work").unwrap();
+    write(&a.join("f0.txt"), "edited");
+    assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Started);
+    wait(&engine, &id);
+    let held = engine.job(&id).unwrap().job.held.expect("held for a look");
+    assert_eq!(fs::read_to_string(b.join("f0.txt")).unwrap(), "x", "nothing ran by itself");
+    assert!(held.contains("changed after Charon put it there"), "{held}");
+    let review = engine.prepare_review(&id).unwrap();
+    let warning = review.warnings.iter().find(|w| w.text.contains("changed after Charon put it there")).expect("warned");
+    assert_eq!(warning.level, Level::Caution);
+    assert!(warning.text.contains("report.txt"), "{}", warning.text);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait(&engine, &id);
+    assert_eq!(fs::read_to_string(&kept).unwrap(), "the report, with today's work");
+}
+
+/// A sync that would fill a drive says so first, and its copies fail with the reason
+/// instead of filling the drive to the last byte.
+#[test]
+fn a_drive_without_room_is_never_filled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write(&a.join("small.txt"), "x");
+    fs::create_dir_all(&b).unwrap();
+    // A file bigger than any drive here, that takes no room itself.
+    let huge = fs::File::create(a.join("huge.bin")).unwrap();
+    if huge.set_len(1 << 43).is_err() {
+        return;
+    }
+    drop(huge);
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::Backup, ConflictRule::Ask)).unwrap().job.id;
+    let review = engine.prepare_review(&id).unwrap();
+    let warning = review.warnings.iter().find(|w| w.text.contains("isn't enough room on the destination's drive")).expect("warned");
+    assert_eq!(warning.level, Level::Caution);
+    engine.approve(&id, &review.review_id, true).unwrap();
+    wait(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join("small.txt")).unwrap(), "x");
+    assert!(!b.join("huge.bin").exists());
+    let run = engine.job(&id).unwrap().job.last_run.unwrap();
+    assert_eq!(run.failed, 1);
+    assert!(engine.log(&id, 20).iter().any(|l| l.text.contains("huge.bin") && l.text.contains("isn't enough room")));
+}

@@ -93,9 +93,11 @@ mod system {
     }
 }
 
-/// Windows writes renames through to the drive as they happen (Charon asks for that with
-/// MOVEFILE_WRITE_THROUGH), and files are flushed before they're renamed. Folders are
-/// flushed as well where Windows allows it (it needs write access to the folder).
+/// Windows: files are flushed before they're renamed, and a rename reaches the drive when
+/// its folder is flushed (MOVEFILE_WRITE_THROUGH, which Charon passes, only makes a
+/// difference for moves between drives, which Charon never makes). Opening a folder to
+/// flush it needs write access to it; where Windows refuses that, the drive writes the
+/// folder's changes in its own time.
 #[cfg(windows)]
 mod system {
     use std::io;
