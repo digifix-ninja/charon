@@ -15,7 +15,7 @@
 //! durable and looks once more at what each finished step left (see `retrace`).
 
 use crate::error::{Error, Result};
-use crate::plan::{Action, Clearing, Pair, Plan, Settled, Side, Step, Unit};
+use crate::plan::{Action, Clearing, Pair, Plan, PutBack, Settled, Side, Step, Unit};
 use crate::run::durable;
 use crate::run::identity::Identity;
 use crate::run::names;
@@ -97,6 +97,9 @@ pub struct Outcome {
     pub unrecorded: Vec<String>,
     /// Files the system wouldn't let this run read on the side they were to be copied from.
     pub unread: Vec<Unread>,
+    /// Items steps that couldn't finish renamed aside and put back as they were (see
+    /// `PutBack`).
+    pub put_back: Vec<PutBack>,
 }
 
 /// An item a drive refused to take (see `Refusal`): the side it was to go to, its key, why,
@@ -416,6 +419,8 @@ pub struct Executor<'a> {
     unkept: RefCell<Vec<(String, String)>>,
     /// What each side's drive answered when asked whether it holds links (see `link`).
     links: RefCell<HashMap<Side, Option<bool>>>,
+    /// Items put back as they were by steps that couldn't finish (see `put_back`).
+    put_back_items: RefCell<Vec<PutBack>>,
 }
 
 impl<'a> Executor<'a> {
@@ -438,6 +443,7 @@ impl<'a> Executor<'a> {
             destroyed: RefCell::default(),
             unkept: RefCell::default(),
             links: RefCell::default(),
+            put_back_items: RefCell::default(),
         }
     }
 
@@ -543,6 +549,7 @@ impl<'a> Executor<'a> {
         outcome.settled = self.settled.take();
         outcome.destroyed = self.destroyed.take();
         outcome.unkept = self.unkept.take();
+        outcome.put_back = self.put_back_items.take();
         outcome
     }
 
@@ -1294,7 +1301,7 @@ impl<'a> Executor<'a> {
             Some(old) if keep_old && old.is_file() => {
                 // Keep a copy of the old version, then replace it in place (see `Trash`).
                 // The old version may be only in the cloud since the scan: then it's left alone.
-                let kept = match self.room_for_kept_copy(to, old.size).and_then(|()| self.trash.preserve(root, &relative).map_err(|e| Copier::unreadable(&target, e, 0))) {
+                let kept = match self.room_for_kept_copy(to, old.size, "the replaced version").and_then(|()| self.trash.preserve(root, &relative)) {
                     Ok(kept) => kept,
                     Err(e) => {
                         Copier::discard(&partial);
@@ -1302,9 +1309,22 @@ impl<'a> Executor<'a> {
                     }
                 };
                 self.touch(&kept);
-                if !self.replace(to, &partial, &target, &relative, &old)? {
-                    let _ = fs::remove_file(&kept);
-                    return Ok(None);
+                let copy = Identity::at(&partial);
+                match self.replace(to, &partial, &target, &relative, &old) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        Copier::discard(&kept);
+                        return Ok(None);
+                    }
+                    Err(e) => {
+                        // With the old version still in its place, its copy in the trash goes:
+                        // each sync that fails here (an app holds the file open) would leave
+                        // one more.
+                        if Self::still_in_place(&target, &old, copy) {
+                            Copier::discard(&kept);
+                        }
+                        return Err(e);
+                    }
                 }
             }
             Some(_) if keep_old => {
@@ -1313,7 +1333,7 @@ impl<'a> Executor<'a> {
                     Ok(kept) => self.touch(&kept),
                     Err(e) => {
                         Copier::discard(&partial);
-                        return Err(Error::file(&target, e));
+                        return Err(e);
                     }
                 }
                 Copier::commit_new(&partial, &target)?;
@@ -1362,7 +1382,7 @@ impl<'a> Executor<'a> {
             Copier::discard(partial);
             return Ok(false);
         };
-        Self::make_writable(target);
+        Copier::make_writable(target);
         let swapped = Swapped { checked: Identity::of(&checked), copy: Identity::at(partial) };
         match swap(partial, target) {
             Ok(()) => self.check_swapped(to, partial, target, relative, expected, swapped),
@@ -1425,7 +1445,7 @@ impl<'a> Executor<'a> {
         let moved = self.look_fresh(to, &aside);
         if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, expected)) {
             Copier::discard(partial);
-            self.put_back(to, &aside, target, relative);
+            self.put_back(to, &aside, target, relative, None);
             return moved.map(|_| false);
         }
         match rename_new(partial, target) {
@@ -1437,7 +1457,7 @@ impl<'a> Executor<'a> {
             }
             Err(e) => {
                 Copier::discard(partial);
-                self.put_back(to, &aside, target, relative);
+                self.put_back(to, &aside, target, relative, Some(expected));
                 if e.kind() == io::ErrorKind::AlreadyExists {
                     Ok(false)
                 } else {
@@ -1461,11 +1481,21 @@ impl<'a> Executor<'a> {
     }
 
     /// Puts an item Charon renamed aside back under its name, or, when something new took
-    /// the name meanwhile, into the trash: never lost, never written over.
-    fn put_back(&self, side: Side, aside: &Path, target: &Path, relative: &str) {
+    /// the name meanwhile, into the trash: never lost, never written over. `checked` is the
+    /// item as the plan saw it, when the look after the move found it so: back in its place
+    /// as it was, it's noted with the change time the renames gave it (see `PutBack`).
+    fn put_back(&self, side: Side, aside: &Path, target: &Path, relative: &str, checked: Option<&Entry>) {
         if let Err(e) = rename_new(aside, target) {
             log::info!("couldn't put {} back ({e}); it goes into the trash", target.display());
             self.keep_aside(side, aside, relative);
+            return;
+        }
+        let Some(checked) = checked else { return };
+        if let Ok(Some(now)) = Self::look(target) {
+            if Self::same_after_rename(&now, checked) {
+                let item = PutBack { side, path: self.spellings.key_for(relative), found: *checked, now };
+                self.put_back_items.borrow_mut().push(item);
+            }
         }
     }
 
@@ -1478,6 +1508,14 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Whether the version `old` is at `target` after a replacement failed: it never left,
+    /// or it was put back. Not when the new copy (`copy`) took the name after all, however
+    /// much it looks like the old version: then the trash holds the only copy of that one.
+    fn still_in_place(target: &Path, old: &Entry, copy: Option<Identity>) -> bool {
+        let looks_old = matches!(Self::look(target), Ok(Some(now)) if Self::same_after_rename(&now, old));
+        looks_old && (copy.is_none() || Identity::at(target) != copy)
+    }
+
     /// Whether an item found after it was renamed is still the one seen before: the same
     /// in everything but its change time, which a rename moves.
     fn same_after_rename(found: &Entry, before: &Entry) -> bool {
@@ -1486,7 +1524,7 @@ impl<'a> Executor<'a> {
 
     /// Removes a file or link for good.
     fn remove_item(path: &Path) -> io::Result<()> {
-        Self::make_writable(path);
+        Copier::make_writable(path);
         fs::remove_file(path)
     }
 
@@ -1498,13 +1536,13 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// The room for keeping a copy of a replaced version of `bytes`: none on a drive where
-    /// that copy is a clone.
-    fn room_for_kept_copy(&self, side: Side, bytes: u64) -> Result<()> {
+    /// The room for keeping a copy of `what` ("the replaced version"), of `bytes`, in the
+    /// trash: none on a drive where that copy is a clone.
+    fn room_for_kept_copy(&self, side: Side, bytes: u64, what: &str) -> Result<()> {
         if self.clones(side) {
             Ok(())
         } else {
-            self.room_for(side, bytes).map_err(|e| Error::NoRoom(format!("{e} (to keep the replaced version in .charon-trash)")))
+            self.room_for(side, bytes).map_err(|e| Error::NoRoom(format!("{e} (to keep {what} in .charon-trash)")))
         }
     }
 
@@ -1634,9 +1672,8 @@ impl<'a> Executor<'a> {
     // ---------------------------------------------------------------- removing
 
     /// Into the trash (`keep`), or deleted for good. Links are removed as links. With the
-    /// item the plan saw (`planned`), it's renamed aside before it goes, and checked once
-    /// more: a version an app saved there at that very moment stays. Returns `false` when
-    /// that happened.
+    /// item the plan saw (`planned`), it's checked once more after it was moved: a version an
+    /// app saved there at that very moment stays. Returns `false` when that happened.
     ///
     /// On APFS a kept file isn't moved into the trash but cloned there (instant, and it takes
     /// no room), and then removed: an app that has it open follows the file itself, not its
@@ -1646,7 +1683,7 @@ impl<'a> Executor<'a> {
         let root = self.shores.root(side);
         let Some(planned) = planned else {
             if keep {
-                let kept = self.trash.put(root, relative).map_err(|e| Error::file(target, e))?;
+                let kept = self.trash.put(root, relative)?;
                 self.touch(&kept);
             } else {
                 Self::remove_item(target).map_err(|e| Error::file(target, e))?;
@@ -1654,68 +1691,77 @@ impl<'a> Executor<'a> {
             return Ok(true);
         };
         if keep && planned.is_file() && self.clones(side) {
-            let kept = self.trash.preserve(root, relative).map_err(|e| Copier::unreadable(target, e, 0))?;
-            self.touch(&kept);
-            let removed = self.remove_checked(side, relative, target, planned);
-            if !matches!(removed, Ok(true)) {
-                let _ = fs::remove_file(&kept);
-            }
-            return removed;
+            return self.remove_after_copying(side, relative, target, planned);
         }
         if keep {
-            let Some(aside) = Self::move_aside(target, root)? else { return Ok(true) };
-            let moved = self.look_fresh(side, &aside);
-            if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
-                self.put_back(side, &aside, target, relative);
-                return moved.map(|_| false);
-            }
-            let kept = self.trash.put_from(&aside, root, relative).map_err(|e| {
-                self.put_back(side, &aside, target, relative);
-                Error::file(target, e)
-            })?;
-            self.touch(&kept);
-            return Ok(true);
+            return self.move_to_trash(side, relative, target, planned);
         }
         self.remove_checked(side, relative, target, planned)
+    }
+
+    /// Moves the file or link at `target` into the trash in one step, if it's still
+    /// `planned`, and checks it there: one that isn't goes back, and this returns `false`.
+    /// When the trash can't take it, nothing was touched: an item renamed and put back would
+    /// carry a new change time, which the next look would take for an edit on its side. Where
+    /// the trash is on another drive than the file (a folder mounted inside the job's), the
+    /// file is copied into the trash instead, and then removed.
+    fn move_to_trash(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+        let kept = match self.trash.put(self.shores.root(side), relative) {
+            Ok(kept) => kept,
+            Err(Error::File { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices && planned.is_file() => {
+                return self.remove_after_copying(side, relative, target, planned);
+            }
+            // Gone already: what the plan wanted.
+            Err(Error::File { source, .. }) if matches!(source.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) && Self::look(target)?.is_none() => {
+                return Ok(true);
+            }
+            Err(e) => return Err(e),
+        };
+        self.touch(&kept);
+        let moved = self.look_fresh(side, &kept);
+        if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
+            // Back to its place, unless something new took the name meanwhile: then it stays
+            // in the trash, never lost and never written over.
+            if let Err(e) = rename_new(&kept, target) {
+                log::info!("couldn't put {} back ({e}); it stays in the trash", target.display());
+            }
+            return moved.map(|_| false);
+        }
+        Ok(true)
+    }
+
+    /// Keeps a copy of the file at `target` in the trash, then removes the file for good if
+    /// it's still `planned` (see `remove_checked`). The copy is a clone on APFS (instant, and
+    /// it takes no room); elsewhere it needs room on the drive.
+    fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
+        self.room_for_kept_copy(side, planned.size, "the removed file")?;
+        let kept = self.trash.preserve(self.shores.root(side), relative)?;
+        self.touch(&kept);
+        let removed = self.remove_checked(side, relative, target, planned);
+        if !matches!(removed, Ok(true)) {
+            Copier::discard(&kept);
+        }
+        removed
     }
 
     /// Removes the file or link at `target` for good, if it's still `planned`: renamed aside,
     /// checked, then removed. `false` when it isn't (it's put back).
     fn remove_checked(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<bool> {
-        Self::make_writable(target);
+        Copier::make_writable(target);
         // Gone already: what the plan wanted.
         let Some(aside) = Self::move_aside(target, self.shores.root(side))? else { return Ok(true) };
         let moved = self.look_fresh(side, &aside);
         if !matches!(&moved, Ok(Some(found)) if Self::same_after_rename(found, planned)) {
-            self.put_back(side, &aside, target, relative);
+            self.put_back(side, &aside, target, relative, None);
             return moved.map(|_| false);
         }
         match Self::remove_item(&aside) {
             Ok(()) => Ok(true),
             Err(e) => {
-                self.put_back(side, &aside, target, relative);
+                self.put_back(side, &aside, target, relative, Some(planned));
                 Err(Error::file(target, e))
             }
         }
-    }
-
-    /// Windows refuses to replace or delete a read-only file or folder (Explorer marks
-    /// customised folders so); the item was checked to be exactly what the plan saw, so its
-    /// read-only mark is lifted first.
-    fn make_writable(path: &Path) {
-        #[cfg(windows)]
-        if let Ok(meta) = fs::symlink_metadata(path) {
-            let mut permissions = meta.permissions();
-            if (meta.is_file() || meta.is_dir()) && permissions.readonly() {
-                #[allow(clippy::permissions_set_readonly_false)]
-                permissions.set_readonly(false);
-                if let Err(e) = fs::set_permissions(path, permissions) {
-                    log::warn!("couldn't lift the read-only mark of {}: {e}", path.display());
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        let _ = path;
     }
 
     /// Removes a folder whose contents were removed by earlier steps. If anything besides
@@ -1740,7 +1786,7 @@ impl<'a> Executor<'a> {
             self.remove(side, item, &root.join(item), true, None)?;
         }
         self.real_folders.borrow_mut().clear();
-        Self::make_writable(target);
+        Copier::make_writable(target);
         match fs::remove_dir(target) {
             Ok(()) => {
                 self.removed_folders.borrow_mut().insert(target.to_path_buf());
@@ -2247,6 +2293,47 @@ mod tests {
         assert!(!executor.replace(Side::Destination, &Copier::partial_path(&target), &target, "notes.txt", &planned).unwrap());
     }
 
+    /// A replacement that fails while the old version is still in its place (an app holds
+    /// the file open, say) leaves no copy of it in the trash: each sync that tries again
+    /// would leave one more.
+    #[test]
+    fn a_replacement_that_fails_leaves_no_copy_of_the_old_version_in_the_trash() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        write(&shores.source.join("report.txt"), "new version", 1_700_000_000);
+        let target = shores.destination.join("report.txt");
+        write(&target, "old", 1_600_000_000);
+        let (from, old) = (seen(&shores.source.join("report.txt")), seen(&target));
+        let observer = |_: &crate::model::Progress| {};
+        let mut meter = ProgressMeter::for_plan(&Plan::default(), &observer);
+        let staged = executor.stage(Side::Destination, "report.txt", &from, Some(&old), false, &mut meter).unwrap().unwrap();
+        // The copy can't take the name (here it's gone, as a drive may refuse the rename).
+        fs::remove_file(&staged.partial).unwrap();
+        assert!(executor.commit(staged).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 0, "no copy of the old version is left in the trash");
+    }
+
+    /// After a failed replacement, only the old version itself counts as still in its place:
+    /// never the new copy that took the name, however much it looks like the old one.
+    #[test]
+    fn only_the_old_version_itself_counts_as_still_in_place() {
+        let (_tmp, shores) = shores();
+        let target = shores.destination.join("vault.img");
+        write(&target, "old", 1_600_000_000);
+        let old = seen(&target);
+        let copy = Copier::partial_path(&target);
+        write(&copy, "new", 1_600_000_000);
+        let copy_identity = Identity::at(&copy);
+        assert!(Executor::still_in_place(&target, &old, copy_identity));
+        fs::rename(&copy, &target).unwrap();
+        assert!(!Executor::still_in_place(&target, &old, copy_identity), "the new copy, with the old one's size and time");
+        fs::remove_file(&target).unwrap();
+        assert!(!Executor::still_in_place(&target, &old, copy_identity));
+    }
+
     /// Something new took the name while the old item was aside: the old item goes into the
     /// trash rather than over it.
     #[test]
@@ -2259,10 +2346,10 @@ mod tests {
         write(&target, "old", 1_600_000_000);
         let aside = Executor::move_aside(&target, &shores.destination).unwrap().unwrap();
         write(&target, "newer", 1_700_000_000);
-        executor.put_back(Side::Destination, &aside, &target, "notes.txt");
+        executor.put_back(Side::Destination, &aside, &target, "notes.txt", None);
         assert_eq!(fs::read_to_string(&target).unwrap(), "newer");
         assert_eq!(names_in(&shores.destination), vec!["notes.txt"]);
-        let trash = Trash::look(&shores.destination, 0, true);
+        let trash = Trash::look(&shores.destination, 0, true, false);
         assert_eq!(trash.bytes, 3, "the old one is in the trash");
     }
 
@@ -2284,8 +2371,82 @@ mod tests {
             let planned = seen(&target);
             assert!(executor.remove(Side::Destination, "plan.txt", &target, keep, Some(&planned)).unwrap());
             assert!(names_in(&shores.destination).is_empty());
-            assert_eq!(Trash::look(&shores.destination, 0, true).bytes > 0, keep, "kept in the trash only with safe deletes");
+            assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes > 0, keep, "kept in the trash only with safe deletes");
         }
+    }
+
+    /// When the trash can't take a file (a link stands where it should be), the removal fails
+    /// before the file is touched: renamed and put back, it would carry a new change time,
+    /// which the next look would take for an edit on its side.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_the_trash_cant_take_leaves_the_file_untouched() {
+        let (tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, shores.destination.join(crate::scan::TRASH_FOLDER)).unwrap();
+        let target = shores.destination.join("photo.jpg");
+        write(&target, "the photo", 1_600_000_000);
+        let planned = seen(&target);
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(executor.remove(Side::Destination, "photo.jpg", &target, true, Some(&planned)).is_err());
+        assert_eq!(seen(&target), planned, "not even renamed: it has the change time the plan saw");
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        assert!(executor.put_back_items.take().is_empty());
+    }
+
+    /// Where the trash is on another drive than the file (a folder mounted inside the job's
+    /// folder), the file can't be moved there: it's copied into the trash, then removed. A
+    /// link to a folder on another drive stands in for the mount, which only root may make.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_file_on_another_drive_than_its_trash_is_copied_there_then_removed() {
+        use std::os::unix::fs::MetadataExt;
+        let (_tmp, shores) = shores();
+        let other_drive = tempfile::tempdir_in("/dev/shm").unwrap();
+        let device = |path: &Path| fs::metadata(path).unwrap().dev();
+        assert_ne!(device(other_drive.path()), device(&shores.destination), "/dev/shm is a drive of its own");
+        std::os::unix::fs::symlink(other_drive.path(), shores.destination.join("photos")).unwrap();
+        let target = shores.destination.join("photos/x.jpg");
+        write(&target, "the photo", 1_600_000_000);
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        assert!(executor.remove(Side::Destination, "photos/x.jpg", &target, true, Some(&seen(&target))).unwrap());
+        assert!(!other_drive.path().join("x.jpg").exists());
+        assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 9, "the trash holds the copy");
+    }
+
+    /// A step that can't finish once it renamed the item aside puts it back as it was. The
+    /// renames moved its change time, so it's noted with the one it has now: the record of the
+    /// last sync follows it (see `Baseline::after_run`), and the next look sees no edit.
+    #[cfg(unix)]
+    #[test]
+    fn an_item_put_back_as_it_was_is_noted_with_its_new_change_time() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let planned = seen(&target);
+        std::thread::sleep(Duration::from_millis(20));
+        // The copy meant to take its place is gone: the old version goes aside, and back.
+        let missing = Copier::partial_path(&target);
+        assert!(executor.replace_aside(Side::Destination, &missing, &target, "notes.txt", &planned).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        let now = seen(&target);
+        assert_ne!(now.changed, planned.changed, "the renames moved its change time");
+        let put_back = PutBack { side: Side::Destination, path: "notes.txt".into(), found: planned, now };
+        assert_eq!(executor.put_back_items.take(), vec![put_back]);
+
+        // One that changed meanwhile goes back too, but isn't noted: that change is real.
+        write(&target, "saved by an app", 1_600_000_100);
+        assert!(!executor.replace_aside(Side::Destination, &missing, &target, "notes.txt", &planned).unwrap());
+        assert!(executor.put_back_items.take().is_empty());
     }
 
     /// Windows: a path of over 300 characters and read-only files and folders are replaced,

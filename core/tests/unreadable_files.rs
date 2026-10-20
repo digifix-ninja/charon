@@ -486,3 +486,66 @@ fn a_copy_that_fails_names_the_file_in_the_row() {
     assert_eq!((run.failed, run.unreadable), (1, 0), "a folder Charon can't write to is no place it can't read");
     assert_eq!(engine.overview().headline(), "1 job needs attention");
 }
+
+/// A trash Charon can't write into is no file it can't read: when the version a copy would
+/// replace can't be kept there, the step fails naming the trash, never the person's file.
+#[test]
+fn a_trash_charon_cannot_write_into_is_never_taken_for_a_file_it_cannot_read() {
+    if !permissions_bite("a_trash_charon_cannot_write_into_is_never_taken_for_a_file_it_cannot_read") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write_at(&a.join("report.txt"), "v1", 0);
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay)).unwrap().job.id;
+    confirm(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join("report.txt")).unwrap(), "v1");
+
+    // Charon may look into b's trash, but not write into it.
+    let trash = b.join(".charon-trash");
+    fs::create_dir_all(&trash).unwrap();
+    chmod(&trash, 0o555);
+    write_at(&a.join("report.txt"), "v2, edited", 60);
+    let review = confirm(&engine, &id);
+    chmod(&trash, 0o755);
+    assert_eq!(review.tally.destination.replaced, 1);
+    assert_eq!(fs::read_to_string(b.join("report.txt")).unwrap(), "v1", "never replaced without keeping the old version");
+    let run = engine.job(&id).unwrap().job.last_run.unwrap();
+    assert_eq!((run.failed, run.unreadable), (1, 0));
+    let line = engine.log(&id, 20).into_iter().find(|line| line.text.starts_with("report.txt: ")).expect("the Activity says why");
+    assert!(line.text.starts_with(&format!("report.txt: Couldn't read or write {}", trash.display())), "{}", line.text);
+}
+
+/// The same for a removal: when the trash won't take the file, the step fails naming the
+/// trash, and the file stays where it is.
+#[test]
+fn a_removal_the_trash_refuses_names_the_trash() {
+    if !permissions_bite("a_removal_the_trash_refuses_names_the_trash") {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    write_at(&a.join("report.txt"), "v1", 0);
+    write_at(&a.join("notes.txt"), "stays", 0);
+    fs::create_dir_all(&b).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay)).unwrap().job.id;
+    confirm(&engine, &id);
+    assert_eq!(fs::read_to_string(b.join("report.txt")).unwrap(), "v1");
+
+    // Charon may look into b's trash, but not write into it.
+    let trash = b.join(".charon-trash");
+    fs::create_dir_all(&trash).unwrap();
+    chmod(&trash, 0o555);
+    fs::remove_file(a.join("report.txt")).unwrap();
+    let review = confirm(&engine, &id);
+    chmod(&trash, 0o755);
+    assert_eq!(review.tally.destination.removed, 1);
+    assert_eq!(fs::read_to_string(b.join("report.txt")).unwrap(), "v1", "never removed without keeping it in the trash");
+    let run = engine.job(&id).unwrap().job.last_run.unwrap();
+    assert_eq!((run.failed, run.unreadable), (1, 0));
+    let line = engine.log(&id, 20).into_iter().find(|line| line.text.starts_with("report.txt: ")).expect("the Activity says why");
+    assert!(line.text.starts_with(&format!("report.txt: Couldn't read or write {}", trash.display())), "{}", line.text);
+}

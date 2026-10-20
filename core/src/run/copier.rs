@@ -28,6 +28,11 @@ const CLOUD_SINCE_SCAN: &str = "only in the cloud since the scan (not downloaded
 /// On a drive that keeps times in steps of a second or more, a file saved this recently
 /// may still be being written within the same step, where its time can't show it.
 const STILL_BEING_WRITTEN_MS: i64 = 3_000;
+/// A network drive's clock may be a few minutes ahead of the computer's, so a file saved
+/// there a moment ago can carry a time up to this far ahead. A time further ahead is no save
+/// going on: a camera with its clock set wrong, or a FAT stick written in a time zone further
+/// east.
+const CLOCK_AHEAD_MS: i64 = 5 * 60 * 1000;
 
 /// A finished copy under its temporary name, waiting to take the real one.
 #[derive(Debug)]
@@ -211,9 +216,33 @@ impl<'a> Copier<'a> {
         })
     }
 
-    /// Removes an unfinished copy.
-    pub fn discard(partial: &Path) {
-        let _ = fs::remove_file(partial);
+    /// Removes a copy Charon made: an unfinished one, or one it no longer needs in the trash.
+    /// A copy of a read-only file is read-only too, and under Windows FAT and exFAT drives
+    /// won't remove it with that mark, so it's lifted first.
+    pub fn discard(copy: &Path) {
+        Self::make_writable(copy);
+        let _ = fs::remove_file(copy);
+    }
+
+    /// Lifts the read-only mark of a file or folder about to be replaced or removed: Windows
+    /// refuses to replace or delete an item with it (Explorer marks customised folders so).
+    /// Only for Charon's own copies and trash, and for items checked to be exactly what the
+    /// plan saw.
+    /// Read-only marks are Windows' own: elsewhere nothing is done.
+    pub(crate) fn make_writable(path: &Path) {
+        #[cfg(windows)]
+        if let Ok(meta) = fs::symlink_metadata(path) {
+            let mut permissions = meta.permissions();
+            if (meta.is_file() || meta.is_dir()) && permissions.readonly() {
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                if let Err(e) = fs::set_permissions(path, permissions) {
+                    log::warn!("couldn't lift the read-only mark of {}: {e}", path.display());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = path;
     }
 
     /// A fresh temporary name in the folder of `to` (see `partial_in`).
@@ -261,6 +290,12 @@ impl<'a> Copier<'a> {
         Self::temporary(to, top, |partial| OpenOptions::new().write(true).create_new(true).open(partial)).map_err(|(partial, e)| Error::file(partial, e))
     }
 
+    /// Whether a file last modified at `modified` was saved so recently, as of `now`, that on
+    /// a drive with coarse times it may still be being written.
+    fn saved_a_moment_ago(modified: i64, now: i64) -> bool {
+        modified > now - STILL_BEING_WRITTEN_MS && modified <= now + CLOCK_AHEAD_MS
+    }
+
     /// Writes the copy and gives it the original's details. Returns the details it couldn't
     /// take along.
     fn write_partial(&self, from: &Path, partial: &Path, mut writer: File, expected: &Entry, on_bytes: &mut dyn FnMut(u64)) -> Result<BTreeSet<&'static str>> {
@@ -270,7 +305,7 @@ impl<'a> Copier<'a> {
         if !before.is_file() || !Entry::file(before.len(), Scanner::modified_ms(&before)).changed_at(changed).unchanged(expected) {
             return Err(Error::Changed("changed since the scan".into()));
         }
-        if self.coarse_source && Scanner::modified_ms(&before) > Scanner::millis(std::time::SystemTime::now()) - STILL_BEING_WRITTEN_MS {
+        if self.coarse_source && Self::saved_a_moment_ago(Scanner::modified_ms(&before), Scanner::millis(std::time::SystemTime::now())) {
             return Err(Error::Changed("saved a moment ago and may still be being written, so it waits for the next sync".into()));
         }
         let mut buffer = vec![0u8; CHUNK];
@@ -609,7 +644,7 @@ mod tests {
         assert!(matches!(&result, Err(Error::Changed(why)) if why.contains("only in the cloud")), "{result:?}");
         // Nor is it downloaded to keep a copy of it in the trash.
         let trash = crate::run::Trash::for_run(chrono::Local::now());
-        assert!(trash.preserve(tmp.path(), "a.txt").is_err_and(|e| Contents::only_in_the_cloud(&e)));
+        assert!(matches!(trash.preserve(tmp.path(), "a.txt"), Err(Error::Changed(why)) if why.contains("only in the cloud")));
     }
 
     #[test]
@@ -622,6 +657,44 @@ mod tests {
         assert!(matches!(result, Err(Error::Changed(_))));
         filetime::set_file_mtime(&from, filetime::FileTime::from_unix_time(1_600_000_000, 0)).unwrap();
         assert!(Copier::new(&never).coarse_source_times(true).file(&from, &to, &entry_of(&from), &mut |_| {}).is_ok());
+    }
+
+    /// A network drive's clock may be a little ahead, so a file dated a moment ahead waits
+    /// too. One dated far ahead (a camera with its clock set wrong) is no save going on: it's
+    /// copied, rather than waiting on every sync until the computer's clock catches up.
+    #[test]
+    fn a_file_dated_far_ahead_on_a_coarse_drive_is_copied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let from = tmp.path().join("IMG_0001.JPG");
+        fs::write(&from, "photo").unwrap();
+        let never = AtomicBool::new(false);
+        let copy = |ahead: std::time::Duration| {
+            filetime::set_file_mtime(&from, filetime::FileTime::from_system_time(std::time::SystemTime::now() + ahead)).unwrap();
+            Copier::new(&never).coarse_source_times(true).file(&from, &tmp.path().join("copy.jpg"), &entry_of(&from), &mut |_| {})
+        };
+        assert!(matches!(copy(std::time::Duration::from_secs(30)), Err(Error::Changed(_))));
+        let far_ahead = copy(std::time::Duration::from_secs(40 * 24 * 60 * 60)).unwrap();
+        assert_eq!(fs::read_to_string(&far_ahead.partial).unwrap(), "photo");
+    }
+
+    /// Windows: a copy of a read-only file is read-only too, and is still removed when it's
+    /// no longer needed: its mark is lifted first, since FAT and exFAT drives won't remove a
+    /// file that has one. (NTFS removes it anyway, so a second name of the same file shows
+    /// whether the mark was lifted.)
+    #[cfg(windows)]
+    #[test]
+    fn a_read_only_copy_is_still_discarded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = Copier::partial_in(tmp.path());
+        let second_name = tmp.path().join("second name");
+        fs::write(&copy, "half").unwrap();
+        fs::hard_link(&copy, &second_name).unwrap();
+        let mut permissions = fs::metadata(&copy).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&copy, permissions).unwrap();
+        Copier::discard(&copy);
+        assert!(!copy.exists());
+        assert!(!fs::metadata(&second_name).unwrap().permissions().readonly(), "the mark was lifted before the copy was removed");
     }
 
     #[test]
