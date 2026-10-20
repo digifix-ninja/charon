@@ -307,6 +307,7 @@ export class DemoBackend {
     this.checked = new Set();   // ids of the jobs looked at since the demo started
     this.timers = new Map();    // id → a running sync's timer
     this.logs = new Map();      // id → log lines, newest first
+    this.nextRuns = new Map();  // id → when its schedule comes next (sent only while it isn't paused)
     this.reviewCount = 0;
     this.refuseOnce = false;
     this.noticeSeen = false;
@@ -355,6 +356,7 @@ export class DemoBackend {
     ];
     this.jobs = jobs;
     for (const j of jobs) {
+      if (j.nextRun) this.nextRuns.set(j.id, j.nextRun);
       this.worlds.set(j.id, WORLDS[j.id]());
       this.logs.set(j.id, this.startingLog(j));
       this.settle(j);
@@ -435,9 +437,12 @@ export class DemoBackend {
     j.notSyncedCount = places.length;
     j.unreadableCount = j.unreadable.length;
     const failedRun = j.lastRun && !j.lastRun.cancelled && (j.lastRun.error || j.lastRun.failed > 0);
+    // "Pause everything" pauses each job without changing its own pause, as in Rust.
+    const paused = j.paused || this.settings.pausedAll;
+    j.nextRun = paused ? null : this.nextRuns.get(j.id) ?? null;
     j.status = this.timers.has(j.id) ? "syncing"
       : !this.online(j) ? "offline"
-      : j.paused ? "paused"
+      : paused ? "paused"
       : j.conflicts.length ? "conflict"
       : failedRun ? "error"
       : j.waiting ? "review"
@@ -900,6 +905,7 @@ export class DemoBackend {
       case "set_all_paused":
         this.settings = { ...this.settings, pausedAll: args.paused };
         this.emit("settings", this.settings);
+        for (const j of this.jobs) this.publish(j);
         this.emit("overview", this.overview());
         return null;
       case "set_settings":

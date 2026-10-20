@@ -18,8 +18,9 @@ const PLACE_KINDS = {
 };
 
 export class JobRow {
-  /** The whole row. */
-  static render(job, { open, tab, log, index, scan, trashDays }) {
+  /** The whole row. `pausedAll` is "Pause everything", which pauses the job without changing its own pause. */
+  static render(job, { open, tab, log, index, scan, trashDays, pausedAll = false }) {
+    const paused = job.paused || pausedAll;
     return html`
       <article class="job ${open ? "open" : ""}" data-id="${job.id}" data-status="${job.status}" style="--i: ${index}">
         <div class="edge"></div>
@@ -39,14 +40,14 @@ export class JobRow {
               <span class="arrow">${Format.arrow(job.mode)}</span>
               ${raw(JobRow.shore(job.destination, job.destinationVolume, job.destinationOnline))}
             </div>
-            ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job))}
+            ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job, paused))}
             ${raw(JobRow.flags(job))}
             ${raw(JobRow.waitsFor(job))}
             ${raw(job.stale ? html`<div class="stale"><span class="ico">${raw(Icons.warn)}</span>${job.stale}</div>` : "")}
           </div>
           ${raw(JobRow.actions(job))}
         </div>
-        <div class="detail"><div class="inner">${raw(open ? JobRow.detail(job, tab, log, trashDays) : "")}</div></div>
+        <div class="detail"><div class="inner">${raw(open ? JobRow.detail(job, tab, log, trashDays, paused) : "")}</div></div>
       </article>`;
   }
 
@@ -85,8 +86,8 @@ export class JobRow {
       </div>`;
   }
 
-  /** The one-line summary under the shores. */
-  static info(job) {
+  /** The one-line summary under the shores. A paused job, paused by itself or with everything, has no schedule to show. */
+  static info(job, paused = job.paused) {
     const parts = [];
     const synced = job.lastSynced ? `Synced ${Format.ago(job.lastSynced)}` : "Never synced";
     switch (job.status) {
@@ -122,7 +123,7 @@ export class JobRow {
           parts.push(`last run carried ${Format.plural(job.lastRun.copied, "file")}${job.lastRun.deleted ? `, removed ${job.lastRun.deleted}` : ""}`);
         }
     }
-    if (!job.paused && job.status !== "offline") parts.push(Dom.escape(Format.schedule(job)));
+    if (!paused && job.status !== "offline") parts.push(Dom.escape(Format.schedule(job)));
     return `<div class="info">${parts.join('<span class="sep">·</span>')}</div>`;
   }
 
@@ -181,7 +182,7 @@ export class JobRow {
 
   // ---------------------------------------------------------------- detail
 
-  static detail(job, tab, log, trashDays) {
+  static detail(job, tab, log, trashDays, paused = job.paused) {
     const tabs = [["activity", "Activity"], ["details", "Details"]];
     const missing = job.notSyncedCount || job.notSynced?.length || 0;
     const unread = job.unreadableCount || job.unreadable?.length || 0;
@@ -191,7 +192,7 @@ export class JobRow {
     const body = tab === "conflicts" && job.conflicts.length ? JobRow.conflicts(job)
       : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job, unread)
       : tab === "not-synced" && job.notSynced?.length ? JobRow.notSynced(job, missing)
-      : tab === "details" ? JobRow.facts(job, trashDays)
+      : tab === "details" ? JobRow.facts(job, trashDays, paused)
       : JobRow.log(log);
     return html`<div class="panel">
         <div class="tabs">${tabs.map(([key, label, badge]) => raw(html`<button data-action="tab" data-tab="${key}" class="${tab === key ? "on" : ""}">${label}${raw(badge ? html`<span class="badge ${key}">${badge}</span>` : "")}</button>`))}</div>
@@ -205,7 +206,7 @@ export class JobRow {
     return `<div class="log">${lines.map(l => html`<div class="line ${l.level}"><span class="time">${Format.stamp(l.time)}</span><span class="text">${l.text}</span></div>`).join("")}</div>`;
   }
 
-  static facts(job, trashDays) {
+  static facts(job, trashDays, paused = job.paused) {
     const fact = (k, v, wide = false) => html`<div class="fact ${wide ? "wide" : ""}"><div class="k">${k}</div><div class="v">${raw(v)}</div></div>`;
     const esc = Dom.escape;
     const folder = (path, volume) => `<code>${esc(path)}</code>${volume ? ` <span class="faint">on ${esc(Format.volume(volume))}</span>` : ""}`;
@@ -222,7 +223,7 @@ export class JobRow {
       ${fact("Destination", folder(job.destination, job.destinationVolume), true)}
       ${fact("Excluded", job.excludes.length ? job.excludes.map(e => `<code>${esc(e)}</code>`).join(", ") : "Nothing", true)}
       ${fact("Full automation", job.fullAutomation ? `<span class="bad">On</span>${job.needsReview ? esc(", but the next sync waits for your OK") : ""}` : "Off: every sync waits for your OK")}
-      ${fact("Next", esc(job.nextRun ? `${job.runsByItself ? "Sync" : "Look"} ${Format.upcoming(job.nextRun)}` : job.paused ? "Paused" : "When triggered"))}
+      ${fact("Next", esc(job.nextRun ? `${job.runsByItself ? "Sync" : "Look"} ${Format.upcoming(job.nextRun)}` : paused ? "Paused" : "When triggered"))}
       ${fact("Last run", esc(job.lastRun ? `${Format.ago(job.lastRun.finishedAt)}: ${Format.run(job.lastRun)}` : "Never"), true)}
     </div>`;
   }
