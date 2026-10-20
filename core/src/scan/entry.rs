@@ -465,7 +465,13 @@ impl Snapshot {
         }
         let frozen = std::mem::take(&mut self.facts.frozen);
         for (key, reason) in frozen {
-            self.facts.frozen.entry(Keys::fold(&key)).or_insert(reason);
+            let folded = Keys::fold(&key);
+            // What's left alone is named in its note as spelled on disk too (a file only in
+            // the cloud, as its placeholder spells it).
+            if folded != key {
+                self.facts.spellings.entry(folded.clone()).or_insert(key);
+            }
+            self.facts.frozen.entry(folded).or_insert(reason);
         }
         self.facts.occupied = std::mem::take(&mut self.facts.occupied).iter().map(|key| Keys::fold(key)).collect();
         self.facts.clashes = std::mem::take(&mut self.facts.clashes).iter().map(|key| Keys::fold(key)).collect();
@@ -622,6 +628,25 @@ mod tests {
         assert!(s.frozen("readme.md").is_some());
         assert!(s.is_clash("readme.md"));
         assert_eq!(s.key_for("PHOTOS/a.JPG"), "photos/a.jpg");
+    }
+
+    /// Where a drive ignores case, a note about something left alone still names it as it's
+    /// spelled on disk, not by its folded key.
+    #[test]
+    fn folding_keeps_the_spelling_of_what_is_left_alone() {
+        let mut s = Snapshot::new();
+        s.insert("Docs", Entry::dir());
+        s.freeze("Docs/Report.pdf", "it's only in the cloud");
+        s.freeze("Mounted", "another drive is mounted here");
+        s.insert("Notes.txt", Entry::file(1, 1));
+        s.freeze("Notes.txt", "can't be read");
+        s.fold();
+        assert!(s.frozen("docs/report.pdf").is_some());
+        assert_eq!(s.spelling("docs/report.pdf"), "Docs/Report.pdf");
+        assert_eq!(s.spelling("mounted"), "Mounted");
+        assert_eq!(s.spelling("notes.txt"), "Notes.txt");
+        let named: Vec<String> = s.frozen_places().map(|(key, _)| s.spelling(key).to_string()).collect();
+        assert_eq!(named, vec!["Docs/Report.pdf", "Mounted", "Notes.txt"]);
     }
 
     #[test]
