@@ -1239,7 +1239,7 @@ fn changes_made_during_a_sync_have_the_folders_looked_at_once_it_is_done() {
     let_progress_throttle_pass();
     confirm(engine, &id);
     assert!(rig.hook_fired());
-    assert_eq!(*heard.lock().unwrap(), vec![false, false], "kept for the sync's end");
+    assert_eq!(*heard.lock().unwrap(), vec![false, true], "another item changing counts, and is kept for the sync's end");
     assert!(engine.check_due(&id, Duration::from_secs(15 * 60)), "the folders are looked at again at once");
 
     // Right after it, the sync's own items are still told apart; anything else counts.

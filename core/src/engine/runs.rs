@@ -1233,8 +1233,10 @@ impl Engine {
 
     /// Whether a change at `path` in the job's folders, heard while the job syncs or a
     /// moment after, counts as a change now (see `note_change`). Most such changes are the
-    /// sync's own writes. A change anywhere else is the person's, or another app's: during
-    /// the sync it's kept for its end, which then has the folders looked at again at once.
+    /// sync's own writes, which don't. A change anywhere else is the person's, or another
+    /// app's, and counts: the folders aren't quiet, so a job that syncs on change waits for
+    /// them to settle. During the sync it's also kept for its end, which then has the folders
+    /// looked at again at once.
     pub fn note_change_while_syncing(&self, id: &JobId, path: &Path) -> bool {
         let Ok(job) = self.stored_job(id) else { return false };
         let key = match self.change_at(&job, path) {
@@ -1248,9 +1250,9 @@ impl Engine {
                 Some(own) if own.is_own(&key) => false,
                 Some(own) if running => {
                     own.note_other(&key);
-                    false
+                    true
                 }
-                _ => !running,
+                _ => true,
             }
         });
         counts && self.note_change(id, path)
@@ -1378,6 +1380,21 @@ impl Engine {
     pub(crate) fn pretend_the_last_sync_ended(&self, id: &JobId, at: Moment) {
         self.change_job(id, |job| job.last_synced = Some(at.wall)).unwrap();
         self.change_runtime(id, |rt| rt.finished_at = Some(at.own));
+    }
+
+    /// Begins a run nobody looks at, as a trigger starts one, and returns what looks at the
+    /// folders and carries the run out, on the caller's thread: until it's called, the run
+    /// is still looking and doesn't know its plan.
+    pub(crate) fn begin_automatic_run(&self, id: &JobId, reason: &str) -> impl FnOnce() + '_ {
+        let crossing = Crossing::unattended(reason, false);
+        let (job, cancel) = self.begin_run(id, &crossing, |_, _| Ok(())).unwrap();
+        move || {
+            let mut survey = self.survey(&job, &cancel, Purpose::Automatic).unwrap();
+            assert!(survey.holds.is_empty(), "{:?}", survey.holds);
+            self.hold_back_recent_removals(&job, &mut survey, Moment::now());
+            let claim = self.claim_folders(&job, &survey).unwrap();
+            self.cross(&job, &survey, &cancel, &crossing, claim);
+        }
     }
 }
 
