@@ -27,7 +27,7 @@ use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_partial, Keys, Refusal, Scanner, TRASH_FOLDER};
+use crate::scan::{is_clutter, is_partial, Keys, Refusal, Scanner, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -358,7 +358,8 @@ impl Trash {
                 Ok(meta) => {
                     contents.items += 1;
                     contents.bytes += meta.len();
-                    if meta.is_dir() || meta.len() != size || Scanner::modified_ms(&meta) != modified {
+                    let changed = meta.len() != size || Scanner::modified_ms(&meta) != modified;
+                    if meta.is_dir() || (changed && !Self::is_nobodys_work(Keys::name(path))) {
                         contents.revived.push(path.clone());
                     }
                 }
@@ -400,8 +401,7 @@ impl Trash {
             };
             contents.items += 1;
             contents.bytes += meta.len();
-            // Charon's own half-written copies never count as someone's work.
-            if is_partial(&inner.file_name().to_string_lossy()) {
+            if Self::is_nobodys_work(&inner.file_name().to_string_lossy()) {
                 continue;
             }
             let modified = Scanner::modified_ms(&meta);
@@ -417,6 +417,14 @@ impl Trash {
             }
         }
         contents
+    }
+
+    /// Whether a file named `name` in the trash never holds someone's work, whatever its
+    /// time: one of Charon's own half-written copies, or a file the system writes into a
+    /// folder by itself when the person looks into it (Finder's `.DS_Store`, Explorer's
+    /// `Thumbs.db`). It goes along with its dated folder.
+    fn is_nobodys_work(name: &str) -> bool {
+        is_partial(name) || is_clutter(name)
     }
 
     /// Permanently removes the dated folders `names` from `root`'s trash (those a review
@@ -617,6 +625,44 @@ mod tests {
         assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{folder}/report.pages")]);
         Trash::sweep(tmp.path(), std::slice::from_ref(&folder));
         assert_eq!(fs::read_to_string(&kept).unwrap(), "the report, with this week's work");
+    }
+
+    /// Finder writes a `.DS_Store` into every folder the person opens (Explorer a
+    /// `Thumbs.db`), also a dated folder of the trash they look into for a removed file.
+    /// That's nobody's work: the folder is still cleared out when its time comes.
+    #[test]
+    fn what_the_system_writes_into_the_trash_is_nobodys_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        fs::write(tmp.path().join("old.txt"), "x").unwrap();
+        set_time(&tmp.path().join("old.txt"), days_ago(41));
+        fs::create_dir_all(tmp.path().join("Docs")).unwrap();
+        fs::write(tmp.path().join("Docs/.DS_Store"), "view").unwrap();
+        set_time(&tmp.path().join("Docs/.DS_Store"), days_ago(41));
+        let kept = trash.put(tmp.path(), "old.txt").unwrap();
+        let listed = trash.put(tmp.path(), "Docs/.DS_Store").unwrap();
+        trash.write_lists();
+        let dated = kept.parent().unwrap();
+        let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
+
+        // Opened in Finder and Explorer days later.
+        for written in [dated.join(".DS_Store"), dated.join("Docs/Thumbs.db"), dated.join("Docs/._old.txt"), listed] {
+            fs::write(&written, "the system's own").unwrap();
+            set_time(&written, days_ago(2));
+        }
+        for thorough in [false, true] {
+            let look = Trash::look(tmp.path(), 30, thorough);
+            assert!(look.revived.is_empty(), "{:?}", look.revived);
+            assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![folder.as_str()]);
+        }
+        let young = Trash::for_run(days_ago(1));
+        fs::write(tmp.path().join("Docs/.DS_Store"), "view").unwrap();
+        let listed = young.put(tmp.path(), "Docs/.DS_Store").unwrap();
+        young.write_lists();
+        fs::write(&listed, "the view, changed").unwrap();
+        assert!(Trash::look(tmp.path(), 30, true).revived.is_empty(), "a listed file of the system's changed by the system");
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder));
+        assert!(!dated.exists());
     }
 
     #[test]
