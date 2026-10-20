@@ -62,14 +62,18 @@ directories:
   again.
 - `slow_damage.rs`: full automation and damage that spreads slowly: the long count of what
   automatic runs removed or replaced, and a trash that only the person empties.
-- `run_order.rs`: the order a run carries out its steps in, and the removals it holds back when
-  a copy fails or a file changes during the run.
+- `run_order.rs`: the order a run carries out its steps in, the removals it holds back when a
+  copy fails or a file changes during the run, and how app libraries and databases land.
 - `drive_comebacks.rs`: drives that come back during a run without its last changes, which must
   never be recorded as done (see *The last look* below).
 - `batch_h.rs`, `long_paths.rs` and `drive_links.rs`: names, links, paths near a drive's limit,
   and what a drive refuses.
 - `batch_i.rs` and `case_probes.rs`: the scanner, network shares, cloud folders, and asking a
   drive how it treats upper and lower case.
+- `client_settings.rs`: which folders a Nextcloud or ownCloud client syncs, by the client's own
+  settings on this computer and by its journal in a folder they don't list. It sets the
+  variables that lead Charon to those settings, so it's a single test that goes through each
+  case in turn.
 - `names_left_alone.rs`, `items_left_alone.rs` and `leftover_claims.rs`: names Charon leaves
   alone stay alone on both sides, in any case, and its own leftovers are never taken for the
   person's files.
@@ -102,6 +106,11 @@ answers, and mounting one takes `CAP_SYS_ADMIN` and `/dev/fuse`: run it as root 
 command above keeps that right). Without them it skips the same way, and with
 `CHARON_REQUIRE_PERMISSION_TESTS=1` it fails instead.
 
+One test in `safety_regressions.rs` runs on Linux only too: it mounts a folder of the same drive
+inside a job's folder (a bind mount) to check that what goes into the trash from there gets
+there, and mounting takes `CAP_SYS_ADMIN` (the `capsh` command above keeps it). Without it the
+test skips the same way, and with `CHARON_REQUIRE_PERMISSION_TESTS=1` it fails instead.
+
 The tests about upper and lower case in `names_left_alone.rs` need a folder on a drive that
 ignores case for every letter. The temporary folder is one on macOS and Windows; on Linux, set
 `CHARON_CASE_INSENSITIVE_FOLDER` to a folder on such a drive (a case-folding ext4 folder, say).
@@ -121,7 +130,8 @@ one does, so keep it in step when you add either. From the browser console:
 
 - `charonDemo.syncAll()`: the tray's *Sync All…*
 - `charonDemo.showWaiting()`: the tray's *Review Waiting Jobs…*
-- `charonDemo.quit()`: the tray's *Quit Charon* while jobs wait for an OK
+- `charonDemo.quit()`: the tray's *Quit Charon* while jobs wait for an OK or have files to
+  compare
 - `charonDemo.quitting()`: Charon quits while a sync runs, and stops it safely first
 - `charonDemo.change("projects")`: something changes in a job's folders, so its open list goes
   stale
@@ -255,13 +265,27 @@ each get the drive's own answer, and every look passes over such names.) It:
    (`scan/cloud.rs`): `.Name.icloud` from iCloud Drive before macOS 14, in iCloud Drive's
    folders on this Mac (`~/Library/Mobile Documents`, `~/Desktop` and `~/Documents`, by their
    real paths), and `Name.nextcloud` or `Name.owncloud` in a folder a Nextcloud or ownCloud
-   client keeps its journal (`.sync_*.db` or `._sync_*.db`) in or above. The placeholder is
-   never synced or removed, and where the receiving side's service keeps files, nothing named
-   like its placeholder is made there. Anywhere else a file named so is an ordinary file; where
-   Charon can't tell, it is taken for a placeholder. An item named exactly `.charon` or
-   `.charon-trash` is Charon's only when it's a folder holding nothing but Charon's own files
-   and system clutter (`Scanner::looks_like_charons`); otherwise it's the person's, and is left
-   out with a note.
+   client syncs: one the clients' settings on this computer list, by its real path
+   (`scan/clients.rs`: the `localPath` of each folder in `nextcloud.cfg` or `owncloud.cfg`, in
+   the client's folder in `$XDG_CONFIG_HOME` or `~/.config` on Linux, or in
+   `~/.var/app/<id>/config` for a Flatpak, in `~/Library/Preferences` on macOS, and in
+   `%APPDATA%` or `%LOCALAPPDATA%` on Windows), or one with a client's journal (`.sync_<hex>.db`
+   or `._sync_<hex>.db`) in it or above it, whatever the settings say: a client on another
+   computer may sync it. A copy of a synced folder holds a copy of the journal too, so where
+   only a journal makes a folder count, the note about each file left alone there names the
+   journal: if no client on any computer syncs that folder, the journal and the placeholder are
+   old copies, for the person to remove. The placeholder is never synced or removed, and where
+   the receiving side's service keeps files, nothing named like its placeholder is made there.
+   Anywhere else a file named so is an ordinary file; where Charon can't look (no home folder,
+   or a folder's real path or a folder that may hold a journal can't be read), it is taken for a
+   placeholder, and settings that can't be read leave it to the journals to tell. A client's
+   journal file itself (`.sync_<hex>.db`, `._sync_<hex>.db` or the older `.csync_journal.db`,
+   with its `-wal`, `-shm` or `-journal`) is the client's own: it's left out without a note at
+   any depth, before the exclude patterns are matched, and keeps its folder from being removed,
+   and an item of that name on the other side is left alone too, with a note. An item named
+   exactly `.charon` or `.charon-trash` is Charon's only when it's a folder holding nothing but
+   Charon's own files and system clutter (`Scanner::looks_like_charons`); otherwise it's the
+   person's, and is left out with a note.
 3. Turns every path into a *key* (`scan/keys.rs`): relative to the job's folder, `/`-separated
    and in Unicode NFC, and folded when either drive ignores case (each letter to the lower case
    of its upper case, so ς and σ, or µ and μ, are one letter, and the dotless ı meets i, as it
@@ -281,9 +305,19 @@ each get the drive's own answer, and every look passes over such names.) It:
    except where the survey's `Guide` says otherwise: a pair found to differ before and left for
    the person (`Memory::unsettled`), and, when the comparison is a fresh one, a pair that the
    record Charon doesn't trust shows changed since on either side, are read all the same. A
-   pair whose contents can't be read counts as differing for that look. A background look
-   reads at most 1 GB (`CHECK_COMPARE_BYTES`) and counts what it left unread as differing,
-   never as in sync, for that look only; lists and runs read everything.
+   pair whose contents can't be read counts as differing for that look. A pair read before in
+   this session isn't read again while both sides are exactly as they were then and both folders
+   carry the markers they carried then (`Reads`, in the job's live state; a sync of Charon's own
+   carries them on to the markers it writes). A background look reads at most 1 GB
+   (`CHECK_COMPARE_BYTES`); lists and runs read everything. Past that, a background look goes by
+   what full reads found before: identical, while both sides are exactly as they were then
+   (`store/same_contents.rs`, kept across restarts while both folders carry the markers they
+   carried then), or different and left for the person. Any other pair is *not compared yet*
+   (`Survey::uncompared`, `Look::uncompared`): the plan leaves it as it is, and the job is never
+   *In sync* while there are any. Its row says "1 file not compared yet", and shows *Files to
+   compare* when that's all the look found. When a folder's marker changed while the look read
+   (another drive under the same name), what it read isn't kept for later looks
+   (`still_marked`).
 6. Plans (`plan::plan_for`), then runs the guard and the other checks. Each check can add a
    **warning** to the list, a **hold** that stops a run nobody looks at, and the need for a
    **tick** before the list can be confirmed.
@@ -365,7 +399,9 @@ exFAT, a whole-hour shift of a file of the same size doesn't count as a change.
   an ordinary file), and a database only a file with a journal file next to it; a database's
   unit is all its files. When files of one unit changed on both sides (any change counts here,
   details too), the whole unit becomes one conflict, and none of its files moves. A run carries
-  a unit's files together too (see *Carrying out a list*).
+  a unit's files together too; only a file new to a library may land on its own while the rest
+  waits, and a library the receiving side doesn't have yet is copied file by file (see *Carrying
+  out a list*).
 - A folder is only removed when everything inside it is removed by the same plan.
 
 Without a memory Charon can trust, **nothing is removed**: an item on one side only is copied to
@@ -451,9 +487,12 @@ jobs and other Charons* below):
 Lists also warn about places that couldn't be read, items that can't be synced, conflicts
 settled by *Newest wins*, copies of a job's `.charon` folder (which can be deleted), symbolic
 links, the trash growing large, and app libraries and databases the sync changes (close the app
-first). That last one is a warning only: it doesn't hold an automatic run, so with *Full
-automation* a library or database may be copied while its app is writing to it. Leave such
-folders out of jobs with full automation, or quit the app before the sync.
+first). That last one is a warning only: it doesn't hold an automatic run. A library or database
+the sync changes waits for the next sync when something of it changes while its files are
+copied, but one the receiving side doesn't have yet is copied file by file (a database in it
+still goes with its journals), so with *Full automation* it may arrive with some files from
+before its app wrote and some from after. Leave such folders out of jobs with full automation,
+or quit the app before the sync.
 
 ### Lists and confirming
 
@@ -588,29 +627,34 @@ folder's drive; if the drive went away, the run stops there.
   kept in `.charon-trash`, never written over.
 - **Keeping the old version:** with safe deletes, always in two-way jobs, and always when a copy
   settles a conflict, a file being replaced is first *copied* into the trash and then replaced
-  in place (a link is moved into the trash). An app that has the file open follows the file, not
-  its name: had the old version been moved into the trash, the app could go on saving the
-  person's work there. Replaced in place, the app finds the new version where the file was. On
-  APFS that copy is a clone, which takes no time and no room. On macOS the copy doesn't take
-  the file's Finder lock along (`Trash::unlock`), so it can be cleared out later. When the
-  replacement then fails and the old version is still in its place (`still_in_place`), the copy
-  is discarded, so a sync that keeps failing on a file an app holds open doesn't fill the
-  trash. An item replaced by one of another kind (a file by a folder) is removed right before
-  the new item lands, as a removal (below).
+  in place (a link is moved into the trash, if it's still the one the plan saw: one removed or
+  changed a moment before is left as it is, and the step is skipped). An app that has the file
+  open follows the file, not its name: had the old version been moved into the trash, the app
+  could go on saving the person's work there. Replaced in place, the app finds the new version
+  where the file was. On APFS that copy is a clone, which takes no time and no room. On macOS
+  the copy doesn't take the file's Finder lock along (`Trash::unlock`), so it can be cleared out
+  later. When the replacement then fails and the old version is still in its place
+  (`still_in_place`), the copy is discarded, so a sync that keeps failing on a file an app holds
+  open doesn't fill the trash. An item replaced by one of another kind (a file by a folder) is
+  removed right before the new item lands, as a removal (below).
 - **Removals** (`Executor::remove`): with safe deletes, and always when it makes room for an
   item of another kind, a file or link is moved into `.charon-trash` in one step and checked
   there; if it isn't what the plan saw (an app saved a new version at that very moment), it goes
-  back to its place (`move_to_trash`). When the trash can't take it (a link or a file in its
+  back to its place (`move_to_trash`). The same goes for a replaced link, the system clutter
+  left in a removed folder, and the leftovers of an interrupted sync: whatever goes into the
+  trash under its own name. When the trash can't take it (a link or a file in its
   place, no permission), the item isn't touched and the step fails with an error that names
-  the place in the trash. Where the trash is on another drive than the file (a drive mounted
-  inside the job's folder), the file is copied into the trash and then removed, which needs room
-  there. On APFS a file kept that way is cloned into the trash and then removed. Without safe
-  deletes, a file or link is renamed aside, checked, and removed for good (`remove_checked`).
-  An item Charon renamed and had to put back carries a new change time; the memory takes that
-  time for it (`PutBack`, `Baseline::follow`), so the next look doesn't take the rename for an
-  edit. A folder is removed only when nothing but system clutter (`.DS_Store`, `Thumbs.db`,
-  `desktop.ini`, `._*` files and the like) is left in it, and that clutter always goes to the
-  trash.
+  the place in the trash. Where a rename can't reach the trash (a folder of the same drive
+  mounted inside the job's folder, a bind mount on Linux; another drive mounted there is frozen
+  by the scan), the item is copied into the trash and then removed, which needs room there, and
+  a link is made again there with its own time (`Trash::copy_link`). On APFS a file kept that
+  way is cloned into the trash and then removed. Without safe deletes, a file or link is renamed
+  aside, checked, and removed for good (`remove_checked`). An item Charon renamed and had to put
+  back carries a new change time; the memory takes that time for it (`PutBack`,
+  `Baseline::follow`), so the next look doesn't take the rename for an edit. A folder is removed
+  only when nothing but system clutter (`.DS_Store`, `Thumbs.db`, `desktop.ini`, `._*` files and
+  the like) is left in it, and that clutter always goes to the trash. A sync client's journal
+  isn't clutter, though `._sync_<hex>.db` matches `._*`: the folder holding it stays.
 - **Keep both:** the destination's version is moved to its conflict name, the source's version is
   copied to the destination under the original name, and the conflict copy is copied to the
   source. The conflict name is numbered when taken on either side, and shortened to fit the
@@ -618,40 +662,69 @@ folder's drive; if the drive went away, the run stops there.
   room the path leaves. When not even one letter of the original name fits, both versions stay as
   they are with a note (`Refusal::ConflictCopy`), remembered like other refusals (below) while
   both versions are there, so later runs go on with everything else.
-- **App libraries and databases** (`Executor::carry_unit`): the files of one unit (see
-  *Two-way*) are carried together, in every mode. Every new version is written next to its
-  target, everything is checked again, and so is the whole library or database on each side the
-  run changes it on (`unit_unchanged`: nothing in it but what the scan saw, the folders this run
-  makes, the copies it is writing, system clutter and what Charon leaves alone). Only then do
-  the files it no longer has go (a database's old journals first) and the new files take their
-  places, one right after the other. If a new version can't be written, or anything changed
-  meanwhile, none is carried, and the steps say why ("left for the next sync: something in
-  “Photos.photoslibrary”, an app library or document, changed while its files were being
-  copied"). A unit the plan only copies into is carried at its first step that isn't a new
-  folder; one it removes something of waits like any removal, and is carried at its first
-  removal (or step in a cleared place), or before the plan's first plain removal if that comes
-  sooner (`starts_carry`). When copies to that side failed, its removals are held, so none of
-  it is carried ("kept for now: other copies didn't land in this run…"). A failure once the
-  files are taking their places (rare) stops the rest and can leave the unit part old and part
-  new; the next sync looks at it again. With safe deletes on, the files that were removed are in
-  `.charon-trash`. A library holding an item Charon leaves alone (one it can't read, one only in
-  the cloud) is left alone whole, with a note (`Ground::keep_units_whole`); an item the other
-  drive can never hold (a link on a drive without links, a name it can't take, a file too big
-  for it) is left out of it on its own, except in a database, whose files only go together.
-- **Room** (`run/room.rs`): Charon keeps 2% of every drive it writes to free, at most 2 GB, where
-  the drive says how much room it has, so other apps can still save. A copy that would eat into
-  that fails with a clear reason. On a Mac, room the system can free by itself counts as free.
+- **App libraries and databases** (`Executor::carry`): the files of one unit (see *Two-way*) are
+  carried together, in every mode. First every new version is written next to its target
+  (`prepare`). That can take hours for a big library, and its app may write to it meanwhile, so
+  right before the new versions take their places everything is checked again (`still_ready`,
+  `as_staged`): each original and each target, each item the unit removes, and the whole library
+  or database on each side the run changes it on (`unit_unchanged`: nothing in it but what the
+  scan saw, the folders this run makes, the copies it is writing, system clutter and what Charon
+  leaves alone). When several are carried at once, each is also checked once all of them are
+  written. Then, once the trash has room for the versions they replace (`room_for_replaced`), a
+  database's old journals are renamed aside (`set_aside`) and the new files take their places,
+  one right after the other. What the unit no longer has goes last: right before the plan's
+  first plain removal, once every library and database carried by then has landed
+  (`remove_units`), and only while none of those removals is held back (`Holds`, below), so a
+  file moved from one library into another keeps its old copy when its new one didn't land. If a
+  new version can't be written, or anything changed meanwhile, none is carried, and the steps
+  say why ("left for the next sync: something in “Photos.photoslibrary”, an app library or
+  document, changed since the scan"). Only a file or link added where the scan saw nothing, and
+  not part of a database, still lands on its own, checked like any copy (`let_additions_land`),
+  so new photos arrive while a library its app keeps writing to waits. A library the receiving
+  side doesn't have yet has no version to mix with: its files go one by one like any others, and
+  only a database in it goes as a unit (`unit_of`). A unit the plan only copies into is carried
+  at its first step that isn't a new folder; one it removes something of, or clears a place in,
+  waits for the plan's copies, and is carried at its first removal or step in a cleared place,
+  or before the plan's first plain removal if that comes sooner (`starts_carry`). When one of
+  its removals is held back, none of it is carried but what only adds to it ("kept for now:
+  other copies didn't land in this run…"). A failure once the files are taking their places
+  (rare) stops the ones after it, but for what only adds to it, and puts the old journals of
+  those databases back; the unit can be left part old and part new, but nothing of it is removed
+  except the old journals of a database that landed, which go to `.charon-trash`. The next sync
+  looks at it again. The run's summary counts what waited ("3 items left for the next sync with
+  the rest of their app library or database"). With safe deletes on, the files that were removed
+  are in `.charon-trash`. A library holding an item Charon leaves alone (one it can't read, one
+  only in the cloud) is left alone whole, with a note (`Ground::keep_units_whole`); an item the
+  other drive can never hold (a link on a drive without links, a name it can't take, a file too
+  big for it) is left out of it on its own, except in a database, whose files only go together.
+- **Room** (`run/room.rs`): Charon keeps 2% of every drive it writes to free, at most 2 GB,
+  where the drive says how much room it has, so other apps can still save. A copy that would eat
+  into that fails with a clear reason. On a Mac, room the system can free by itself counts as
+  free. The copies of replaced versions kept in the trash need room too, and how much at one
+  time depends on the drive (`KeptCopies`): none on APFS, where they're clones; the largest
+  one's on a drive that gives a removed file's room back at once (Mac OS Extended, FAT, exFAT,
+  NTFS, ext, XFS, tmpfs and `fuseblk`, not over a network), plus those of files with other names
+  (hard links, `Identity::names`), which keep their room; and every one's elsewhere (Btrfs, ZFS
+  and ReFS may keep a removed file in a snapshot, a share's server may too, and a drive Charon
+  doesn't know counts the same). The survey counts that room in what a sync needs
+  (`Engine::bytes_onto`, which can't see hard links), and before an app library or database
+  lands, the run makes sure the trash has that room for the versions it replaces
+  (`room_for_replaced`), so it almost never stops halfway.
 - **One failed item doesn't stop the run:** it's counted, written to the job's log (the first 50
-  failures, and the first 50 of the skipped and left-out items together) and shown; the row names
-  the first two that failed. What a run holds back (`Holds`): on a side where a copy failed, a file
-  couldn't be read or the drive refused an item, every removal the run would still make there
-  waits. A copy left for the next sync because its file changed during the run holds back only
-  the removals there that could be its old copy (an item with the same name, or the same size and
-  time), so one file an app keeps writing to doesn't stop every removal. Charon remembers what a
-  drive refused until it quits (or the job's folders or mode change), while the item and the
-  drive stay the same: later lists leave it out with the reason, and after a restart it's tried
-  again. A name the drive found taken by another item (a short name like `REPORT~1.PDF`, or
-  another rule for upper and lower case) is tried again as soon as that item is gone.
+  failures, and the first 50 of the skipped, waiting and left-out items together) and shown; the
+  row names the first two that failed. What a run holds back (`Holds`): on a side where a copy
+  failed, a file couldn't be read or the drive refused an item, every removal the run would
+  still make there waits. A copy left for the next sync because its file changed since the scan,
+  because the item of another kind in its place couldn't go first, or because it waits with the
+  rest of its app library or database holds back only the removals there that could be its old
+  copy (an item with the same name, or the same size and time), and the note of each says which
+  copy it waits for, and why ("kept for now: it may be the old copy of “X”, which changed since
+  the scan and wasn't copied to the destination yet"). So one file an app keeps writing to
+  doesn't stop every removal. Charon remembers what a drive refused until it quits (or the job's
+  folders or mode change), while the item and the drive stay the same: later lists leave it out
+  with the reason, and after a restart it's tried again. A name the drive found taken by another
+  item (a short name like `REPORT~1.PDF`, or another rule for upper and lower case) is tried
+  again as soon as that item is gone.
 - **Files Charon can't read:** a file the scan listed but the copy couldn't read (no permission,
   macOS's privacy settings, a mailbox another program holds open, a locked range:
   `Error::ReadDenied`) isn't a failure, and the run isn't an error. The row lists it under
@@ -670,16 +743,23 @@ folder's drive; if the drive went away, the run stops there.
   is never emptied, lists say where it is, and automatic runs are held. What the system writes
   into a folder by itself (`.DS_Store`, `Thumbs.db`) and Charon's own half-written copies are
   nobody's work (`is_nobodys_work`) and don't count as such a change, and on FAT and exFAT
-  neither does a time moved by whole hours. Dated folders older than *Keep deleted files* (30
-  days by default; 0 keeps everything) are emptied only after a run the person confirmed, whose
-  list named them, went all the way (`Trash::sweep`), and only those still older than the
-  setting as it is then: a confirmed list can wait for another sync, and a setting changed
-  meanwhile counts. On Windows their read-only marks are lifted first, never through a link,
-  since FAT and exFAT won't remove a read-only item. Runs nobody looked at never empty the
-  trash. If `.charon-trash` is a link or a file, nothing is put into it, and a step that would
-  have put something there fails. An item whose path in
-  the trash would be too long for the drive goes in under its own name at the top of the run's
-  dated folder (numbered if needed), and the app's log says so.
+  neither does a time moved by whole hours. Nor does a cloud service's placeholder for a file
+  the list names, once that file is gone from the dated folder and the placeholder says what the
+  list says (`stands_in_for_listed`): a Nextcloud or ownCloud placeholder by its time (within 2
+  seconds, or whole hours apart on FAT and exFAT), an iCloud one by the size it records
+  (`NSURLFileSizeKey`), which for a package is the size of all its listed files together. One
+  that says otherwise, or nothing, is judged by its time like any other file. Dated folders
+  older than *Keep deleted files* (30 days by default; 0 keeps everything) are emptied only
+  after a run the person confirmed, whose list named them, went all the way (`Trash::sweep`),
+  and only those still older than the setting as it is then: a confirmed list can wait for
+  another sync, and a setting changed meanwhile counts. On Windows, FAT and exFAT won't remove a
+  read-only item, so when the drive refuses, the marks are lifted and the folder removed once
+  more (`Trash::clear_out`), never through a link and never for a file with more than one name,
+  whose mark is the same under its names outside the trash. Runs nobody looked at never empty
+  the trash. If `.charon-trash` is a link or a file, nothing is put into it, and a step that
+  would have put something there fails. An item whose path in the trash would be too long for
+  the drive goes in under its own name at the top of the run's dated folder (numbered if
+  needed), and the app's log says so.
 - **Leftovers:** what an interrupted sync left (`.part` files, link copies under a temporary
   name, and the empty files a failed rename left as claims) is moved into the trash by a run
   that went all the way, once nothing has written to it for an hour and, for a temporary name,
@@ -745,10 +825,11 @@ that can't be saved, the run changes nothing. Once the run is durable:
    After *Stop*, a run that couldn't be recorded, a long count that couldn't be saved, or a sync
    that ended on an error of Charon's own, the next sync waits for an OK and the row says why. A
    run stopped because Charon quit carries on as before next time.
-6. The job's activity log gets the summary, the items that failed, were skipped or were left
-   out, the files the run couldn't read, the conflicts *Newest wins* settled, the copies left out
-   of the memory because their original was gone or older, and the files that arrived without
-   details their drive can't keep (up to 50 of each, skipped and left-out items sharing one 50).
+6. The job's activity log gets the summary, the items that failed, were skipped, wait with their
+   app library or database, or were left out, the files the run couldn't read, the conflicts
+   *Newest wins* settled, the copies left out of the memory because their original was gone or
+   older, and the files that arrived without details their drive can't keep (up to 50 of each,
+   skipped, waiting and left-out items sharing one 50).
 
 ### When jobs run by themselves
 
@@ -760,9 +841,10 @@ does a job whose folders, mode, conflict rule, excludes or safe deletes changed,
 full automation turned on, or that was held back or stopped. In the job editor, changing the
 mode, turning safe deletes off or swapping a one-way job's folders also turns *Full automation*
 off; it has to be turned on again, with its two warnings. Every other job is only *looked at*:
-Charon scans and plans in the background, the row shows *Needs your OK* when changes wait
-(unless it shows *Syncing*, *Offline*, *Paused*, *Conflict* or *Error*, which come first), and
-nothing changes in its folders until the person confirms a list.
+Charon scans and plans in the background, the row shows *Needs your OK* when changes wait, or
+*Files to compare* when all a look found is files it couldn't compare yet (unless it shows
+*Syncing*, *Offline*, *Paused*, *Conflict* or *Error*, which come first), and nothing changes in
+its folders until the person confirms a list.
 
 For each job whose folders are reachable (a folder now on another drive than at the last sync
 doesn't count, nor one that doesn't answer in time: see *Folders that don't answer* below) and
@@ -786,8 +868,10 @@ that isn't syncing, in this order:
 4. **Removals left for later** (below) have come due: a job that runs by itself syncs once more,
    whatever its trigger.
 5. **Regular look:** every *Look for changes* minutes (15 by default), in case the watcher missed
-   something. An *On change* job that runs by itself and has changes found by a look syncs,
-   unless its folders are still changing: step 2 then syncs once they settle. Folders that never
+   something. An *On change* job that runs by itself and has changes found by a look (files the
+   look couldn't compare count too, `has_pending`) syncs, unless its folders are still changing
+   (step 2 then syncs once they settle) or its last sync ended less than its settle time ago,
+   since what an app saved into that sync's own items meanwhile isn't heard. Folders that never
    settle (an app that saves every few seconds) still sync here, once they have kept changing for
    a whole *Look for changes* interval since they began to and since the job last synced.
 
@@ -798,15 +882,22 @@ notification) says why, and the job shows *Needs your OK* until the person confi
 
 **Pausing** a job stops its running sync as *Stop* does, calls off its confirmed list that waits
 for another sync, and drops the run it wanted (`Engine::stop_paused`). *Pause everything*
-(`set_all_paused`) is saved first, then stops every running sync nobody confirmed a list for,
-as *Stop* would (`stop_unattended`; the job's log says "everything paused: this sync stops,
-since you didn't confirm its list"), drops every wanted run, and calls off every confirmed list
-that waits for another sync (`call_off_all_confirmed`). A sync the person confirmed that's at
-work goes on. `begin_run` refuses a run a trigger started while the job or everything is
-paused, so a run that was about to start doesn't. Runs the person asks for (*Sync now*, *Sync
-all*, a confirmed list) aren't refused this way: *Sync all* leaves out jobs paused on their own,
-but under *Pause everything* it still starts the jobs that run by themselves, and such a run
-still waits for another sync and starts once it's done.
+(`set_all_paused`) is saved first, then, all under one lock (`pause_everything`), it counts the
+pause (`Engine::pauses`), stops every running sync nobody confirmed a list for, as *Stop* would
+(the job's log says "everything paused: this sync stops, since you didn't confirm its list"),
+drops every wanted run, and calls off every confirmed list that waits for another sync. A sync
+the person confirmed that's at work goes on. A confirmed list whose sync is about to start
+counts as running then, so it isn't called off here, but it sees the count went up and is called
+off where it ends up (see *What waits* below). `begin_run` refuses a run a trigger started while
+the job or everything is paused, so a run that was about to start doesn't. Runs the person asks
+for (*Sync now*, *Sync all*, a confirmed list) aren't refused this way: *Sync all* leaves out
+jobs paused on their own, but under *Pause everything* it still starts the jobs that run by
+themselves, and such a run still waits for another sync and starts once it's done. A pause that
+comes while *Sync all* is starting jobs wins: `want_for_sync_all` checks, under the locks
+pausing takes, that the job isn't paused and that everything wasn't paused since *Sync all* read
+the jobs (it counts the pauses first). After *Pause everything* it starts no more jobs, and the
+window says "You paused everything while Sync all was starting the jobs, so it started no more
+of them."
 
 Removals that only follow from an item missing for less than ten minutes on a drive that may
 show changes late (a network share, or a drive run by a program, like sshfs and cloud drives
@@ -814,26 +905,36 @@ that mount as a FUSE drive) are left for a later automatic run (`engine::Missing
 person confirms shows them all. A disk of the computer's own that a program reads (`fuseblk` on
 Linux: a USB disk through ntfs-3g or exfat-fuse) doesn't count as such a drive. The ten minutes
 are counted by Charon's own clock (`Moment::own`, an `Instant`), which a clock set forward or
-back doesn't move. When each item was first found missing is saved per job in
-`absences/<job>.json`, by the clock on the wall, so the wait survives a restart: that clock is
-read for it once, at launch, to tell how long the item had been missing by then (a time later
-than now counts as no time), and an item a look finds noted later than now starts afresh.
-Whenever Charon begins to look at the folders again (at launch, when a folder comes back, and
-after a tick that came 30 seconds or more after the one before by either clock, because the
-computer slept or the clock jumped: `after_a_gap`), an item found missing before must also be
-found missing by the looks since then for two minutes (`Missing::look_again`). A database's
-files only go together, so every other change to a database one of whose removals waits is left
-for later with it, and the log says so ("1 more change to the same database waits with them").
-Until they're carried out the row shows *Pending* with their count (those changes included),
-never *In sync*, and the run's summary counts the removals ("2 removals left for a later
-sync"), in the log and in the window's last-run line. Cloud
-folders on the computer's own disk (where iCloud Drive, Dropbox and OneDrive usually keep them)
-count as local: this rule doesn't cover them, and *Newest wins* trusts their times.
+back doesn't move. How long looks have found each item missing is saved per job in
+`absences/<job>.json` (`countedSeconds`), so the wait survives a restart: the next launch counts
+on from there (`Missing::restored`), and the time while Charon wasn't running doesn't count, as
+its own clock can't tell how long that was. When a look first found the item missing (`since`,
+by the clock on the wall) is kept only for whoever reads the file, and a record an earlier
+Charon wrote without the count starts its wait over. Whenever Charon begins to look at the
+folders again (at launch, when a folder comes back, and after a tick that came 30 seconds or
+more after the one before by either clock, because the computer slept or the clock jumped:
+`after_a_gap`), an item found missing before must also be found missing by the looks since then
+for two minutes (`Missing::look_again`). A database's files only go together, so every other
+change to a database one of whose removals waits is left for later with it, and the log says so
+("1 more change to the same database waits with them"). Until they're carried out the row shows
+*Pending* with their count (those changes included), never *In sync*, and the run's summary
+counts the removals ("2 removals left for a later sync"), in the log and in the window's
+last-run line. Cloud folders on the computer's own disk (where iCloud Drive, Dropbox and
+OneDrive usually keep them) count as local: this rule doesn't cover them, and *Newest wins*
+trusts their times.
 
 A job whose last sync is dated later than now synced while the clock was ahead, or the clock is
-behind now. Each tick the autopilot dates such a sync now, for every job, offline ones too, and
-saves it (`correct_syncs_dated_ahead`), so the row's "Not synced for 3 days" (`Engine::stale`)
-still comes once the job really hasn't synced for that long.
+behind now, and which of the two can't be told. Each tick the autopilot notes such a sync, for
+every job, offline ones too (`note_syncs_dated_ahead`): the date stays as it is, and Charon
+counts for how long it has known so, by its own clock, until the job syncs again (`FoundAhead`).
+The row shows the sync as made at the earlier of the date and the moment Charon found it later
+than now (`Engine::last_synced`, `FoundAhead::latest`), even once the clock is past the date: it
+never says "Synced just now" for a sync days old, and "Not synced for 3 days" (`Engine::stale`)
+comes once the job really hasn't synced for that long. The count is saved with the job
+(`datedAhead` in `charon-state.json`) when the date is found and then at least every 10 minutes
+(`DATED_AHEAD_SAVED_EVERY`), but not while the state can't be saved, and the next launch counts
+on from there while it's still about the job's last sync. The time Charon wasn't running doesn't
+count, so after a restart the row may show the sync as more recent than it was.
 
 **Folders that don't answer** (`engine/reach.rs`): a network share whose server stopped
 answering can hold up any question about a folder on it (is it there, which drive is it on,
@@ -852,10 +953,15 @@ closing a list don't ask the disk on the window's thread. A survey or a sync tha
 work isn't time-limited: one stuck on such a share stays stuck until the share answers, and
 quitting waits for it only once, at most 30 seconds (`Quit::stop_syncs`), before Charon exits.
 
-When changes or conflicts wait for the person, Charon says so in one notification, reminds them
-after two hours, and then once a day (`Engine::remind`). Paused and offline jobs aren't
-mentioned, and right after a start Charon waits for the first looks (at most two minutes), so the
-jobs found waiting come in one notification.
+When changes or conflicts wait for the person, or files a look couldn't compare yet, Charon says
+so in one notification ("“Videos” has 1 file to compare" when that's all a job has), reminds
+them after two hours, and then once a day (`Engine::remind`). Paused and offline jobs aren't
+mentioned, and right after a start Charon waits for the first looks (at most two minutes), so
+the jobs found waiting come in one notification. The tray's status line (`Overview::headline`)
+names each kind ("1 job waits for your OK, 1 has files to compare"), and the header, the tray's
+*Review Waiting Jobs…*, the Dock badge and the quit prompt count both (`Overview::to_compare`,
+`Overview::lists_waiting`). A job that was held back waits for an OK, whatever else its look
+found.
 
 ### Overlapping jobs and other Charons
 
@@ -1006,23 +1112,29 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   one the list was made for, the job changed or synced, an older Charon at work) is dropped, and
   the row says why ("The list you confirmed couldn't be carried out after all." followed by the
   reason). *Stop* (`cancel`, which drops `JobRuntime::confirmed` but keeps the list), pausing
-  the job (`stop_paused`), *Pause everything* (`call_off_all_confirmed`: the person now wants
-  nothing to start without them), discarding the list (`discard_review`), editing the job,
+  the job (`stop_paused`), *Pause everything* (`pause_everything`: the person now wants nothing
+  to start without them), discarding the list (`discard_review`), editing the job,
   *Leave this folder out*, a newer list (`JobRuntime::forget_review`) and quitting Charon call
   it off, and the job's log says so: "the confirmed sync that waited for another sync was called
   off", followed by the reason in brackets except when the person did it directly (*Stop*,
   closing the list, pausing the job). A list confirmed while *Pause everything* is on still
   syncs, like any list the person confirms. Calling off wins even when it comes just as the sync
   starts: `carry_out` starts a list that waited only if it's still `JobRuntime::confirmed`,
-  checked under the same lock that `cancel` and `stop_paused` take. It lives only in
-  `JobRuntime`: quitting Charon drops it, and after a restart the job is where it was before the
-  list was confirmed. While it waits, runs nobody looks at are refused, and the row
-  (`JobView::confirmed`) has no `waiting`: it shows *Pending* when its look found changes,
-  unless a folder that's away, *Pause everything*, conflicts, or a problem or failed last run
-  outrank it; it isn't counted as waiting for an OK in the header, the tray, the reminders or
-  the quit prompt (`quit.rs` counts `Overview.waiting`, so quitting doesn't ask about it); its
-  main button is *Stop*, and it says *Confirmed: starts as soon as “X” finishes syncing (Stop
-  calls it off)* (`JobRow.waitsFor`).
+  checked under the same lock that `cancel` and `stop_paused` take. *Pause everything* finds a
+  list whose sync is about to start marked as running, and leaves it; the list then sees that
+  everything was paused since it was confirmed (`Confirmed::pauses`) and is called off where it
+  ends up: it no longer waits for the other sync (`keep_waiting`), its sync ends before it
+  changes anything (`carry_out`), or, confirmed just then, it isn't kept at all
+  (`queue_confirmed`, and the window says "You paused everything just as this list was about to
+  start, and “X” is still syncing these folders, so the list doesn't wait for it. Look again
+  once that sync is done."). It lives only in `JobRuntime`: quitting Charon drops it, and after
+  a restart the job is where it was before the list was confirmed. While it waits, runs nobody
+  looks at are refused, and the row (`JobView::confirmed`) has no `waiting`: it shows *Pending*
+  when its look found changes, unless a folder that's away, *Pause everything*, conflicts, or a
+  problem or failed last run outrank it; it isn't counted as waiting for an OK in the header,
+  the tray, the reminders or the quit prompt (`quit.rs` counts `Overview::lists_waiting`, so
+  quitting doesn't ask about it); its main button is *Stop*, and it says *Confirmed: starts as
+  soon as “X” finishes syncing (Stop calls it off)* (`JobRow.waitsFor`).
 - **Looks that came too late.** `JobRuntime::epoch` goes up whenever what a look under way would
   find becomes outdated: a run begins, the job is edited or removed, a list is being made
   (`outdate_looks`), or a folder comes back (`forget_look`). A look notes the epoch when it
@@ -1039,12 +1151,15 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   `change_known_runtime`, which only changes a job's live state while it has one, so it leaves
   nothing behind; `change_runtime` makes one when it's missing.
 - **Changes made during a sync.** From the moment a run begins, `JobRuntime::own_writes`
-  (`OwnWrites`) holds what it writes: its plan's items and every folder above them, once it knows
-  its plan (before that, every change is someone else's). A change the folder watcher hears while
-  the sync runs, or in the 3 seconds after (`note_change_while_syncing`), is the sync's own when
-  it's at one of those. Any other change during the sync is kept for its end, which then has the
-  folders looked at again at once; a run that ended without carrying anything does the same
-  (`look_again_if_changed`). In the 3 seconds after, such a change counts as usual.
+  (`OwnWrites`) holds what it writes: its plan's items and every folder above them, once it
+  knows its plan (before that, every change is someone else's), and each conflict copy right
+  before it's made, since the plan doesn't know its name (`Executor::telling_new_names`). A
+  change the folder watcher hears while the sync runs, or in the 3 seconds after
+  (`note_change_while_syncing`), is the sync's own when it's at one of those, and doesn't count.
+  Any other change counts at once, so the folders aren't quiet and an *On change* job waits for
+  them to settle; during the sync it's also kept for its end, which then has the folders looked
+  at again at once, and a run that ended without carrying anything does the same
+  (`look_again_if_changed`).
 - **An older Charon, and a state that can't be saved.** Two Charons can't work with one data
   folder (`DataLock`). Charon 0.2 doesn't know that lock, nor that its jobs moved: it writes
   `charon.json` again after a sync, and syncs by itself without these checks and without busy
@@ -1064,8 +1179,11 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   (`run_in_progress`), it ends before changing anything ("Charon couldn't save its state before
   syncing…"), which uses the list up. `Engine::problem` turns either into the sentence in
   `Overview.problem`. The tray's status line and tooltip (`Overview::headline`) and the header
-  (`header.js`) then say "Charon needs your attention" before anything else, and the header shows
-  the whole sentence under the title bar (`#app-problem`).
+  (`header.js`) then say "Charon needs your attention" before anything else, and the header
+  shows the whole sentence under the title bar (`#app-problem`). Editing a job, removing it and
+  *Leave this folder out* save first (`with_job_at_rest`): when the save fails, nothing changes,
+  in the stored state or the live one (a confirmed list that waits keeps waiting), and the
+  window says "Charon couldn't save this change (…), so nothing changed."
 
 ### Safety rules
 
@@ -1088,10 +1206,11 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   When the trash can't take an item, the item stays as it was and the step fails.
 - Removals come last, and an item that makes room for another right before that item lands. A
   side where a copy failed, a file couldn't be read or a drive refused an item keeps the run's
-  removals, and a copy skipped because its file changed keeps those that could be its old copy.
-- A folder is removed only when everything in it is removed; folders holding unreadable items,
-  or excluded items other than system clutter, are never removed (clutter such as `.DS_Store`
-  goes to the trash with its folder).
+  removals, and a copy that didn't land because its file changed, its place couldn't be cleared
+  or its app library or database waits keeps those that could be its old copy.
+- A folder is removed only when everything in it is removed; folders holding unreadable items, a
+  sync client's journal, or excluded items other than system clutter, are never removed (clutter
+  such as `.DS_Store` goes to the trash with its folder).
 - Places that can't be read, files a run couldn't read, names written two ways, items a scan
   leaves out with a note, and items the other drive can't hold are left alone on both sides, with
   a note in the list. While a file can't be read, no file or link is removed on the side it
@@ -1101,9 +1220,10 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   Never synced: Charon's own files (`.charon`, `.charon-trash`, `.part` files, claims an
   interrupted rename left) and anything named like them or like Charon 0.2's `*.charon-partial`
   files, at any depth (its folders' names in any case, where a drive ignores case); `._*` files
-  on a Mac, whatever the patterns say; names that aren't valid Unicode; and sockets, pipes and
-  devices. An item named exactly `.charon` or `.charon-trash` that holds the person's files is
-  left out with a note, never taken for Charon's.
+  on a Mac, whatever the patterns say; a Nextcloud or ownCloud client's journal, at any depth;
+  names that aren't valid Unicode; and sockets, pipes and devices. An item named exactly
+  `.charon` or `.charon-trash` that holds the person's files is left out with a note, never
+  taken for Charon's.
 - Files that are only in the cloud are never downloaded (macOS and Windows), and a file a cloud
   service freed up and left a placeholder for is left alone, with its placeholder.
 - A run stops as soon as a folder isn't the one the plan was made for.
@@ -1154,7 +1274,9 @@ core/                         the sync engine (crate charon-core, no interface)
       entry.rs                Entry, Snapshot, and what a scan learned besides the items
       contents.rs             Contents: opening files without downloading them, and comparing
                               two files byte for byte
-      cloud.rs                the placeholders cloud services leave for the files they free up
+      cloud.rs                the placeholders cloud services leave for the files they free up,
+                              and the journals of Nextcloud and ownCloud clients
+      clients.rs              ClientSettings: the folders Nextcloud and ownCloud clients sync
       filter.rs               ExcludeFilter, system clutter, Charon's own names
       keys.rs                 Keys: NFC, /-separated, folded when a drive ignores case
       root.rs                 RootId: which folder a path really is
@@ -1177,9 +1299,11 @@ core/                         the sync engine (crate charon-core, no interface)
                               the last look before a run is recorded
       copier.rs               Copier: one file or link, through a temporary .part file
       rename.rs               renames that never replace (rename_new, move_to_new_name), swaps
-      identity.rs             Identity: which file an item is, by its drive and file numbers
+      identity.rs             Identity: which file an item is, by its drive and file numbers,
+                              and how many names it has (hard links)
       durable.rs              flushing files, folders and drives
-      room.rs                 Room: free space, and the room Charon leaves for other apps
+      room.rs                 Room: free space and the room Charon leaves for other apps;
+                              KeptCopies: the room copies kept in the trash take
       trash.rs                Trash: .charon-trash, its lists and its clean-up
       marker.rs               Marker: .charon/<job>.json in the job's folders
       busy.rs                 Claim and BusyWatch: busy notes, one sync at a time in a folder
@@ -1190,8 +1314,9 @@ core/                         the sync engine (crate charon-core, no interface)
       state_file.rs           StateFile: charon-state.json, and the move from charon.json
       baselines.rs            Baselines: each job's two-way memory
       landings.rs             Landings: Mirror and Backup copies whose dates didn't stick
+      same_contents.rs        SameContents: two-way pairs a full read found identical
       unattended.rs           Unattended: the long count of automatic changes
-      absences.rs             Absences: items missing on a share or cloud drive, and since when
+      absences.rs             Absences: items missing on a share or cloud drive, for how long
       journal.rs              Journal: one activity log per job
       lock.rs                 DataLock: one Charon per data folder
       atomic.rs               saving a file so a crash never leaves it half-written
@@ -1219,7 +1344,7 @@ src-tauri/                    the desktop app (crate charon)
     events.rs                 engine events to the window, the tray and notifications
     tray.rs                   Tray: the menu-bar or system-tray icon and its menu
     notifier.rs               notifications, and Repeats (the same problem told once)
-    quit.rs                   Quit: asks first when changes wait, lets syncs stop cleanly
+    quit.rs                   Quit: asks first when lists wait, lets syncs stop cleanly
     login.rs                  LaunchAtLogin
     desktop.rs                showing folders and opening links, per system
     about.rs                  About: what the About panel shows, and the links it may open
@@ -1282,20 +1407,22 @@ A development build uses `dev.stean.charon-dev` next to it instead.
 
 | File | What's in it |
 |---|---|
-| `charon-state.json` | settings and jobs, with each job's record: its last run, whether its next sync waits for an OK and why, the drives of the last sync (with whether one refused links, and `caseGuessed` where how it treats case was only a guess), the Mirror/Backup markers of the last sync, and what automatic runs removed or replaced during the last day |
+| `charon-state.json` | settings and jobs, with each job's record: its last run, whether its next sync waits for an OK and why, the drives of the last sync (with whether one refused links, and `caseGuessed` where how it treats case was only a guess), the Mirror/Backup markers of the last sync, what automatic runs removed or replaced during the last day, and, for a last sync dated later than now, for how long Charon has known so (`datedAhead`) |
 | `charon-state.json.damaged-<date>-<time>` | a state file that couldn't be read, put aside instead of overwritten (Charon then starts without jobs) |
 | `charon.json.moved-to-0.3` | Charon 0.2's settings and jobs, after they moved (see below) |
 | `charon.lock` | locked while a Charon works with this folder; a second one refuses to start |
 | `instances.json` | the running Charon and up to 19 before it that worked with this folder, newest first, each with its id (a new one each start), its computer and its data folder: busy notes left in a job's folders by an earlier one on this computer with this folder count for nothing (see *Overlapping jobs and other Charons*) |
 | `baselines/<job>.json` | two-way memory: the two folders it belongs to, the markers' tokens and counter, how each side looked at the last sync, the pairs that look alike but were found to differ and left for the person (`unsettled`), and, when one item was settled while Charon couldn't trust the memory, why it isn't trusted (`distrust`) |
 | `landings/<job>.json` | Mirror and Backup: copies whose dates didn't stick on the destination, with the folders and destination marker they belong to |
+| `same-contents/<job>.json` | two-way: pairs of files a full read found identical, with how both sides looked then, and the folders and markers they belong to (gone with the two-way memory, when the job's folders or mode change, and when the job is removed) |
 | `unattended/<job>.json` | full automation: what automatic runs removed or replaced since the last confirmed list, within *Keep deleted files* days |
-| `absences/<job>.json` | items the job's looks found missing on a network share or a drive run by a program, since when, and whether a run left the removal that follows for later, with the folders they belong to (gone when the job's folders or mode change, or the job is removed) |
+| `absences/<job>.json` | items the job's looks found missing on a network share or a drive run by a program, for how long by Charon's own clock (`countedSeconds`; `since`, by the clock on the wall, is only for reading), and whether a run left the removal that follows for later, with the folders they belong to (gone when the job's folders or mode change, or the job is removed) |
 | `logs/<job>.log` | each job's activity log, cut to its newest half when it grows past 512 KB |
 
-The state file, the list of Charons, the memories, the landings, the counts and the absences are
-saved under a temporary name next to them (`.<name>.<process>-<n>.tmp`) and renamed into place,
-so a crash never leaves one half-written. The job logs are added to as they go.
+The state file, the list of Charons, the memories, the landings, the counts, the absences and
+the files found identical are saved under a temporary name next to them
+(`.<name>.<process>-<n>.tmp`) and renamed into place, so a crash never leaves one half-written.
+The job logs are added to as they go.
 
 The app's own log is `charon.log` (`charon-dev.log` for a development build), started afresh at
 5 MB with a few older ones kept: in `~/Library/Logs/dev.stean.charon/` on macOS,

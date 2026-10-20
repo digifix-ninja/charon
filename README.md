@@ -46,7 +46,8 @@ runs), and buttons to open either folder or pause the job.
 **Every sync waits for your OK**
 
 By default Charon never changes your files by itself. When a job is due, it looks at both
-folders and counts what would change. If anything would, the row says *Needs your OK*, a
+folders and counts what would change. If anything would, the row says *Needs your OK* (or
+*Files to compare*, when all it found is large files it couldn't compare yet), a
 notification tells you (if *Notifications* is on in Settings), and nothing crosses until you
 press *Review and sync*, which makes the list afresh, and confirm it. A new job shows its first
 list as soon as you save it.
@@ -92,9 +93,10 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
 | In sync | green, a tick | The last look found nothing to carry, apart from what the row's flags say couldn't be read or isn't synced. |
 | Syncing | blue, turning arrows | Files are crossing right now. |
 | Needs your OK | pink, a checklist | Changes wait for you to look at the list and confirm it, or a full-automation run was held back for your OK. |
+| Files to compare | pink, a checklist | A look in the background found nothing else to carry, but couldn't compare some large files by their contents yet (it reads at most 1 GB), so their copies may differ. *Review and sync* compares them, and its list may well have nothing to confirm. |
 | Ready | cyan, a spark | A new job that hasn't synced yet. Nothing crosses until you confirm its first list. |
 | Looking | no colour yet, a magnifying glass | Charon hasn't finished a new look at this job yet, so it doesn't claim the folders match. |
-| Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run, or removals were left for a later sync. |
+| Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run (which also reads the files a look couldn't compare yet), or removals were left for a later sync. |
 | Paused | grey, two bars | Doesn't sync by itself. Charon still looks and shows what waits, and you can still sync it from its row. |
 | Conflict | violet, a fork | A file changed on both sides and waits for you to choose which version to keep. |
 | Error | red, an exclamation mark | The last look or sync failed, or some files couldn't be copied. The row says why and names what failed. |
@@ -153,7 +155,9 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   only what is still older than *Keep deleted files* when that sync runs. It never empties a
   file that changed after it went in (an app may still be saving into it); the `.DS_Store` that
   Finder leaves when you look inside, or the hours a FAT or exFAT drive shifts at a
-  daylight-saving change, don't count as such a change.
+  daylight-saving change, don't count as such a change. Nor does the placeholder iCloud Drive,
+  Nextcloud or ownCloud leaves when it frees up a file (or iCloud Drive a whole package) that
+  Charon put there, as long as the placeholder says it was as Charon left it.
 - **No half-written files.** Each file is copied under a temporary name next to its target (or,
   where that path would be too long for the drive, in the nearest folder above it where it fits),
   flushed to the drive, and only then takes its real name, with its original modification time.
@@ -208,19 +212,28 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   the meantime don't count as lost changes, but moving or deleting something this sync has just
   copied or created does, since Charon can't tell that from a drive that lost it.
 - **Room to spare, in a safe order.** Charon keeps 2% of the receiving drive free (at most 2 GB),
-  and the list warns when a sync won't fit. New folders and copies go first and removals last.
-  Where an item of another kind takes an item's place, the item there goes as late as it can:
-  after every other copy, right before what takes its place. When a copy to one side fails,
-  that side's removals wait for the next sync. When a copy is skipped because its file changed
-  meanwhile, only the removals that could be its old copy wait (the same name, or the same size
-  and date), so one busy file doesn't stop every removal.
+  and the list warns when a sync won't fit. The old versions a sync keeps in `.charon-trash`
+  count as their drive frees room: one at a time on most local drives, all together on drives
+  that keep snapshots and on network shares, and not at all on APFS, where they're clones. New
+  folders and copies go first and removals last. Where an item of another kind takes an item's
+  place, the item there goes as late as it can: after every other copy, right before what takes
+  its place. When a copy to one side fails, that side's removals wait for the next sync. When a
+  copy is skipped because its file changed meanwhile, or waits with the rest of its app library,
+  only the removals that could be its old copy wait (the same name, or the same size and date),
+  so one busy file doesn't stop every removal. The list's notes say which copy each of them
+  waits for, and why.
 - **App libraries and databases stay whole.** A Photos or Final Cut library, a Logic project or
   a Pages document that changed on both sides of a two-way job becomes one conflict, kept whole
   from the side you choose. A sync carries each library, and each SQLite database with its
-  journal files, as one: all of it is copied first, checked again, and put in place only if
-  nothing of it changed meanwhile. A library holding a file Charon leaves alone (one it can't
-  read, or one only in the cloud) is left alone whole, with a note; only an item the other drive
-  can never hold, such as a link on a drive without links, is left out of it on its own.
+  journal files, as one: all of it is copied first, checked again right before it takes its
+  place, and put in place only if nothing of it changed meanwhile. What it no longer has goes
+  last, once its new versions have landed, so a file moved from one library into another keeps
+  its old copy until the new one is there. A new file it gains (a new photo) still arrives while
+  the rest of a busy library waits for the next sync, and a library the other drive doesn't
+  have yet is copied file by file, each database in it with its journal files. A library
+  holding a file Charon leaves alone (one it can't read, or one only in the cloud) is left alone
+  whole, with a note; only an item the other drive can never hold, such as a link on a drive
+  without links, is left out of it on its own.
 - **When a file changed on both sides.** Two-way jobs choose *Keep both*, *Newest wins* or
   *Ask me*, and an edit always beats a deletion. *Newest wins* decides only when the times can
   be trusted (not on FAT, exFAT or network drives, not whole hours apart, not a time that went
@@ -228,8 +241,11 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   last sync, both sides changed, or a date that only moved by a rounding), two-way jobs compare
   files of the same size byte by byte: identical ones aren't copied, and look-alikes that differ
   inside become a conflict. A look in the background reads at most 1 GB this way and never
-  counts what it left unread as in sync; the list and the sync read them all. Mirror and Backup
-  go by size and modification time only.
+  counts what it left unread as in sync: the row says how many files it couldn't compare yet,
+  and the list and the sync read them all. What a read found identical is remembered, even
+  after a restart, while both files and the folders they're in stay as they were, so a large
+  file whose details alone changed isn't left to compare at every launch. Mirror and Backup go
+  by size and modification time only.
 - **Crashes and quitting.** Quitting lets a sync stop at a safe point (a file being copied stays
   as it was) and records what it carried. If Charon or the computer stops mid-sync, a two-way
   job's next look compares both folders afresh and removes nothing. After your *Stop*, the next
@@ -266,10 +282,12 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   move one of them. An item whose path in `.charon-trash` would be too long goes in under its
   own name at the top of that sync's dated folder.
 - **Never synced:** sockets, pipes and devices, names that aren't valid Unicode, the folders a
-  drive keeps for itself (like `lost+found`) at the top of a synced folder, and Charon's own
-  `.charon`, `.charon-trash` and half-copied files (with the empty files an interrupted sync can
-  leave to hold a name; a later sync moves them into `.charon-trash`, half-copied files after an
-  hour, the empty ones after an hour too, or at once on a drive that keeps no change time).
+  drive keeps for itself (like `lost+found`) at the top of a synced folder, the journal a
+  Nextcloud or ownCloud client keeps in the folder it syncs (`.sync_….db` and the files that go
+  with it, at any depth, never removed either), and Charon's own `.charon`, `.charon-trash` and
+  half-copied files (with the empty files an interrupted sync can leave to hold a name; a later
+  sync moves them into `.charon-trash`, half-copied files after an hour, the empty ones after an
+  hour too, or at once on a drive that keeps no change time).
   Where a drive ignores case, a folder of your own named like Charon's in other case
   (`.Charon-Trash`, `.CHARON`) is left out too, and so, on any drive, is an item of yours named
   exactly `.charon` or `.charon-trash` that holds anything but Charon's own files (system files
@@ -281,10 +299,11 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   went missing only once looks have found it missing for ten minutes. Until then the job's row
   shows *Pending* and its last run says how many removals were left for a later sync; once the
   ten minutes are up, the job syncs again by itself, whatever starts it otherwise. Charon
-  remembers since when an item has been missing, even across a restart, and counts the ten
-  minutes by its own clock, so setting the computer's clock forward while Charon runs doesn't
-  shorten them. After a restart, after the computer wakes up, or once the share comes back, looks
-  must also find the item missing for two more minutes. When such a removal belongs to a
+  remembers how long looks have found an item missing, even across a restart, and counts the
+  ten minutes by its own clock only: the time Charon isn't running doesn't count, and setting
+  the computer's clock forward or back, while Charon runs or between two launches, never
+  shortens them. After a restart, after the computer wakes up, or once the share comes back,
+  looks must also find the item missing for two more minutes. When such a removal belongs to a
   database, the database's other changes wait with it. A list you confirm shows every removal
   and holds none back. A USB disk that Linux reads through a program (ntfs-3g, exfat-fuse) and
   cloud folders on the computer's own drive (iCloud Drive, Dropbox, OneDrive) don't count as
@@ -294,9 +313,14 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   alone when Charon looks, and it says so. So are files that iCloud Drive before macOS 14, or
   Nextcloud and ownCloud, replaced with a placeholder of their own (`.Report.pdf.icloud`,
   `Report.pdf.nextcloud`); the placeholder itself is never synced or removed. A file named like
-  a placeholder counts as one only where its service keeps files: on a backup drive, say, it's an
-  ordinary file. Charon never downloads a file: one that goes back to the cloud after the list
-  was made is skipped when its turn comes, and the job's activity log says why.
+  a placeholder counts as one only where its service keeps files: in iCloud Drive's folders on
+  this Mac, and in a folder the Nextcloud or ownCloud client on this computer syncs, as its own
+  settings say, or one that holds a client's journal (a client on another computer may sync
+  it). Elsewhere, on a backup drive say, it's an ordinary file. A backup copied from a synced
+  folder may hold a copy of that journal too: the note then names the journal, and if no client
+  syncs that folder, the journal and the placeholder are old copies you can remove. Charon never
+  downloads a file: one that goes back to the cloud after the list was made is skipped when its
+  turn comes, and the job's activity log says why.
 - **What travels with a file:** contents, modification time, and where the drive takes them,
   access time and permissions (creation time on macOS and Windows). On a Mac also Finder tags,
   Finder info and resource forks; on Linux, `user.` extended attributes. Owners, ACLs, other
@@ -347,7 +371,8 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   changes nothing (the row says why). The header and the tray say *Charon needs your attention*,
   with the reason under the title bar. Charon tries a save again every minute. Once one works, jobs
   sync by themselves again from their next trigger: a scheduled sync that came due meanwhile waits
-  for its next time.
+  for its next time. Editing or removing a job, or leaving a place out, changes nothing when
+  Charon can't save it, and the window says so.
 
 ## More
 
@@ -355,12 +380,12 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   jobs with full automation that may sync by themselves and shows the others' lists; jobs
   paused on their own, jobs whose folders aren't there or don't answer, and jobs whose confirmed
   list already waits for another sync are left out), *Review Waiting Jobs…* and *Pause
-  Everything* (it also stops at once every sync you didn't confirm a list for; a sync you
-  confirmed goes on).
-- **Notifications** when changes wait for your OK (a reminder after two hours, then once a day),
-  when a full-automation run is held back, and for errors, files that couldn't be read or that a
-  drive couldn't hold, conflicts and big syncs. A problem that comes back at every sync is told
-  once, until a sync goes well again.
+  Everything* (it also stops at once every sync you didn't confirm a list for, and a *Sync All…*
+  that is still starting jobs starts no more of them; a sync you confirmed goes on).
+- **Notifications** when changes wait for your OK or files wait to be compared (a reminder after
+  two hours, then once a day), when a full-automation run is held back, and for errors, files
+  that couldn't be read or that a drive couldn't hold, conflicts and big syncs. A problem that
+  comes back at every sync is told once, until a sync goes well again.
 - **Launch at login** (off by default). With *Keep running when the window is closed* on (the
   default), Charon keeps looking for changes from the menu bar or tray after you close the window.
 - **Tells you when a new version is out**: it asks GitHub at start-up and once a day, and an
