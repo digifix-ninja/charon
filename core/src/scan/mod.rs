@@ -1,5 +1,6 @@
 //! Reading a folder into a snapshot.
 //!
+//! * `clients.rs` – which folders Nextcloud and ownCloud clients sync (`ClientSettings`)
 //! * `cloud.rs`   – the placeholders cloud services leave for files they free up (`Placeholder`)
 //! * `entry.rs`   – one file, folder or link (`Entry`) and a whole folder (`Snapshot`)
 //! * `contents.rs` – comparing two files byte for byte (`Contents`)
@@ -9,6 +10,7 @@
 //! * `scanner.rs` – walking a folder (`Scanner`), noting every place it couldn't read
 //! * `volume.rs`  – what kind of drive a folder is on and what it can hold (`Volume`)
 
+mod clients;
 mod cloud;
 mod contents;
 mod entry;
@@ -18,7 +20,7 @@ mod root;
 mod scanner;
 mod volume;
 
-pub use cloud::{CloudService, Placeholder};
+pub use cloud::{is_sync_journal, CloudService, Placeholder};
 pub use contents::Contents;
 pub use entry::{CharonFolder, Entry, EntryKind, ScanFacts, Skipped, Snapshot, MTIME_TOLERANCE_MS};
 pub use filter::{

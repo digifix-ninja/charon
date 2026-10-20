@@ -226,7 +226,8 @@ pub struct ScanFacts {
     pub(crate) skipped: Vec<Skipped>,
     /// Items left out without a note because their names are kept for Charon's own use
     /// (its trash, its marker, its half-copied files), for the drive's (its folders at the
-    /// top) or for a cloud service's (its placeholders): key → the path as spelled on disk.
+    /// top) or for a cloud service's (its placeholders, a sync client's journal): key → the
+    /// path as spelled on disk.
     /// Those names are matched as they are written, not by key, so an item whose key is the
     /// same but whose name is written in another case is left alone too, on either side.
     pub(crate) reserved: BTreeMap<String, String>,

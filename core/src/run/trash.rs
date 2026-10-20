@@ -8,9 +8,10 @@
 //! replaced in place: an app that has the file open (Pages, TextEdit, Preview…) follows the
 //! file itself, not its name, so after a move it would go on saving the person's work into
 //! the trash. Replaced in place, the app notices the new version instead. (On APFS, where a
-//! copy takes no time and no room, a removed file is copied there too and then removed, and
-//! so is one on another drive than the trash, in a folder mounted inside the job's: see
-//! `Executor::remove`.)
+//! copy takes no time and no room, a removed file is copied there too and then removed. So is
+//! anything that goes into the trash from another drive than the trash's, in a folder
+//! mounted inside the job's: a removed file or link, the system's files left in a removed
+//! folder, a leftover of an interrupted sync. See `Executor::move_to_trash`.)
 //!
 //! Each dated folder holds a list of what its run put there, with each file's size and time
 //! (`.charon`). A file that no longer matches it was changed after it went into the trash:
@@ -27,11 +28,13 @@
 //! top of the dated folder instead of failing on every sync.
 
 use crate::error::{Error, Result};
+#[cfg(windows)]
+use crate::run::identity::Identity;
 use crate::run::marker::hide;
 use crate::run::names;
 use crate::run::rename::{move_to_new_name, rename_new};
 use crate::run::{durable, Copier};
-use crate::scan::{is_clutter, is_partial, Entry, Keys, Refusal, Scanner, TRASH_FOLDER};
+use crate::scan::{is_clutter, is_partial, Entry, Keys, Placeholder, Refusal, Scanner, TRASH_FOLDER};
 use chrono::{DateTime, Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
@@ -128,14 +131,17 @@ impl Trash {
         self.keep(root, &base, relative, |place| move_to_new_name(from, place).map_err(|e| Error::file(from, e)))
     }
 
-    /// Copies the file `root/relative` into the trash, leaving it where it is. On drives that
-    /// support it (APFS, Btrfs) the copy is a clone: instant, and it takes no room. When the
-    /// file can't be read, this fails as `Copier::unreadable` says. When the trash can't take
-    /// the copy (its folders, or the copy's place in it), it fails with that place in the
-    /// trash: that is never a file Charon couldn't read.
+    /// Copies the file or link `root/relative` into the trash, leaving it where it is. On
+    /// drives that support it (APFS, Btrfs) a file's copy is a clone: instant, and it takes no
+    /// room. When the file can't be read, this fails as `Copier::unreadable` says. When the
+    /// trash can't take the copy (its folders, or the copy's place in it), it fails with that
+    /// place in the trash: that is never a file Charon couldn't read.
     pub fn preserve(&self, root: &Path, relative: &str) -> Result<PathBuf> {
         let from = root.join(relative);
         let base = self.dated(root)?;
+        if fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_symlink()) {
+            return self.keep(root, &base, relative, |place| Self::copy_link(&from, place));
+        }
         // Written under a temporary name at the top of the dated folder first: a half-written
         // copy never takes a name, and nothing already in the trash is ever written over.
         let temp = Copier::partial_in(&base);
@@ -303,6 +309,27 @@ impl Trash {
         Ok(())
     }
 
+    /// Makes a link like the one at `from` at `to`, with its time: the link itself, never what
+    /// it points to. Fails with `AlreadyExists` when `to` is taken.
+    #[cfg(unix)]
+    fn copy_link(from: &Path, to: &Path) -> Result<()> {
+        let target = fs::read_link(from).map_err(|e| Error::file(from, e))?;
+        std::os::unix::fs::symlink(&target, to).map_err(|e| Error::file(to, e))?;
+        if let Ok(meta) = fs::symlink_metadata(from) {
+            let modified = filetime::FileTime::from_last_modification_time(&meta);
+            if let Err(e) = filetime::set_symlink_file_times(to, modified, modified) {
+                log::debug!("couldn't keep the time of the link {} in the trash: {e}", from.display());
+            }
+        }
+        Ok(())
+    }
+
+    /// Windows plans never hold links (see `Copier::link`).
+    #[cfg(not(unix))]
+    fn copy_link(from: &Path, _to: &Path) -> Result<()> {
+        Err(Error::file(from, io::Error::other("only files are copied into the trash")))
+    }
+
     /// A copy of a file locked in the Finder is locked too (macOS copies a file's flags
     /// along): it could neither take its place in the trash nor ever be cleared out of it.
     /// The copy's lock is lifted; the file itself keeps its own.
@@ -449,6 +476,7 @@ impl Trash {
             let revived = match list {
                 Some(list) => match list.get(&path) {
                     Some(listed) => !Self::as_listed(&meta, listed, shifting),
+                    None if Self::stands_in_for_listed(folder, &path, list) => false,
                     None => modified > made,
                 },
                 None => modified > made + UNLISTED_MARGIN_MS && modified <= now + 60_000,
@@ -464,6 +492,20 @@ impl Trash {
     /// for `days` (none when `days` is 0, which keeps everything).
     fn cutoff(days: u32) -> Option<DateTime<Local>> {
         (days > 0).then(|| Local::now() - chrono::Duration::days(days as i64))
+    }
+
+    /// Whether the file at `path` in the dated `folder` is a cloud service's placeholder for
+    /// a file the folder's list names, and that file is no longer there: the service freed it
+    /// up and left its stand-in (iCloud Drive before macOS 14 turns `report.txt` into a new,
+    /// hidden `.report.txt.icloud`). That holds nobody's work, whatever its time, and goes
+    /// along with its dated folder.
+    fn stands_in_for_listed(folder: &Path, path: &str, list: &Listed) -> bool {
+        let Some(placeholder) = Placeholder::named(Keys::name(path)) else { return false };
+        let item = match Keys::parent(path) {
+            Some(parent) => format!("{parent}/{}", placeholder.item),
+            None => placeholder.item.to_string(),
+        };
+        list.contains_key(&item) && fs::symlink_metadata(folder.join(&item)).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
     }
 
     /// Whether a file named `name` in the trash never holds someone's work, whatever its
@@ -505,8 +547,7 @@ impl Trash {
                 log::warn!("kept {}: something in it changed after it went into the trash, or can't be read", folder.display());
                 continue;
             }
-            Self::lift_read_only_marks(&folder);
-            if let Err(e) = fs::remove_dir_all(&folder) {
+            if let Err(e) = Self::clear_out(&folder) {
                 log::warn!("couldn't clear old trash {}: {e}", folder.display());
             }
         }
@@ -514,12 +555,31 @@ impl Trash {
         let _ = fs::remove_dir(&trash);
     }
 
-    /// Windows: what went into the trash keeps its read-only mark, and FAT and exFAT drives
-    /// won't remove a read-only file or folder. The marks inside `folder` are lifted first,
-    /// never through a link.
+    /// Removes the dated `folder` with everything in it. On Windows what went into the trash
+    /// keeps its read-only mark: NTFS removes a marked item all the same, FAT and exFAT
+    /// refuse to. Only when the drive refuses are the marks lifted (see
+    /// `lift_read_only_marks`), and the folder removed once more.
+    fn clear_out(folder: &Path) -> io::Result<()> {
+        match fs::remove_dir_all(folder) {
+            Err(e) if cfg!(windows) && e.kind() == io::ErrorKind::PermissionDenied => {
+                Self::lift_read_only_marks(folder);
+                fs::remove_dir_all(folder)
+            }
+            removed => removed,
+        }
+    }
+
+    /// Windows: lifts the read-only marks of `folder` and of everything in it, never through
+    /// a link. A file with more than one name (hard links) keeps its mark: the mark is the
+    /// file's, so it would be lifted for every one of its names, which may be the person's
+    /// files outside the trash. (FAT and exFAT, which need the marks lifted, have no hard
+    /// links.)
     #[cfg(windows)]
     fn lift_read_only_marks(folder: &Path) {
         for item in walkdir::WalkDir::new(folder).follow_links(false).into_iter().flatten() {
+            if item.file_type().is_file() && Identity::names(item.path()) != Some(1) {
+                continue;
+            }
             Copier::make_writable(item.path());
         }
     }
@@ -789,6 +849,54 @@ mod tests {
         assert!(!dated.exists());
     }
 
+    /// iCloud Drive before macOS 14 frees up the files nobody used for long, the trash's old
+    /// ones first: the file goes, and a new hidden `.report.txt.icloud` stands in for it.
+    /// That stand-in is nobody's work: the folder is still cleared out when its time comes,
+    /// with it. A placeholder for a file the list doesn't name, or for one that's still
+    /// there, is judged by its time like any other file.
+    #[test]
+    fn a_cloud_placeholder_for_a_listed_file_is_nobodys_work() {
+        let tmp = tempfile::tempdir().unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        fs::create_dir_all(tmp.path().join("Docs")).unwrap();
+        let mut kept = Vec::new();
+        for name in ["report.txt", "Docs/plans.odt", "notes.txt"] {
+            fs::write(tmp.path().join(name), "the old version").unwrap();
+            set_time(&tmp.path().join(name), days_ago(41));
+            kept.push(trash.put(tmp.path(), name).unwrap());
+        }
+        trash.write_lists();
+        let dated = kept[0].parent().unwrap().to_path_buf();
+        let folder = dated.file_name().unwrap().to_string_lossy().into_owned();
+        let stand_in = |placeholder: &str| {
+            fs::write(dated.join(placeholder), "the service's stand-in").unwrap();
+            set_time(&dated.join(placeholder), days_ago(2));
+        };
+
+        // Freed up days later.
+        for (file, placeholder) in [("report.txt", ".report.txt.icloud"), ("Docs/plans.odt", "Docs/plans.odt.nextcloud")] {
+            fs::remove_file(dated.join(file)).unwrap();
+            stand_in(placeholder);
+        }
+        for thorough in [false, true] {
+            let look = Trash::look(tmp.path(), 30, thorough, false);
+            assert!(look.revived.is_empty(), "{:?}", look.revived);
+            assert_eq!(look.expired.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), vec![folder.as_str()]);
+        }
+        for placeholder in [".notes.txt.icloud", ".other.txt.icloud"] {
+            stand_in(placeholder);
+        }
+        let look = Trash::look(tmp.path(), 30, false, false);
+        assert!(look.expired.is_empty());
+        assert_eq!(look.revived, vec![format!("{TRASH_FOLDER}/{folder}/.notes.txt.icloud"), format!("{TRASH_FOLDER}/{folder}/.other.txt.icloud")]);
+
+        for placeholder in [".notes.txt.icloud", ".other.txt.icloud"] {
+            fs::remove_file(dated.join(placeholder)).unwrap();
+        }
+        Trash::sweep(tmp.path(), std::slice::from_ref(&folder), 30, false);
+        assert!(!dated.exists(), "cleared out, the stand-ins with it");
+    }
+
     #[test]
     fn a_younger_folder_is_checked_by_its_list_when_the_look_is_thorough() {
         let tmp = tempfile::tempdir().unwrap();
@@ -891,27 +999,63 @@ mod tests {
         assert!(!tmp.path().join(TRASH_FOLDER).exists());
     }
 
-    /// Windows: clearing out a dated folder first lifts the read-only marks of everything in
-    /// it, the folder itself included. (FAT and exFAT drives won't remove a marked item; NTFS
-    /// removes it anyway, so this looks at the marks themselves.)
+    /// Windows: where a drive won't remove a marked item (FAT, exFAT), the read-only marks in
+    /// a dated folder are lifted, the folder's own included. A file with a name outside the
+    /// folder too keeps its mark. (NTFS removes a marked item all the same, so this looks at
+    /// the marks themselves.)
     #[cfg(windows)]
     #[test]
     fn the_read_only_marks_in_a_dated_folder_are_lifted() {
-        let tmp = tempfile::tempdir().unwrap();
-        let folder = tmp.path().join("2000-01-01_00-00-00");
-        let inner = folder.join("from a cd");
-        let file = inner.join("photo.jpg");
-        fs::create_dir_all(&inner).unwrap();
-        fs::write(&file, "photo").unwrap();
-        for item in [&file, &inner, &folder] {
+        let read_only = |item: &Path| {
             let mut permissions = fs::metadata(item).unwrap().permissions();
             permissions.set_readonly(true);
             fs::set_permissions(item, permissions).unwrap();
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("2000-01-01_00-00-00");
+        let inner = folder.join("from a cd");
+        let (file, shared, outside) = (inner.join("photo.jpg"), inner.join("shared.jpg"), tmp.path().join("shared.jpg"));
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(&file, "photo").unwrap();
+        fs::write(&outside, "a file with two names").unwrap();
+        fs::hard_link(&outside, &shared).unwrap();
+        for item in [&file, &outside, &inner, &folder] {
+            read_only(item);
         }
         Trash::lift_read_only_marks(&folder);
         for item in [&file, &inner, &folder] {
             assert!(!fs::metadata(item).unwrap().permissions().readonly(), "{} is still read-only", item.display());
         }
+        assert!(fs::metadata(&outside).unwrap().permissions().readonly(), "the file's other name keeps its mark");
+    }
+
+    /// Windows: a file in the trash may have other names outside it (hard links: a git clone
+    /// of a repository on the same drive shares its objects' files with it), and a read-only
+    /// mark is the file's, shared by all of its names. Clearing out old trash leaves that
+    /// mark as it is: NTFS removes the trash's name all the same.
+    #[cfg(windows)]
+    #[test]
+    fn clearing_out_the_trash_keeps_the_mark_of_a_file_with_names_outside_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (original, clone) = (tmp.path().join("repository/objects/ab12"), tmp.path().join("clone/objects/ab12"));
+        fs::create_dir_all(original.parent().unwrap()).unwrap();
+        fs::create_dir_all(clone.parent().unwrap()).unwrap();
+        fs::write(&original, "an object").unwrap();
+        set_time(&original, days_ago(41));
+        fs::hard_link(&original, &clone).unwrap();
+        let trash = Trash::for_run(days_ago(40));
+        let kept = trash.put(tmp.path(), "clone/objects/ab12").unwrap();
+        trash.write_lists();
+        let mut permissions = fs::metadata(&original).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&original, permissions).unwrap();
+
+        let look = Trash::look(tmp.path(), 30, false, false);
+        assert_eq!(look.expired.len(), 1, "{look:?}");
+        Trash::sweep(tmp.path(), &[look.expired[0].name.clone()], 30, false);
+        assert!(!kept.exists(), "cleared out");
+        assert!(fs::metadata(&original).unwrap().permissions().readonly(), "the repository's object keeps its mark");
+        assert_eq!(fs::read_to_string(&original).unwrap(), "an object");
     }
 
     /// A folder without a list (an interrupted run, an earlier version) is judged by the

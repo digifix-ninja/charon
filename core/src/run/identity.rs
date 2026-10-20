@@ -46,6 +46,14 @@ impl Identity {
             file.metadata().ok().as_ref().and_then(Self::of)
         }
     }
+
+    /// How many names (hard links) the file at `path` has, without following a link there.
+    /// `None` when it can't be told. On Windows a file's read-only mark is the file's, shared
+    /// by all of its names.
+    #[cfg(windows)]
+    pub fn names(path: &Path) -> Option<u32> {
+        system::names(path)
+    }
 }
 
 #[cfg(windows)]
@@ -59,18 +67,35 @@ mod system {
         GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
     };
 
-    /// Opened only to read its numbers: without access to its contents (so a file another
-    /// app holds open opens too), a folder with backup semantics, and a link as itself.
     pub fn at(path: &Path) -> Option<Identity> {
-        let item = OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path).ok()?;
-        of_file(&item)
+        information(path).map(identity)
     }
 
     pub fn of_file(file: &File) -> Option<Identity> {
+        information_of(file).map(identity)
+    }
+
+    pub fn names(path: &Path) -> Option<u32> {
+        information(path).map(|info| info.nNumberOfLinks)
+    }
+
+    fn identity(info: BY_HANDLE_FILE_INFORMATION) -> Identity {
+        Identity(info.dwVolumeSerialNumber as u64, ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64)
+    }
+
+    /// What the drive says about the item at `path`, opened only to read that: without
+    /// access to its contents (so a file another app holds open opens too), a folder with
+    /// backup semantics, and a link as itself.
+    fn information(path: &Path) -> Option<BY_HANDLE_FILE_INFORMATION> {
+        let item = OpenOptions::new().access_mode(0).custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).open(path).ok()?;
+        information_of(&item)
+    }
+
+    fn information_of(file: &File) -> Option<BY_HANDLE_FILE_INFORMATION> {
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: the handle is open for the duration of the call and `info` is a valid buffer.
         let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) };
-        (ok != 0).then(|| Identity(info.dwVolumeSerialNumber as u64, ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64))
+        (ok != 0).then_some(info)
     }
 }
 
