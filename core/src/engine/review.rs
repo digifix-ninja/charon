@@ -100,12 +100,33 @@ impl Engine {
 
     /// One page of a review's steps, filtered by kind and by a part of the path.
     pub fn review_steps(&self, id: &JobId, review_id: &str, filter: StepFilter, query: &str, offset: usize, limit: usize) -> Result<StepPage> {
+        self.review_steps_in(id, review_id, filter, query, None, offset, limit)
+    }
+
+    /// One page of a review's steps, like `review_steps`, and only those at or inside
+    /// `folder` (a path as the list spells it) when one is given: what goes with a removed
+    /// folder, and nothing from another folder whose path merely contains its name.
+    #[allow(clippy::too_many_arguments)]
+    pub fn review_steps_in(
+        &self,
+        id: &JobId,
+        review_id: &str,
+        filter: StepFilter,
+        query: &str,
+        folder: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<StepPage> {
         let review = self.stored_review(id, review_id)?;
         let query = query.trim().to_lowercase();
+        let folder = folder.map(|folder| folder.trim_end_matches('/')).filter(|folder| !folder.is_empty());
+        let inside = |path: &str| {
+            folder.is_none_or(|folder| path.strip_prefix(folder).is_some_and(|rest| rest.is_empty() || rest.starts_with('/')))
+        };
         let matching: Vec<&ReviewStep> = review
             .steps
             .iter()
-            .filter(|step| filter.admits(step) && (query.is_empty() || step.path.to_lowercase().contains(&query)))
+            .filter(|step| filter.admits(step) && inside(&step.path) && (query.is_empty() || step.path.to_lowercase().contains(&query)))
             .collect();
         let steps = matching.iter().skip(offset).take(limit.min(MAX_PAGE)).map(|step| (*step).clone()).collect();
         Ok(StepPage { steps, total: matching.len() })

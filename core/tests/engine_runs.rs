@@ -143,6 +143,51 @@ fn a_list_is_confirmed_once_and_only_as_it_was_made() {
 }
 
 #[test]
+fn a_removed_folder_lists_only_what_is_inside_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    for path in ["Scans/2019/a.pdf", "Scans/2019/b.pdf", "Old/Scans/2019/c.pdf", "Scans/2019 copy/d.pdf", "keep.txt"] {
+        write(&src.join(path), "x");
+    }
+    fs::create_dir_all(&dst).unwrap();
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&src, &dst, SyncMode::Mirror, ConflictRule::Ask)).unwrap().job.id;
+    confirm(&engine, &id);
+    for folder in ["Scans/2019", "Old/Scans/2019", "Scans/2019 copy"] {
+        fs::remove_dir_all(src.join(folder)).unwrap();
+    }
+
+    let review = engine.prepare_review(&id).unwrap();
+    let page = engine.review_steps_in(&id, &review.review_id, StepFilter::Removals, "", Some("Scans/2019"), 0, 50).unwrap();
+    let mut paths: Vec<&str> = page.steps.iter().map(|step| step.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["Scans/2019", "Scans/2019/a.pdf", "Scans/2019/b.pdf"], "nothing from another folder with the same name in its path");
+    assert_eq!(page.total, 3);
+    // Without a folder, the search still finds a part of the path anywhere.
+    let all = engine.review_steps(&id, &review.review_id, StepFilter::Removals, "scans/2019", 0, 50).unwrap();
+    assert!(all.total > 3);
+}
+
+#[test]
+fn full_automation_is_confirmed_once_even_when_nothing_needs_to_cross() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));
+    write(&src.join("same.txt"), "same");
+    write(&dst.join("same.txt"), "same");
+    let engine = engine(&data);
+    let mut automatic = setup(&src, &dst, SyncMode::TwoWay, ConflictRule::Ask);
+    automatic.full_automation = true;
+    let id = engine.add_job(automatic).unwrap().job.id;
+    assert!(!engine.job(&id).unwrap().runs_by_itself);
+
+    let review = engine.prepare_review(&id).unwrap();
+    assert_eq!(review.total_steps, 0);
+    engine.approve(&id, &review.review_id, false).unwrap();
+    wait(&engine, &id);
+    assert!(engine.job(&id).unwrap().runs_by_itself, "the empty list, confirmed, lets it run by itself");
+}
+
+#[test]
 fn mirror_refuses_to_wipe_from_an_empty_source() {
     let tmp = tempfile::tempdir().unwrap();
     let (src, dst, data) = (tmp.path().join("src"), tmp.path().join("dst"), tmp.path().join("data"));

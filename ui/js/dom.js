@@ -30,7 +30,7 @@ export class Dom {
 
   /** A selector that finds the same control again after a redraw, from its data attributes. */
   static selectorOf(element) {
-    const keys = ["do", "action", "id", "index", "key", "choice", "field", "value", "tab", "trigger"];
+    const keys = ["do", "action", "id", "list", "index", "key", "choice", "field", "value", "tab", "trigger"];
     const parts = keys
       .filter(key => element.dataset?.[key] !== undefined)
       .map(key => `[data-${key}="${CSS.escape(element.dataset[key])}"]`);

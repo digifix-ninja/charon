@@ -7,6 +7,7 @@
 //   charonDemo.syncAll()          the tray's "Sync All…"
 //   charonDemo.showWaiting()      the tray's "Review waiting jobs…"
 //   charonDemo.quit()             the tray's Quit while jobs wait
+//   charonDemo.quitting()         Charon quits while a sync runs and stops it safely first
 //   charonDemo.change("projects") something changes in a job's folders (open lists go stale)
 //   charonDemo.refuseNext()       the next confirm is refused, to see how that looks
 
@@ -24,6 +25,9 @@ const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
 const DEFAULT_EXCLUDES = [".DS_Store", "._*", ".Spotlight-V100", ".Trashes", ".fseventsd", "Thumbs.db", "desktop.ini", "$RECYCLE.BIN", "~$*", "*.tmp"];
 
 /** Which kinds of steps each filter of the review shows. */
+/** The kinds of note a row lists under "Not synced", as the engine's JobView does. */
+const NOT_SYNCED = ["left-out", "name-clash", "blocked"];
+
 const FILTER_KINDS = {
   removals: ["remove"],
   replacements: ["replace", "settle"],
@@ -56,7 +60,7 @@ const setupKey = j => JSON.stringify([j.source, j.destination, j.mode, j.conflic
 function run(fields) {
   return {
     startedAt: ago(5 * MIN), finishedAt: ago(4 * MIN),
-    copied: 0, deleted: 0, bytes: 0, conflicts: 0, failed: 0, skipped: 0, leftOut: 0, kept: 0, unreadable: 0,
+    copied: 0, deleted: 0, bytes: 0, conflicts: 0, failed: 0, skipped: 0, leftOut: 0, kept: 0, unreadable: 0, settled: 0, unkept: 0,
     cancelled: false, error: null, approved: true,
     ...fields,
   };
@@ -83,11 +87,14 @@ function job(id, fields) {
     rev: 0,
     status: "in-sync",
     runsByItself: false,
+    looking: false,
     waiting: null,
     pending: null,
     progress: null,
     conflicts: [],
     unreadable: [],
+    notSynced: [],
+    notSyncedCount: 0,
     problem: null,
     sourceOnline: true,
     destinationOnline: true,
@@ -95,6 +102,7 @@ function job(id, fields) {
     destinationVolume: null,
     nextRun: null,
     stale: null,
+    waitingFor: null,
     ...fields,
   };
 }
@@ -144,6 +152,7 @@ const WORLDS = {
       files: { source: 12_034, destination: 11_998 },
       steps,
       agreed: 8_000,
+      compare: { files: 36, bytes: 412_000_000 },
       warnings: [
         { level: "danger", text: "880 files would be removed on the destination, among them the whole folder Renders/2019 (860 files). Check that this is what you meant to do on the source." },
         { level: "caution", text: "3 files would be removed and 2 replaced on the source, where your originals are." },
@@ -153,7 +162,7 @@ const WORLDS = {
         { kind: "unreadable", side: "source", path: "Private/keys", reason: "Permission denied", canLeaveOut: true },
         { kind: "name-clash", side: "destination", path: "Docs/Readme.md", reason: "Docs/README.md is there too, and the NAS doesn't tell upper and lower case apart. Rename one of them; until then neither crosses.", canLeaveOut: false },
         { kind: "kept-folder", side: "destination", path: "build", reason: "Kept, though it was removed on the source: it still holds files your excludes leave out (node_modules).", canLeaveOut: false },
-        { kind: "left-out", side: null, path: "node_modules", reason: "Left out by the pattern node_modules (14,200 items).", canLeaveOut: false },
+        { kind: "left-out", side: "source", path: "Charon/target/latest", reason: "A symbolic link, and the NAS can't hold links: it stays on the source.", canLeaveOut: false },
       ],
       looked: true,
       since: ago(25 * HOUR),
@@ -276,7 +285,7 @@ export class DemoBackend {
   static create() {
     const backend = new DemoBackend();
     window.charonDemo = backend.console();
-    console.info("Charon demo: try charonDemo.syncAll(), charonDemo.showWaiting(), charonDemo.quit(), charonDemo.change(\"projects\") or charonDemo.refuseNext().");
+    console.info("Charon demo: try charonDemo.syncAll(), charonDemo.showWaiting(), charonDemo.quit(), charonDemo.quitting(), charonDemo.change(\"projects\") or charonDemo.refuseNext().");
     return { core: { invoke: (c, a) => backend.invoke(c, a) }, event: { listen: (e, h) => backend.listen(e, h) } };
   }
 
@@ -286,6 +295,7 @@ export class DemoBackend {
     this.worlds = new Map();    // id → what differs between its folders (never sent as is)
     this.reviews = new Map();   // reviewId → {review, steps, notes, jobId, setup, stale, settles}
     this.looks = new Map();     // id → set of running looks, so cancel_review can stop them
+    this.checked = new Set();   // ids of the jobs looked at since the demo started
     this.timers = new Map();    // id → a running sync's timer
     this.logs = new Map();      // id → log lines, newest first
     this.reviewCount = 0;
@@ -371,6 +381,8 @@ export class DemoBackend {
       waiting: this.jobs.filter(j => j.waiting).length,
       attention: count("error", "conflict"),
       offline: count("offline"),
+      looking: count("looking"),
+      incomplete: this.jobs.filter(j => j.unreadable.length || j.notSyncedCount > 0).length,
       pausedAll: this.settings.pausedAll,
     };
   }
@@ -399,21 +411,43 @@ export class DemoBackend {
   settle(j) {
     const w = this.world(j.id);
     const changes = w.steps.filter(s => s.kind !== "conflict");
-    const known = w.looked && changes.length > 0;
+    // Until the demo has looked at a job, what waited before still waits, but uncounted.
+    const checked = this.checked.has(j.id);
+    const waited = w.looked && changes.length > 0;
+    const known = checked && waited;
     j.runsByItself = j.fullAutomation && !j.needsReview;
-    j.waiting = known && (!j.runsByItself || w.held) ? this.waitingOf(j, w, changes) : null;
+    j.waiting = known && (!j.runsByItself || w.held) ? this.waitingOf(j, w, changes)
+      : !checked && waited && !j.runsByItself ? { ...this.waitingOf(j, w, []), conflicts: 0, held: null, counted: false }
+      : null;
     j.pending = known && !j.waiting ? { items: changes.length, bytes: changes.reduce((n, s) => n + s.bytes, 0), checkedAt: now() } : null;
+    const places = checked && w.looked ? w.notes.filter(n => NOT_SYNCED.includes(n.kind) && n.side) : [];
+    j.notSynced = places.slice(0, 100).map(({ kind, side, path, reason }) => ({ kind, side, path, reason, privacy: false }));
+    j.notSyncedCount = places.length;
+    const failedRun = j.lastRun && !j.lastRun.cancelled && (j.lastRun.error || j.lastRun.failed > 0);
     j.status = this.timers.has(j.id) ? "syncing"
       : !this.online(j) ? "offline"
       : j.paused ? "paused"
       : j.conflicts.length ? "conflict"
-      : j.lastRun?.error ? "error"
+      : failedRun ? "error"
       : j.waiting ? "review"
       : !j.lastSynced ? "new"
       : j.pending ? "pending"
+      : !checked ? "looking"
       : "in-sync";
+    j.looking = !this.timers.has(j.id) && (this.looks.get(j.id)?.size > 0 || (!checked && this.online(j) && !j.paused));
     if (j.status !== "syncing") j.progress = null;
     j.rev += 1;
+  }
+
+  /** Looks at every job once, a moment after the window asks, as Charon does when it starts. */
+  lookAtEverything() {
+    if (this.lookedAtStart) return;
+    this.lookedAtStart = true;
+    this.jobs.forEach((j, i) => setTimeout(() => {
+      if (!this.jobs.includes(j) || this.checked.has(j.id)) return;
+      this.checked.add(j.id);
+      this.publish(j);
+    }, 1_200 + i * 600));
   }
 
   waitingOf(j, w, changes) {
@@ -426,6 +460,7 @@ export class DemoBackend {
       conflicts: w.steps.filter(s => s.kind === "conflict").length,
       held: w.held ?? null,
       since: w.since ?? now(),
+      counted: true,
     };
   }
 
@@ -455,12 +490,16 @@ export class DemoBackend {
 
   // ---------------------------------------------------------------- looking
 
-  /** Pretends to count both folders, sending counts as it goes. Throws "Stopped." when cancelled. */
+  /**
+   * Pretends to count both folders, then to compare the files that differ only by date,
+   * sending counts as it goes. Throws "Stopped." when cancelled.
+   */
   async count(j) {
     const w = this.world(j.id);
     const look = { cancelled: false };
     if (!this.looks.has(j.id)) this.looks.set(j.id, new Set());
     this.looks.get(j.id).add(look);
+    this.publish(j);
     try {
       const ticks = 14 + Math.round(Math.random() * 12);
       for (let t = 1; t <= ticks; t++) {
@@ -471,8 +510,19 @@ export class DemoBackend {
           this.emit("scan-progress", { id: j.id, side, items: Math.round(w.files[side] * share) });
         }
       }
+      const compare = w.compare;
+      for (let t = 1; compare && t <= 10; t++) {
+        await wait(110);
+        if (look.cancelled) throw "Stopped.";
+        this.emit("compare-progress", {
+          id: j.id, files: Math.round((compare.files * t) / 10), totalFiles: compare.files,
+          bytes: Math.round((compare.bytes * t) / 10), totalBytes: compare.bytes,
+        });
+      }
+      this.checked.add(j.id);
     } finally {
       this.looks.get(j.id).delete(look);
+      if (this.jobs.includes(j)) this.publish(j);
     }
   }
 
@@ -706,7 +756,9 @@ export class DemoBackend {
   async invoke(command, args = {}) {
     await wait(30);
     switch (command) {
-      case "get_state": return structuredClone({ jobs: this.jobs, settings: this.settings, overview: this.overview(), defaultExcludes: DEFAULT_EXCLUDES });
+      case "get_state":
+        this.lookAtEverything();
+        return structuredClone({ jobs: this.jobs, settings: this.settings, overview: this.overview(), defaultExcludes: DEFAULT_EXCLUDES });
       case "about": return { name: "Charon", version: "0.3.0", appWebsite: "https://charonsync.app", sourceCode: "https://github.com/steanart/charon", developer: "stean.DEV", developerWebsite: "https://stean.dev", developerEmail: "a.s@stean.dev", licence: "MIT", copyrightYear: "2026" };
       case "update_info": return null;
       case "check_updates": {
@@ -782,7 +834,9 @@ export class DemoBackend {
         const entry = this.entry(args.id, args.reviewId);
         const kinds = FILTER_KINDS[args.filter];
         const query = String(args.query ?? "").toLowerCase();
-        const list = entry.steps.filter(s => (!kinds || kinds.includes(s.kind)) && (!query || s.path.toLowerCase().includes(query)));
+        const folder = args.folder ? String(args.folder).replace(/\/+$/, "") : null;
+        const inside = path => !folder || path === folder || path.startsWith(`${folder}/`);
+        const list = entry.steps.filter(s => (!kinds || kinds.includes(s.kind)) && inside(s.path) && (!query || s.path.toLowerCase().includes(query)));
         await wait(60 + Math.random() * 120);
         return { steps: list.slice(args.offset, args.offset + Math.min(500, args.limit)), total: list.length };
       }
@@ -918,6 +972,10 @@ export class DemoBackend {
       syncAll: () => this.emit("sync-all"),
       showWaiting: () => this.emit("show-waiting"),
       quit: () => this.emit("confirm-quit", { jobs: this.jobs.filter(j => j.waiting).length }),
+      quitting: () => {
+        const running = this.jobs.filter(j => this.syncing(j)).map(j => j.name);
+        this.emit("quitting", { jobs: running.length ? running : [this.jobs[0]?.name ?? "Projects"] });
+      },
       change: id => this.outdate(id),
       refuseNext: () => { this.refuseOnce = true; },
     };

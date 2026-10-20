@@ -70,7 +70,7 @@ export class Api {
   // ---- the review: the list of changes, shown before anything is touched
   static prepareReview(id) { return this.call("prepare_review", { id }); }
   static cancelReview(id) { return this.call("cancel_review", { id }); }
-  static reviewSteps(id, reviewId, filter, query, offset, limit) { return this.call("review_steps", { id, reviewId, filter, query, offset, limit }); }
+  static reviewSteps(id, reviewId, filter, query, offset, limit, folder = null) { return this.call("review_steps", { id, reviewId, filter, query, folder, offset, limit }); }
   static reviewNotes(id, reviewId, offset, limit) { return this.call("review_notes", { id, reviewId, offset, limit }); }
   static approve(id, reviewId, acknowledged) { return this.call("approve", { id, reviewId, acknowledged }); }
   static discardReview(id, reviewId) { return this.call("discard_review", { id, reviewId }); }

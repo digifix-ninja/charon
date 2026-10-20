@@ -5,6 +5,7 @@ import { Api } from "../api.js";
 import { Dom } from "../dom.js";
 import { Icons } from "../icons.js";
 import { Modal } from "./modal.js";
+import { Platform } from "../platform.js";
 import { Sheet } from "./sheet.js";
 import { Theme } from "../theme.js";
 
@@ -69,11 +70,11 @@ export class SettingsPanel extends Sheet {
           <span class="copy"><strong>Appearance</strong><small>Dark like the river at night, light like paper, or whatever your system uses.</small></span>
           <span class="segmented">${raw(choice("system", "System"))}${raw(choice("light", "Light"))}${raw(choice("dark", "Dark"))}</span>
         </div>
-        ${raw(toggle("launchAtLogin", "Launch at login", "Charon starts quietly in the menu bar when you log in."))}
-        ${raw(toggle("runInBackground", "Keep running when the window is closed", "Charon keeps looking for changes from the menu bar or system tray, and jobs with full automation keep syncing."))}
+        ${raw(toggle("launchAtLogin", "Launch at login", `Charon starts quietly in the ${Platform.tray()} when you log in.`))}
+        ${raw(toggle("runInBackground", "Keep running when the window is closed", `Charon keeps looking for changes from the ${Platform.tray()}, and jobs with full automation keep syncing.`))}
         ${raw(toggle("notifications", "Notifications", "Errors, conflicts, big syncs, and changes waiting for your OK."))}
         ${raw(toggle("pausedAll", "Pause everything", "Nothing syncs by itself. Charon still looks for changes and shows what's waiting."))}
-        ${raw(number("trashDays", "Keep deleted files", "Charon keeps removed and replaced files in a hidden .charon-trash folder on each drive for this many days. 0 keeps them until you empty it.", "days", 0, 3650))}
+        ${raw(number("trashDays", "Keep deleted files", "Charon keeps removed and replaced files in a hidden .charon-trash folder on each drive for this many days. 0 keeps them until you empty it. Only a sync you confirmed empties it: syncs with full automation never do.", "days", 0, 3650))}
         ${raw(number("checkMinutes", "Look for changes", "How often Charon looks for changes in each job, besides watching the folders.", "min", 1, 1440))}
         ${raw(toggle("checkUpdates", "Look for new versions", "Charon asks GitHub at start-up and once a day. Nothing is downloaded without you."))}
       </div></div>`;

@@ -6,6 +6,7 @@ const STATUS_NAMES = {
   syncing: "Syncing",
   pending: "Pending",
   review: "Needs your OK",
+  looking: "Looking",
   paused: "Paused",
   conflict: "Conflict",
   error: "Error",
@@ -14,10 +15,11 @@ const STATUS_NAMES = {
 };
 const RULE_NAMES = { "keep-both": "Keep both", "newest-wins": "Newest wins", ask: "Ask me" };
 
-/** What each mode does, in one sentence. */
+/** What each mode does, in one sentence. Backup's depends on safe deletes. */
 const MODE_SENTENCES = {
   mirror: "The destination becomes an exact copy: files removed from the source are removed there too.",
   backup: "Files removed from the source stay. Changed files replace the older copy (the older copy goes to .charon-trash).",
+  "backup-unsafe": "Files removed from the source stay. Changed files replace the older copy, which is gone at once (safe deletes are off).",
   "two-way": "Changes flow both ways. Deleting a file on either side deletes it on the other.",
 };
 
@@ -138,7 +140,9 @@ export class Format {
   static modeName(mode) { return MODE_NAMES[mode] ?? mode; }
   static statusName(status) { return STATUS_NAMES[status] ?? status; }
   static ruleName(rule) { return RULE_NAMES[rule] ?? rule; }
-  static modeSentence(mode) { return MODE_SENTENCES[mode] ?? ""; }
+  static modeSentence(mode, safeDelete = true) {
+    return MODE_SENTENCES[mode === "backup" && !safeDelete ? "backup-unsafe" : mode] ?? "";
+  }
   static ruleSentence(rule) { return RULE_SENTENCES[rule] ?? ""; }
 
   /** "→" for one-way jobs, "⇄" for two-way. */
@@ -197,12 +201,37 @@ export class Format {
     return job.runsByItself ? `next sync ${Format.when(job.nextRun)}` : `looks ${Format.at(job.nextRun)} and asks you`;
   }
 
-  /** "23 changes wait for your OK · 3 removals", or why a full-automation run was held. */
+  /**
+   * "23 changes wait for your OK · 3 removals", or why a full-automation run was held.
+   * Right after Charon starts, before its first look, it knows changes wait but not how many.
+   */
   static waiting(waiting) {
     if (waiting.held) return `Held for your OK: ${waiting.held}`;
+    if (waiting.counted === false) return "Changes wait for your OK";
     const text = waiting.items === 1 ? "1 change waits for your OK" : `${Format.count(waiting.items)} changes wait for your OK`;
     const removals = (waiting.removals?.source || 0) + (waiting.removals?.destination || 0);
     return removals ? `${text} · ${Format.plural(removals, "removal")}` : text;
+  }
+
+  /**
+   * What a run did, as the log says it: "copied 12 files (8.2 MB), removed 1, 2 left out
+   * (a drive couldn't hold them)".
+   */
+  static run(run) {
+    if (run.error) return `failed: ${run.error}`;
+    if (run.cancelled) return "stopped";
+    const parts = [];
+    if (run.copied) parts.push(`copied ${Format.plural(run.copied, "file")} (${Format.bytes(run.bytes)})`);
+    if (run.deleted) parts.push(`removed ${Format.plural(run.deleted, "item")}`);
+    if (run.settled) parts.push(`${Format.plural(run.settled, "conflict")} settled by Newest wins`);
+    if (run.conflicts) parts.push(`${Format.plural(run.conflicts, "conflict")} to resolve`);
+    if (run.failed) parts.push(`${Format.plural(run.failed, "file")} failed`);
+    if (run.skipped) parts.push(`${Format.plural(run.skipped, "item")} skipped (changed meanwhile)`);
+    if (run.leftOut) parts.push(`${Format.plural(run.leftOut, "item")} left out (a drive couldn't hold ${run.leftOut === 1 ? "it" : "them"})`);
+    if (run.kept) parts.push(`kept ${Format.plural(run.kept, "folder")} that still hold files`);
+    if (run.unreadable) parts.push(`${Format.plural(run.unreadable, "place")} couldn't be read`);
+    if (run.unkept) parts.push(`${Format.plural(run.unkept, "file")} arrived without ${run.unkept === 1 ? "its" : "their"} Finder tags or other details`);
+    return parts.length ? parts.join(", ") : "already in sync";
   }
 
   /**

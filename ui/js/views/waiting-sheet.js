@@ -64,7 +64,8 @@ export class WaitingSheet extends Sheet {
     try {
       const review = await Api.prepareReview(entry.id);
       if (entry.token !== token) return Api.discardReview(review.jobId, review.reviewId).catch(() => {});
-      if (review.totalSteps === 0) {
+      // An empty list is let go, unless a job with full automation waits for one OK first.
+      if (review.totalSteps === 0 && !this.review.confirmsNothing(review)) {
         entry.state = "nothing";
         Api.discardReview(review.jobId, review.reviewId).catch(() => {});
       } else {
@@ -111,8 +112,8 @@ export class WaitingSheet extends Sheet {
   render() {
     const n = this.entries.length;
     const started = this.started === 1
-      ? "1 job that runs by itself has started. "
-      : this.started > 1 ? `${this.started} jobs that run by themselves have started. ` : "";
+      ? "1 job that runs by itself is on its way. "
+      : this.started > 1 ? `${this.started} jobs that run by themselves are on their way. ` : "";
     this.redraw(() => (this.element.innerHTML = html`
       <header>
         <div><span class="eyebrow"><span class="num">${String(n).padStart(2, "0")}</span> ${n === 1 ? "Job" : "Jobs"}</span><h2>Waiting for your OK</h2></div>
@@ -161,7 +162,8 @@ export class WaitingSheet extends Sheet {
         if (entry.state === "blocked") {
           return { text: `Blocked: ${review.blocked}`, tone: "danger", extra, action: { do: "review", label: "Review…" } };
         }
-        const changes = Format.changeList(review.tally) || Format.plural(review.totalSteps, "step");
+        const changes = Format.changeList(review.tally)
+          || (review.totalSteps ? Format.plural(review.totalSteps, "step") : "nothing to copy. Confirm once so it may sync by itself");
         return { text: `Ready: ${changes}`, tone: "ready", extra, action: { do: "review", label: "Review…", primary: true } };
       }
       case "nothing": return { text: "Nothing to do", tone: "calm" };
@@ -175,6 +177,8 @@ export class WaitingSheet extends Sheet {
   }
 
   countsText(id) {
+    const compare = this.store.compares.get(id);
+    if (compare?.totalFiles) return `comparing ${Format.count(compare.files)} of ${Format.count(compare.totalFiles)} files by contents`;
     const scan = this.store.scans.get(id);
     if (!scan) return "Counting…";
     return `source: ${Format.plural(scan.source, "item")} · destination: ${Format.plural(scan.destination, "item")}`;

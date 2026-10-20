@@ -55,6 +55,7 @@ export const Icons = {
     offline: stroke('<path d="M6 2.5v3M10 2.5v3M4.5 5.5h7v2.5a3.5 3.5 0 0 1-7 0zM8 11.5v2M2 2l12 12"/>'),
     new: stroke('<path d="M8 2.5v3M8 10.5v3M2.5 8h3M10.5 8h3M4.2 4.2l1.6 1.6M10.2 10.2l1.6 1.6M11.8 4.2l-1.6 1.6M5.8 10.2l-1.6 1.6"/>'),
     review: stroke('<path d="m2.3 4.4 1.3 1.3L6 3.2M2.3 10l1.3 1.3L6 8.8M8.6 4.6h5M8.6 10.2h5"/>'),
+    looking: stroke('<circle cx="7" cy="7" r="4.2"/><path d="m10.1 10.1 3.4 3.4"/>'),
   },
 
   // Little diagrams for the three modes

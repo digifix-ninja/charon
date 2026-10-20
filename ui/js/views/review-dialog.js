@@ -244,8 +244,23 @@ export class ReviewDialog extends Overlay {
         ${raw(review.housekeeping.length ? html`<ul class="r-house">${review.housekeeping.map(line => raw(html`<li>${line}</li>`))}</ul>` : "")}
         ${raw(this.clustersHtml(review))}
         ${raw(this.notesHtml())}
-        ${raw(nothing ? '<div class="r-settled">Both shores already match.</div>' : this.listHtml())}
+        ${raw(nothing ? this.settledHtml(review) : this.listHtml())}
       </div>`;
+  }
+
+  /**
+   * Nothing to do. A job with full automation still asks once (its first sync, or after it
+   * was held or stopped): confirming the empty list lets it sync by itself again.
+   */
+  settledHtml(review) {
+    const line = this.confirmsNothing(review) ? '<p class="r-settled-why">Confirm once so Charon may sync this job by itself from now on.</p>' : "";
+    return `<div class="r-settled">Both shores already match.${line}</div>`;
+  }
+
+  /** An empty list that is still worth confirming: the job waits for an OK before it runs by itself. */
+  confirmsNothing(review) {
+    const job = this.store.jobs.get(review.jobId);
+    return review.kind === "sync" && review.totalSteps === 0 && review.fullAutomation && Boolean(job?.needsReview);
   }
 
   /** Both folders, with their drives and file counts, and what the job does with removed files. */
@@ -257,7 +272,9 @@ export class ReviewDialog extends Overlay {
       </div>`;
     const safety = review.safeDelete
       ? "Removed and replaced files go to .charon-trash."
-      : "Safe deletes are off: removed and replaced files are gone at once.";
+      : review.mode === "two-way"
+        ? "Safe deletes are off: removed files are gone at once (replaced versions still go to .charon-trash)."
+        : "Safe deletes are off: removed and replaced files are gone at once.";
     return html`<div class="r-shores">
         ${raw(shore("Source", review.source))}
         ${raw(shore("Destination", review.destination))}
@@ -297,7 +314,7 @@ export class ReviewDialog extends Overlay {
     };
     const extras = [];
     if (t.keepBoth) extras.push(`${Format.plural(t.keepBoth, "file")} changed on both sides: both versions are kept`);
-    if (t.conflicts) extras.push(`${Format.plural(t.conflicts, "conflict")} left for you`);
+    if (t.conflicts) extras.push(`${Format.plural(t.conflicts, "conflict")} left for you: settle ${t.conflicts === 1 ? "it" : "them"} in the job's Conflicts tab`);
     if (t.newestWins) extras.push(`${Format.plural(t.newestWins, "conflict")} settled by newest wins`);
     if (t.agreed) extras.push(`${Format.plural(t.agreed, "file")} ${t.agreed === 1 ? "is the same on both sides apart from its dates" : "are the same on both sides apart from their dates"}: treated as in sync`);
     if (t.bytes) extras.push(`${Format.bytes(t.bytes)} to copy in all`);
@@ -346,10 +363,12 @@ export class ReviewDialog extends Overlay {
     const s = this.state;
     const box = Dom.$(".r-steps", this.element);
     if (!s || !box) return;
-    const filtered = s.filter !== "all" || s.query;
+    const filtered = s.filter !== "all" || s.query || s.cluster !== null;
+    const cluster = s.cluster === null ? null : s.review.clusters[s.cluster];
+    const where = cluster ? ` in ${cluster.path}` : "";
     Dom.$(".r-count", this.element).textContent = s.loading && !append
       ? "Looking…"
-      : `${Format.plural(s.total, "step")}${filtered ? " match" : ""}${s.steps.length < s.total ? ` · showing ${Format.count(s.steps.length)}` : ""}`;
+      : `${Format.plural(s.total, "step")}${filtered ? " match" : ""}${where}${s.steps.length < s.total ? ` · showing ${Format.count(s.steps.length)}` : ""}`;
     if (s.listError) {
       box.innerHTML = notice("danger", s.listError);
     } else if (!s.steps.length) {
@@ -433,7 +452,7 @@ export class ReviewDialog extends Overlay {
       const destructive = Format.isDestructive(review.tally);
       const kind = destructive ? "danger-solid" : "primary";
       let confirm = "";
-      if (review.totalSteps > 0) {
+      if (review.totalSteps > 0 || this.confirmsNothing(review)) {
         if (approving) {
           // Rust is starting this list: nothing here can swap it for another until it answers.
           confirm = html`<button class="btn ${kind} confirm" data-do="confirm" disabled>Starting…</button>`;
@@ -462,7 +481,12 @@ export class ReviewDialog extends Overlay {
     return `Prepared ${Format.ago(this.state.review.preparedAt)}`;
   }
 
+  /** What the look has counted so far; after both scans, the files it compares by contents. */
   countsText() {
+    const compare = this.store.compares.get(this.state.jobId);
+    if (compare?.totalFiles) {
+      return `Comparing files that differ only by date: ${Format.count(compare.files)} of ${Format.count(compare.totalFiles)} (${Format.bytes(compare.bytes)} of ${Format.bytes(compare.totalBytes)})`;
+    }
     const scan = this.store.scans.get(this.state.jobId);
     if (!scan) return "Counting…";
     return `source: ${Format.plural(scan.source, "item")} · destination: ${Format.plural(scan.destination, "item")}`;
@@ -491,7 +515,8 @@ export class ReviewDialog extends Overlay {
     s.loading = true;
     this.renderSteps({ append: more });
     try {
-      const page = await Api.reviewSteps(review.jobId, review.reviewId, s.filter, s.query, more ? s.steps.length : 0, PAGE);
+      const folder = s.cluster === null ? null : review.clusters[s.cluster]?.path ?? null;
+      const page = await Api.reviewSteps(review.jobId, review.reviewId, s.filter, s.query, more ? s.steps.length : 0, PAGE, folder);
       if (token !== this.listToken || this.state !== s) return;
       s.steps = more ? s.steps.concat(page.steps) : page.steps;
       s.total = page.total;
@@ -515,13 +540,12 @@ export class ReviewDialog extends Overlay {
   /** A removed folder: shows only the removals in it, or the whole list again. */
   toggleCluster(index) {
     const s = this.state;
-    const cluster = s.review.clusters[index];
     const off = s.cluster === index;
     s.cluster = off ? null : index;
     s.filter = off ? "all" : "removals";
-    s.query = off ? "" : cluster.path;
+    s.query = "";
     const input = Dom.$('[data-field="query"]', this.element);
-    if (input) input.value = s.query;
+    if (input) input.value = "";
     this.markChoices();
     this.loadSteps();
     if (!off) Dom.$(".r-list", this.element)?.scrollIntoView({ block: "start", behavior: "smooth" });

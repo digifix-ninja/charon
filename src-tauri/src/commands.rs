@@ -169,10 +169,20 @@ pub fn cancel_review(state: State<AppState>, id: JobId) {
     state.engine.cancel_review(&id);
 }
 
-/// One page of a list's steps.
+/// One page of a list's steps; with `folder`, only those at or inside that folder.
 #[tauri::command]
-pub fn review_steps(state: State<AppState>, id: JobId, review_id: String, filter: StepFilter, query: String, offset: usize, limit: usize) -> Answer<StepPage> {
-    state.engine.review_steps(&id, &review_id, filter, &query, offset, limit).map_err(say)
+#[allow(clippy::too_many_arguments)]
+pub fn review_steps(
+    state: State<AppState>,
+    id: JobId,
+    review_id: String,
+    filter: StepFilter,
+    query: String,
+    folder: Option<String>,
+    offset: usize,
+    limit: usize,
+) -> Answer<StepPage> {
+    state.engine.review_steps_in(&id, &review_id, filter, &query, folder.as_deref(), offset, limit).map_err(say)
 }
 
 /// One page of a list's notes.

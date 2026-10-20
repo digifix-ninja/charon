@@ -45,6 +45,7 @@ class App {
     this.updates = new Updates(this.toast);
     this.about = new AboutPanel(this.updates, this.toast);
     this.later = null;   // a sheet asked for while a question or the review was open
+    this.quittingShown = false;
     this.store.subscribe(hint => this.render(hint));
     // Once the closing code has finished (a second warning may follow the first), see if it can open now.
     Overlay.afterClose(() => setTimeout(() => this.runLater()));
@@ -133,7 +134,8 @@ class App {
     const ids = await this.run(() => Api.syncAll());
     if (!Array.isArray(ids)) return;
     if (ids.length) return this.openWaiting(ids, { started: starting });
-    this.toast.show(starting ? "Every job that runs by itself has started." : "Nothing to sync.");
+    // Some may first wait for another job that syncs the same folders.
+    this.toast.show(starting ? "Every job that runs by itself is on its way." : "Nothing to sync.");
   }
 
   /** The waiting sheet with every job whose changes wait for an OK (the tray, the quit question). */
@@ -186,6 +188,22 @@ class App {
     if (answer === "quit") this.run(() => Api.quitApp());
   }
 
+  /**
+   * Charon is quitting and stops running syncs first, between two files: says what it
+   * waits for, so it doesn't look stuck. The app closes by itself.
+   */
+  quitting({ jobs = [] } = {}) {
+    if (this.quittingShown || !jobs.length) return;
+    this.quittingShown = true;
+    const names = jobs.map(name => `“${name}”`);
+    const list = names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names.at(-1)}` : names[0];
+    Modal.ask({
+      title: "Stopping safely…",
+      body: `Charon finishes the file it's copying for ${list}, then quits. What was carried is recorded, so nothing is lost.`,
+      buttons: [],
+    });
+  }
+
   /** A job was saved in the editor. A new job opens its review: look before crossing. */
   saved(view, { isNew, message }) {
     this.store.put(view);
@@ -208,6 +226,7 @@ class App {
       case "main": return this.mainAction(job);
       case "review": return this.review.show(id);
       case "unreadable": return this.openTab(id, "unreadable");
+      case "not-synced": return this.openTab(id, "not-synced");
       case "pause": return this.run(() => Api.setPaused(id, true));
       case "resume": return this.run(() => Api.setPaused(id, false));
       case "folders": return this.menu.show(target, [
@@ -227,7 +246,7 @@ class App {
       ]);
       case "tab": return this.openTab(id, target.dataset.tab, { reveal: false });
       case "resolve": return this.resolve(job, target);
-      case "leave-out": return this.leaveOut(job, Number(target.dataset.index), target);
+      case "leave-out": return this.leaveOut(job, target.dataset.list, Number(target.dataset.index), target);
       case "privacy": return this.run(() => Api.openPrivacySettings());
     }
   }
@@ -277,9 +296,9 @@ class App {
     if (conflict) this.review.settle(job.id, conflict, button.dataset.choice);
   }
 
-  /** "Leave this folder out" on a place that couldn't be read. */
-  async leaveOut(job, index, button) {
-    const place = job.unreadable?.[index];
+  /** "Leave this folder out" on a place that couldn't be read, or one that isn't synced. */
+  async leaveOut(job, list, index, button) {
+    const place = (list === "not-synced" ? job.notSynced : job.unreadable)?.[index];
     if (!place) return;
     button.disabled = true;
     const view = await this.run(() => Api.leaveOut(job.id, place.side, place.path));
@@ -359,6 +378,7 @@ class App {
     await Api.on("overview", overview => this.store.setOverview(overview));
     await Api.on("settings", settings => this.store.setSettings(settings));
     await Api.on("scan-progress", ({ id, side, items }) => this.store.setScan(id, side, items));
+    await Api.on("compare-progress", ({ id, ...compare }) => this.store.setCompare(id, compare));
     await Api.on("review-stale", stale => {
       this.review.markStale(stale);
       this.waiting.markStale(stale);
@@ -366,6 +386,7 @@ class App {
     await Api.on("sync-all", () => this.syncAll());
     await Api.on("show-waiting", () => this.showWaiting());
     await Api.on("confirm-quit", payload => this.confirmQuit(payload));
+    await Api.on("quitting", payload => this.quitting(payload));
   }
 }
 

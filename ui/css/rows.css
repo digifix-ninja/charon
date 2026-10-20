@@ -55,6 +55,10 @@
 .job[data-status="error"] { --tone: var(--error); }
 .job[data-status="offline"] { --tone: var(--offline); }
 .job[data-status="new"] { --tone: var(--new); }
+/* Looking: whether the folders match isn't known yet, so no colour claims they do */
+.job[data-status="looking"] { --tone: var(--text-dim); }
+.job[data-status="looking"] .orb .ico { animation: breathe 1.6s ease-in-out infinite; }
+@keyframes breathe { 50% { opacity: 0.4; } }
 /* Offline: the row fades, but not the sentence that says what to do */
 .job[data-status="offline"] :is(.orb, .shores, .row-actions) { opacity: 0.55; }
 .job[data-status="offline"] :is(.info .warn, .tag.status) { color: var(--text-dim); }
@@ -188,6 +192,11 @@
 .flag:hover { background: rgb(var(--flag-rgb) / 0.16); border-color: var(--flag); }
 .flag .ico { width: 13px; height: 13px; }
 .flag.unreadable { --flag: var(--pending); --flag-rgb: var(--pending-rgb); }
+.flag.not-synced { --flag: var(--pending); --flag-rgb: var(--pending-rgb); }
+
+/* "Waits for “Photos” to finish syncing": a calm line, it starts by itself */
+.waits-for { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); }
+.waits-for .ico { width: 13px; height: 13px; }
 
 /* "Not synced for 3 days": an amber line */
 .stale { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--pending); }
@@ -228,7 +237,7 @@
 .tabs button:hover { color: var(--text-dim); }
 .tabs button.on { color: var(--text); background: rgb(var(--ink-rgb) / 0.06); }
 .tabs .badge { color: var(--conflict); margin-left: 4px; }
-.tabs .badge.unreadable { color: var(--pending); }
+.tabs .badge:is(.unreadable, .not-synced) { color: var(--pending); }
 .tab-hint { margin: 0 0 4px; color: var(--text-dim); font-size: 12px; }
 
 .facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px 18px; }

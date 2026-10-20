@@ -216,3 +216,4 @@
 .wait-item .warnings { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--pending); }
 .wait-item .warnings.danger { color: var(--error); }
 .wait-item .warnings .ico { width: 12px; height: 12px; }
+.r-settled-why { margin: 8px 0 0; font-size: 13px; color: var(--text-dim); }

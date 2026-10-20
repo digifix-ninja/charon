@@ -10,6 +10,7 @@ const TONES = {
   review: "var(--review)",
   paused: "var(--paused)",
   pending: "var(--pending)",
+  looking: "var(--text-dim)",
   calm: "var(--in-sync)",
   empty: "var(--text-faint)",
 };
@@ -60,12 +61,15 @@ export class Header {
    */
   facts(overview) {
     const jobs = this.store.all();
-    const waiting = jobs.filter(job => job.waiting).length;
-    const attention = jobs.filter(needsYou).length;
+    const count = match => jobs.filter(match).length;
+    const most = (key, match) => Math.max(overview[key] ?? 0, count(match));
     return {
       ...overview,
-      waiting: Math.max(overview.waiting ?? 0, waiting),
-      attention: Math.max(overview.attention ?? 0, attention),
+      jobs: Math.max(overview.jobs ?? 0, jobs.length),
+      waiting: most("waiting", job => job.waiting),
+      attention: most("attention", needsYou),
+      looking: most("looking", job => job.status === "looking"),
+      incomplete: most("incomplete", job => job.unreadable?.length || job.notSyncedCount || job.notSynced?.length),
       pausedAll: this.store.pausedAll(),
     };
   }
@@ -76,18 +80,23 @@ export class Header {
     if (o.attention) return "attention";
     if (o.waiting) return "review";
     if (o.pausedAll) return "paused";
-    if (o.pending) return "pending";
+    if (o.pending || o.incomplete) return "pending";
+    if (o.looking) return "looking";
     return "calm";
   }
 
+  /** One line about everything. Never calm while anything waits, needs you, or isn't known yet. */
   describe(o) {
     const waits = o.waiting === 1 ? "1 job waits for your OK" : `${o.waiting} jobs wait for your OK`;
+    const need = `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
     if (o.jobs === 0) return "No crossings yet. Create your first sync job.";
-    if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing`;
-    if (o.attention) return `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
+    if (o.syncing) return `Ferrying files · ${o.syncing} ${o.syncing === 1 ? "job" : "jobs"} crossing${o.waiting ? ` · ${waits}` : ""}`;
+    if (o.attention) return o.waiting ? `${need} · ${waits}` : need;
     if (o.pausedAll) return o.waiting ? `Everything is paused · ${waits}` : "Everything is paused";
     if (o.waiting) return waits;
     if (o.pending) return `${o.pending} ${o.pending === 1 ? "job has" : "jobs have"} changes queued`;
+    if (o.incomplete) return `${o.incomplete} ${o.incomplete === 1 ? "job doesn't" : "jobs don't"} sync everything`;
+    if (o.looking) return "Looking for changes…";
     return o.offline ? `All reachable jobs in sync · ${o.offline} offline` : "All in sync. The river is calm.";
   }
 }

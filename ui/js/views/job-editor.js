@@ -62,6 +62,7 @@ export class JobEditor extends Sheet {
     this.editingId = null;
     this.original = null;
     this.nameTouched = false;
+    this.automationReset = null;
     this.draft = {
       name: "",
       source: "",
@@ -86,6 +87,7 @@ export class JobEditor extends Sheet {
     if (!job) return;
     this.editingId = id;
     this.nameTouched = true;
+    this.automationReset = null;
     this.original = structuredClone(Object.fromEntries(SETUP_FIELDS.map(field => [field, job[field]])));
     this.original.fullAutomation = Boolean(this.original.fullAutomation);
     this.draft = structuredClone(this.original);
@@ -163,7 +165,7 @@ export class JobEditor extends Sheet {
       <button class="card-choice ${this.draft.mode === m.key ? "on" : ""}" data-do="mode" data-value="${m.key}">
         <span class="diagram">${raw(Icons.mode[m.key])}</span>
         <strong>${m.title}</strong>
-        <small>${Format.modeSentence(m.key)}</small>
+        <small>${Format.modeSentence(m.key, this.draft.safeDelete)}</small>
       </button>`))}</div>`;
   }
 
@@ -225,6 +227,10 @@ export class JobEditor extends Sheet {
   /** Notes that stay in sight above the buttons while the draft says so. */
   notesHtml() {
     const notes = [];
+    if (this.automationReset && !this.draft.fullAutomation) {
+      notes.push(html`<div class="notice caution"><span class="ico">${raw(Icons.warn)}</span>
+        <span>Full automation was turned off because ${this.automationReset}. The warnings you accepted spoke of the job as it was; turn it on again to read what it means now.</span></div>`);
+    }
     if (this.draft.fullAutomation) {
       notes.push(html`<div class="notice danger"><span class="ico">${raw(Icons.warn)}</span>
         <span>Full automation is on: this job changes files without asking you first.</span></div>`);
@@ -274,6 +280,17 @@ export class JobEditor extends Sheet {
       || o.safeDelete !== d.safeDelete
       || JSON.stringify(o.excludes) !== JSON.stringify(d.excludes)
       || (!o.fullAutomation && d.fullAutomation);
+  }
+
+  /**
+   * The warnings someone accepted describe one mode and one safe-deletes setting. When
+   * either changes, full automation goes off in the draft, and turning it on again shows
+   * the warnings as they read now.
+   */
+  resetAutomation(because) {
+    if (!this.draft.fullAutomation) return;
+    this.draft.fullAutomation = false;
+    this.automationReset = because;
   }
 
   // ---------------------------------------------------------------- the two warnings
@@ -329,8 +346,12 @@ export class JobEditor extends Sheet {
     const d = this.draft;
     const body = ["Removed and replaced files will be gone for good, with no copy in .charon-trash. Turn safe deletes off?"];
     if (d.mode === "two-way") body.push("In two-way jobs Charon still keeps the replaced version of a file.");
+    if (d.fullAutomation) body.push("Full automation goes off too: turn it on again to read what it means without safe deletes.");
     const off = await Modal.confirm({ title: "Safe deletes", body, action: "Turn safe deletes off" });
-    if (off && this.draft === d) d.safeDelete = false;
+    if (off && this.draft === d) {
+      d.safeDelete = false;
+      this.resetAutomation("safe deletes were turned off");
+    }
     if (this.draft === d && this.isOpen) this.refresh();
   }
 
@@ -353,10 +374,13 @@ export class JobEditor extends Sheet {
         return;
       }
       case "swap":
+        // One way, the other folder now gets overwritten: worth reading the warnings again.
+        if (d.mode !== "two-way" && d.source !== d.destination) this.resetAutomation("the source and destination were swapped");
         [d.source, d.destination] = [d.destination, d.source];
         this.autoName();
         return this.refresh();
       case "mode":
+        if (d.mode !== target.dataset.value) this.resetAutomation(`the mode changed to ${Format.modeName(target.dataset.value)}`);
         d.mode = target.dataset.value;
         this.autoName();
         return this.refresh();

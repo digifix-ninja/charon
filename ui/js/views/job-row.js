@@ -9,6 +9,14 @@ const { html, raw } = Dom;
 
 const PRIVACY_TEXT = "macOS didn't let Charon read this. Allow Charon in System Settings › Privacy & Security › Full Disk Access.";
 
+/** The little label of each place that isn't synced. */
+const PLACE_KINDS = {
+  "left-out": "Left out",
+  "name-clash": "Name clash",
+  blocked: "Blocked",
+  unreadable: "Couldn't read",
+};
+
 export class JobRow {
   /** The whole row. */
   static render(job, { open, tab, log, index, scan, trashDays }) {
@@ -33,6 +41,7 @@ export class JobRow {
             </div>
             ${raw(job.status === "syncing" ? JobRow.progress(job.progress, scan) : JobRow.info(job))}
             ${raw(JobRow.flags(job))}
+            ${raw(job.waitingFor ? html`<div class="waits-for"><span class="ico">${raw(Icons.pause)}</span>Waits for “${job.waitingFor}” to finish syncing, then starts by itself</div>` : "")}
             ${raw(job.stale ? html`<div class="stale"><span class="ico">${raw(Icons.warn)}</span>${job.stale}</div>` : "")}
           </div>
           ${raw(JobRow.actions(job))}
@@ -77,7 +86,10 @@ export class JobRow {
         break;
       case "review":
         if (!job.waiting) parts.push(html`<span class="warn">The next sync waits for your OK</span>`);
-        parts.push(synced);
+        parts.push(job.looking ? "Looking for changes…" : synced);
+        break;
+      case "looking":
+        parts.push("Looking for changes…", synced);
         break;
       case "pending":
         parts.push(html`<span class="warn">${Format.plural(job.pending?.items ?? 0, "change")} queued${job.pending?.bytes ? ` (${Format.bytes(job.pending.bytes)})` : ""}</span>`, synced);
@@ -87,11 +99,11 @@ export class JobRow {
         break;
       case "error":
       case "offline":
-        parts.push(html`<span class="warn">${job.problem ?? "Something went wrong"}</span>`);
+        parts.push(html`<span class="warn">${JobRow.problem(job) ?? "Something went wrong"}</span>`);
         break;
       case "paused": {
         // Paused shows first, but a failed last run still says what went wrong.
-        const problem = job.problem ?? job.lastRun?.error;
+        const problem = JobRow.problem(job);
         parts.push("Paused", problem ? html`<span class="bad">${problem}</span>` : synced);
         break;
       }
@@ -105,7 +117,16 @@ export class JobRow {
     return `<div class="info">${parts.join('<span class="sep">·</span>')}</div>`;
   }
 
-  /** Chips that show whatever the status: changes waiting for an OK, places not read. */
+  /** What's wrong, in words: the problem Rust names, or what the last run left undone. */
+  static problem(job) {
+    if (job.problem) return job.problem;
+    const run = job.lastRun;
+    if (run?.error) return run.error;
+    if (run?.failed) return `${Format.plural(run.failed, "file")} couldn't be copied in the last sync. The activity log says which and why.`;
+    return null;
+  }
+
+  /** Chips that show whatever the status: changes waiting for an OK, places not read or not synced. */
   static flags(job) {
     const flags = [];
     if (job.waiting) {
@@ -116,6 +137,11 @@ export class JobRow {
       const n = job.unreadable.length;
       flags.push(html`<button class="flag unreadable" data-action="unreadable" title="Show the places">
         <span class="ico">${raw(Icons.warn)}</span><span>${n === 1 ? "1 place couldn't be read" : `${Format.count(n)} places couldn't be read`}</span></button>`);
+    }
+    const missing = job.notSyncedCount || job.notSynced?.length || 0;
+    if (missing) {
+      flags.push(html`<button class="flag not-synced" data-action="not-synced" title="Show what isn't synced, and why">
+        <span class="ico">${raw(Icons.info)}</span><span>${missing === 1 ? "1 item isn't synced" : `${Format.count(missing)} items aren't synced`}</span></button>`);
     }
     return flags.length ? `<div class="flags">${flags.join("")}</div>` : "";
   }
@@ -146,10 +172,13 @@ export class JobRow {
 
   static detail(job, tab, log, trashDays) {
     const tabs = [["activity", "Activity"], ["details", "Details"]];
+    const missing = job.notSyncedCount || job.notSynced?.length || 0;
+    if (job.notSynced?.length) tabs.unshift(["not-synced", "Not synced", missing]);
     if (job.unreadable?.length) tabs.unshift(["unreadable", "Couldn't read", job.unreadable.length]);
     if (job.conflicts.length) tabs.unshift(["conflicts", "Conflicts", job.conflicts.length]);
     const body = tab === "conflicts" && job.conflicts.length ? JobRow.conflicts(job)
       : tab === "unreadable" && job.unreadable?.length ? JobRow.unreadable(job)
+      : tab === "not-synced" && job.notSynced?.length ? JobRow.notSynced(job, missing)
       : tab === "details" ? JobRow.facts(job, trashDays)
       : JobRow.log(log);
     return html`<div class="panel">
@@ -169,17 +198,20 @@ export class JobRow {
     const esc = Dom.escape;
     const folder = (path, volume) => `<code>${esc(path)}</code>${volume ? ` <span class="faint">on ${esc(Format.volume(volume))}</span>` : ""}`;
     const kept = trashDays > 0 ? `kept ${Format.plural(trashDays, "day")}` : "kept until emptied";
+    // Syncs nobody looked at never empty the trash: old files there wait for a list you confirm.
+    const emptied = job.fullAutomation ? ", emptied only by a sync you confirm" : "";
+    const trashTwoWay = job.mode === "two-way" ? "Gone at once (replaced versions still go to <code>.charon-trash</code>)" : "Gone at once";
     return `<div class="facts">
       ${fact("Mode", esc(Format.modeName(job.mode)))}
       ${fact("When", esc(Format.trigger(job.trigger, job.runsByItself)))}
-      ${fact("Removed files", job.safeDelete ? `To <code>.charon-trash</code>, ${esc(kept)}` : '<span class="bad">Gone at once</span>')}
+      ${fact("Removed files", job.safeDelete ? `To <code>.charon-trash</code>, ${esc(kept + emptied)}` : `<span class="bad">${trashTwoWay}</span>`)}
       ${fact("Conflicts", esc(job.mode === "two-way" ? Format.ruleName(job.conflict) : "—"))}
       ${fact("Source", folder(job.source, job.sourceVolume), true)}
       ${fact("Destination", folder(job.destination, job.destinationVolume), true)}
       ${fact("Excluded", job.excludes.length ? job.excludes.map(e => `<code>${esc(e)}</code>`).join(", ") : "Nothing", true)}
       ${fact("Full automation", job.fullAutomation ? `<span class="bad">On</span>${job.needsReview ? esc(", but the next sync waits for your OK") : ""}` : "Off: every sync waits for your OK")}
       ${fact("Next", esc(job.nextRun ? `${job.runsByItself ? "Sync" : "Look"} ${Format.upcoming(job.nextRun)}` : job.paused ? "Paused" : "When triggered"))}
-      ${fact("Last run", esc(job.lastRun ? Format.ago(job.lastRun.finishedAt) : "Never"))}
+      ${fact("Last run", esc(job.lastRun ? `${Format.ago(job.lastRun.finishedAt)}: ${Format.run(job.lastRun)}` : "Never"), true)}
     </div>`;
   }
 
@@ -222,8 +254,29 @@ export class JobRow {
         </div>
         <div class="choices">
           ${raw(place.privacy ? '<button class="btn" data-action="privacy">Open Privacy settings</button>' : "")}
-          <button class="btn" data-action="leave-out" data-index="${i}">Leave this folder out</button>
+          <button class="btn" data-action="leave-out" data-list="unreadable" data-index="${i}">Leave this folder out</button>
         </div>
       </div>`).join("")}</div>`;
+  }
+
+  /**
+   * Items the last look had to leave out (a drive can't hold them), names that clash on a
+   * drive, and items that can't cross as they are. Nothing else is held up by them.
+   */
+  static notSynced(job, total) {
+    const more = total - job.notSynced.length;
+    return `<div class="place-list">
+      <p class="tab-hint">These items stay where they are and aren't synced; everything else crosses as usual. Fix the name or the item, or leave it out so it isn't listed.</p>
+      ${job.notSynced.map((place, i) => html`
+      <div class="place">
+        <div>
+          <div class="path">${place.path}</div>
+          <div class="versions">${PLACE_KINDS[place.kind] ?? "Not synced"} · On the ${place.side} · ${place.reason}</div>
+        </div>
+        <div class="choices">
+          <button class="btn" data-action="leave-out" data-list="not-synced" data-index="${i}">Leave this out</button>
+        </div>
+      </div>`).join("")}
+      ${more > 0 ? html`<p class="tab-hint">And ${Format.count(more)} more. The list of changes shows them all, under Notes.</p>` : ""}</div>`;
   }
 }

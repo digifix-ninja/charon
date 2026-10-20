@@ -15,7 +15,7 @@ export const GROUPS = [
   { key: "in-sync", label: "In sync", tone: "var(--in-sync)", match: isAny("in-sync") },
   { key: "syncing", label: "Crossing", tone: "var(--syncing)", match: isAny("syncing") },
   { key: "your-ok", label: "Your OK", tone: "var(--review)", match: job => Boolean(job.waiting) },
-  { key: "queued", label: "Queued", tone: "var(--pending)", match: isAny("pending", "new", "paused", "offline") },
+  { key: "queued", label: "Queued", tone: "var(--pending)", match: isAny("pending", "new", "paused", "offline", "looking") },
   { key: "attention", label: "Need you", tone: "var(--error)", match: needsYou },
 ];
 
@@ -32,13 +32,24 @@ export class JobStore {
     this.tabs = new Map();      // id → open tab in the expanded row
     this.logs = new Map();      // id → log lines
     this.scans = new Map();     // id → {source, destination}: items counted while looking
+    this.compares = new Map();  // id → {files, totalFiles, bytes, totalBytes}: files compared by contents
+    this.removed = new Set();   // ids of jobs Rust removed (a state taken before can't bring them back)
     this.listeners = [];
   }
 
-  /** Takes the full state from Rust. */
+  /**
+   * Takes the full state from Rust. Rows that changed while it was on its way (a `job`
+   * event with a higher `rev`) and jobs removed meanwhile stay as the events left them.
+   */
   load(state) {
-    this.jobs = new Map(state.jobs.map(job => [job.id, job]));
-    this.order = state.jobs.map(job => job.id);
+    const fresher = new Map([...this.jobs].filter(([id, job]) => {
+      const loaded = state.jobs.find(other => other.id === id);
+      return !loaded || (job.rev ?? 0) > (loaded.rev ?? 0);
+    }));
+    const jobs = state.jobs.filter(job => !this.removed.has(job.id)).map(job => fresher.get(job.id) ?? job);
+    const added = [...fresher.values()].filter(job => !jobs.some(other => other.id === job.id));
+    this.jobs = new Map([...jobs, ...added].map(job => [job.id, job]));
+    this.order = [...jobs, ...added].map(job => job.id);
     this.settings = state.settings;
     this.overview = state.overview;
     this.defaultExcludes = state.defaultExcludes;
@@ -47,6 +58,7 @@ export class JobStore {
 
   /** A new or changed row. A view older than the one we have (lower `rev`) is ignored. */
   put(view) {
+    if (this.removed.has(view.id)) return;
     const known = this.jobs.get(view.id);
     if (known && (view.rev ?? 0) < (known.rev ?? 0)) return;
     if (!known) this.order.push(view.id);
@@ -56,12 +68,14 @@ export class JobStore {
 
   /** A removed row. */
   drop(id) {
+    this.removed.add(id);
     this.jobs.delete(id);
     this.order = this.order.filter(other => other !== id);
     this.open.delete(id);
     this.tabs.delete(id);
     this.logs.delete(id);
     this.scans.delete(id);
+    this.compares.delete(id);
     this.changed();
   }
 
@@ -84,9 +98,16 @@ export class JobStore {
     this.changed({ id, scanOnly: true });
   }
 
+  /** Files compared by contents so far while a job's list is made (after both scans). */
+  setCompare(id, compare) {
+    this.compares.set(id, compare);
+    this.changed({ id, scanOnly: true });
+  }
+
   /** Forgets the counts, before a new look starts. */
   clearScan(id) {
     this.scans.delete(id);
+    this.compares.delete(id);
   }
 
   setOverview(overview) {
@@ -124,6 +145,7 @@ export class JobStore {
     const tab = this.tabs.get(id);
     if (tab === "conflicts" && !job?.conflicts?.length) return "activity";
     if (tab === "unreadable" && !job?.unreadable?.length) return "activity";
+    if (tab === "not-synced" && !job?.notSynced?.length) return "activity";
     return tab ?? (job?.conflicts?.length ? "conflicts" : "activity");
   }
 
