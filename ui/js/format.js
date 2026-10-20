@@ -231,6 +231,7 @@ export class Format {
     if (run.kept) parts.push(`kept ${Format.plural(run.kept, "folder")} that still hold files`);
     if (run.unreadable) parts.push(`${Format.plural(run.unreadable, "place")} couldn't be read`);
     if (run.unkept) parts.push(`${Format.plural(run.unkept, "file")} arrived without ${run.unkept === 1 ? "its" : "their"} Finder tags or other details`);
+    if (run.leftForLater) parts.push(`${Format.plural(run.leftForLater, "removal")} left for a later sync (missing for only a little while on a drive that may show changes late)`);
     return parts.length ? parts.join(", ") : "already in sync";
   }
 
