@@ -63,6 +63,12 @@ impl Tray {
         Ok(())
     }
 
+    /// Whether the icon is in the menu bar or system tray (it may not be, on a Linux desktop
+    /// without a tray).
+    pub fn is_installed(app: &AppHandle) -> bool {
+        app.try_state::<Tray>().is_some()
+    }
+
     /// Updates the status line, the waiting and pause items, the tooltip and the badge.
     pub fn refresh(app: &AppHandle, overview: &Overview) {
         let Some(tray) = app.try_state::<Tray>() else { return };
@@ -134,9 +140,15 @@ impl Tray {
             // The window runs these, so jobs that wait for an OK get their lists shown.
             "sync" => Self::tell_window(app, "sync-all"),
             "waiting" => Self::tell_window(app, "show-waiting"),
+            // Saving the settings and redrawing every row asks the disk: not on the thread
+            // that draws the menu bar.
             "pause" => {
-                let paused = engine.settings().paused_all;
-                let _ = engine.set_all_paused(!paused);
+                std::thread::spawn(move || {
+                    let paused = engine.settings().paused_all;
+                    if let Err(e) = engine.set_all_paused(!paused) {
+                        log::error!("couldn't pause or resume everything: {e}");
+                    }
+                });
             }
             "update" => Self::update_clicked(app),
             "quit" => Quit::ask(app),

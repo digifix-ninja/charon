@@ -44,15 +44,19 @@ pub struct WindowState {
     default_excludes: Vec<String>,
 }
 
+/// Every row looks at its folders (are they reachable?), which a slow network share can
+/// take a while to answer: off the window's thread.
 #[tauri::command]
-pub fn get_state(state: State<AppState>) -> WindowState {
-    let engine = &state.engine;
-    WindowState {
-        jobs: engine.jobs(),
-        settings: engine.settings(),
-        overview: engine.overview(),
-        default_excludes: JobSetup::default_excludes(),
-    }
+pub async fn get_state(state: State<'_, AppState>) -> Answer<WindowState> {
+    in_background(state, |engine| {
+        Ok(WindowState {
+            jobs: engine.jobs(),
+            settings: engine.settings(),
+            overview: engine.overview(),
+            default_excludes: JobSetup::default_excludes(),
+        })
+    })
+    .await
 }
 
 #[tauri::command]
@@ -100,18 +104,18 @@ pub async fn remove_job(state: State<'_, AppState>, id: JobId) -> Answer<()> {
 }
 
 #[tauri::command]
-pub fn move_job(state: State<AppState>, id: JobId, to_index: usize) -> Answer<()> {
-    state.engine.move_job(&id, to_index).map_err(say)
+pub async fn move_job(state: State<'_, AppState>, id: JobId, to_index: usize) -> Answer<()> {
+    in_background(state, move |engine| engine.move_job(&id, to_index)).await
 }
 
 #[tauri::command]
-pub fn set_paused(state: State<AppState>, id: JobId, paused: bool) -> Answer<()> {
-    state.engine.set_paused(&id, paused).map_err(say)
+pub async fn set_paused(state: State<'_, AppState>, id: JobId, paused: bool) -> Answer<()> {
+    in_background(state, move |engine| engine.set_paused(&id, paused)).await
 }
 
 #[tauri::command]
-pub fn set_all_paused(state: State<AppState>, paused: bool) -> Answer<()> {
-    state.engine.set_all_paused(paused).map_err(say)
+pub async fn set_all_paused(state: State<'_, AppState>, paused: bool) -> Answer<()> {
+    in_background(state, move |engine| engine.set_all_paused(paused)).await
 }
 
 #[tauri::command]
@@ -216,12 +220,14 @@ pub fn dismiss_upgrade_notice(state: State<AppState>) -> Answer<()> {
 // ---------------------------------------------------------------- settings
 
 #[tauri::command]
-pub fn set_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> Answer<()> {
-    let login_changed = state.engine.settings().launch_at_login != settings.launch_at_login;
-    if login_changed {
-        LaunchAtLogin::apply(&app, settings.launch_at_login);
-    }
-    state.engine.set_settings(settings).map_err(say)
+pub async fn set_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Answer<()> {
+    in_background(state, move |engine| {
+        if engine.settings().launch_at_login != settings.launch_at_login {
+            LaunchAtLogin::apply(&app, settings.launch_at_login);
+        }
+        engine.set_settings(settings)
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- the desktop

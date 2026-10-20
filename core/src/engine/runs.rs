@@ -19,9 +19,10 @@ use crate::plan::{Action, Baseline, NoteKind, Side};
 use crate::run::{Care, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Trash};
 use crate::scan::never_download_on_this_thread;
 use crate::store::{Landings, Memory};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -35,6 +36,8 @@ pub(crate) const UNRECORDED: &str = "Charon couldn't record the last sync, so no
 /// automatic sync removed or replaced.
 pub(crate) const UNCOUNTED: &str =
     "Charon couldn't count what the last automatic sync removed or replaced, so nothing more happens until you confirm the list.";
+/// Why a job waits for an OK after its sync ended on a mistake in Charon itself.
+pub(crate) const CRASHED: &str = "The last sync stopped on an error of Charon's own, so nothing more happens until you confirm the list.";
 /// Live progress reaches the window at most this often.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(120);
 /// At most this many failed or skipped items are written to the log per run.
@@ -310,7 +313,11 @@ impl Engine {
         let id = job.id.clone();
         let spawned = thread::Builder::new().name("charon-sync".into()).spawn(move || {
             never_download_on_this_thread();
-            work(&engine, job, cancel, crossing)
+            let (id, started_at, approved) = (job.id.clone(), Utc::now(), crossing.approved);
+            let ended = std::panic::catch_unwind(AssertUnwindSafe(|| work(&engine, job, cancel, crossing)));
+            if ended.is_err() {
+                engine.after_a_panic(&id, started_at, approved);
+            }
         });
         if let Err(e) = spawned {
             self.change_runtime(&id, |rt| {
@@ -321,6 +328,39 @@ impl Engine {
             return Err(Error::Io(e));
         }
         Ok(())
+    }
+
+    /// A sync ended on a mistake in Charon itself (a panic) before it was recorded. What it
+    /// carried isn't known: the job's record still has the mark set before anything was
+    /// carried, so the next look doesn't trust the two-way memory, and the next sync waits
+    /// for the person's OK.
+    fn after_a_panic(&self, id: &JobId, started_at: DateTime<Utc>, approved: bool) {
+        log::error!("a sync of job {id} ended on a panic");
+        let mut summary = RunSummary::starting(started_at, approved);
+        summary.finished_at = Utc::now();
+        summary.error = Some(CRASHED.into());
+        let held = self.change_job_anyway(id, |stored| {
+            stored.last_run = Some(summary.clone());
+            stored.needs_review = true;
+            stored.held = Some(CRASHED.into());
+        });
+        if let Err(e) = held {
+            log::error!("couldn't save that job {id} waits for an OK: {e}");
+        }
+        self.inner.journal.error(id, "the sync stopped on an error of Charon's own; the next sync waits for your OK");
+        self.change_runtime(id, |rt| {
+            rt.cancel = None;
+            rt.stopped_by_person = false;
+            rt.must_ask = true;
+            rt.progress = None;
+            rt.finished_at = Some(Instant::now());
+            rt.problem = summary.error.clone();
+            rt.last_checked = None;
+        });
+        if let Ok(job) = self.stored_job(id) {
+            self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name, summary }));
+        }
+        self.publish(id);
     }
 
     // ---------------------------------------------------------------- carrying out
@@ -826,5 +866,59 @@ impl Survey {
             housekeeping: Default::default(),
             made_at: Utc::now(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{ConflictRule, JobStatus, SyncMode, Trigger};
+    use crate::SyncStart;
+
+    #[test]
+    fn a_sync_that_ends_on_a_panic_waits_for_an_ok_and_distrusts_its_memory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let engine = Engine::open(tmp.path().join("data"), Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: "Panics".into(),
+            source: a,
+            destination: b,
+            mode: SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: true,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        engine.change_job(&id, |job| job.needs_review = false).unwrap();
+        assert!(engine.stored_job(&id).unwrap().runs_by_itself());
+
+        // A run starts carrying files, then hits a mistake in Charon itself.
+        let (job, cancel) = engine.begin_run(&id, |_, _| Ok(())).unwrap();
+        let crossing = Crossing { kind: ReviewKind::Sync, approved: false, reason: "a test".into(), resolving: None };
+        engine
+            .spawn_crossing(job, cancel, crossing, |engine, job, _, _| {
+                engine.change_job(&job.id, |job| job.run_in_progress = true).unwrap();
+                panic!("a mistake in the middle of a sync");
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while engine.is_running(&id) {
+            assert!(Instant::now() < deadline, "the job stayed marked as syncing");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        let view = engine.job(&id).unwrap();
+        assert_eq!(view.job.held.as_deref(), Some(CRASHED));
+        assert!(view.job.needs_review && !view.runs_by_itself);
+        assert!(view.job.run_in_progress, "the next look doesn't trust the two-way memory");
+        assert_eq!(view.job.last_run.as_ref().and_then(|run| run.error.as_deref()), Some(CRASHED));
+        assert_ne!(view.status, JobStatus::Syncing);
+        assert_eq!(engine.sync_now(&id).unwrap(), SyncStart::Review);
+        assert!(engine.sync_all().contains(&id), "Sync all asks for it");
     }
 }

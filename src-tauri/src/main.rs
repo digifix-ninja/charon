@@ -43,6 +43,7 @@ const LOG_FILE_SIZE: u128 = 5_000_000;
 const LOG_FILES_KEPT: usize = 4;
 
 fn main() {
+    log_panics();
     let builder = tauri::Builder::default();
     // A second launch of the installed app brings the first one's window up instead. A
     // development build keeps its own data, so it may run next to the installed app (the
@@ -60,27 +61,54 @@ fn main() {
         .setup(|app| {
             let handle = app.handle().clone();
             log::info!("Charon {} starting", env!("CARGO_PKG_VERSION"));
-            let data_folder = DataFolder::open(&handle)?;
+            let data_folder = match DataFolder::open(&handle) {
+                Ok(folder) => folder,
+                Err(e) => {
+                    log::error!("couldn't find Charon's data folder: {e}");
+                    could_not_start(&handle, "Charon couldn't start", format!("Charon couldn't find the folder where it keeps its jobs: {e}\n\nNothing in your folders was changed."));
+                    return Ok(());
+                }
+            };
             let engine = match Engine::open(data_folder, events::forward_to(&handle)) {
                 Ok(engine) => engine,
+                Err(Error::AlreadyRunning) => {
+                    log::error!("another Charon works with the same jobs");
+                    could_not_start(
+                        &handle,
+                        "Charon is already running",
+                        "Another Charon is already looking after your sync jobs. Use that one: its boat is in the menu bar (or the system tray).".into(),
+                    );
+                    return Ok(());
+                }
                 Err(e) => {
-                    could_not_start(&handle, e);
+                    log::error!("couldn't open Charon's data: {e}");
+                    could_not_start(&handle, "Charon couldn't start", format!("Charon couldn't open its list of jobs: {e}\n\nNothing in your folders was changed."));
                     return Ok(());
                 }
             };
             app.manage(AppState::new(engine.clone()));
             app.manage(Quit::new());
-            Tray::install(&handle, &engine.overview())?;
+            app.manage(notifier::Repeats::default());
+            // Without a tray icon (a Linux desktop without one) Charon still works: the
+            // window stays the way in, so closing it quits instead of hiding it.
+            // (On Linux the tray library panics when the system has none.)
+            let overview = engine.overview();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Tray::install(&handle, &overview))) {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => log::error!("couldn't put Charon's icon in the menu bar or system tray: {e}"),
+                Err(_) => log::error!("couldn't put Charon's icon in the system tray: the system has no tray library"),
+            }
             login::LaunchAtLogin::apply(&handle, engine.settings().launch_at_login);
             Autopilot::start(engine);
             Updates::start(&handle);
             Ok(())
         })
         .on_window_event(|window, event| {
-            // With "keep running in the background", closing only hides the window.
+            // With "keep running in the background", closing only hides the window (when
+            // the tray icon is there to bring it back).
             if let WindowEvent::CloseRequested { api, .. } = event {
                 if let Some(state) = window.try_state::<AppState>() {
-                    if state.engine.settings().run_in_background {
+                    if state.engine.settings().run_in_background && Tray::is_installed(window.app_handle()) {
                         api.prevent_close();
                         let _ = window.hide();
                     }
@@ -146,20 +174,24 @@ fn logger() -> tauri::plugin::TauriPlugin<tauri::Wry> {
 
 /// Charon couldn't open its jobs: says so in plain words and quits. Nothing in any synced
 /// folder has been touched at this point.
-fn could_not_start(app: &AppHandle, error: Error) {
-    log::error!("couldn't open Charon's data: {error}");
+fn could_not_start(app: &AppHandle, title: &str, text: String) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.hide();
     }
-    let (title, text) = match error {
-        Error::AlreadyRunning => (
-            "Charon is already running",
-            "Another Charon is already looking after your sync jobs. Use that one: its boat is in the menu bar (or the system tray).".to_string(),
-        ),
-        e => ("Charon couldn't start", format!("Charon couldn't open its list of jobs: {e}\n\nNothing in your folders was changed.")),
-    };
     let handle = app.clone();
     app.dialog().message(text).title(title).kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
+}
+
+/// A mistake in Charon itself (a panic) is written to the log file, where it can be found
+/// afterwards, as well as to the terminal. The engine catches the ones inside syncs and
+/// looks, so they end as an error on the job instead of taking the app down.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current().name().unwrap_or("unnamed").to_string();
+        log::error!("panic on thread {thread}: {info}");
+        default(info);
+    }));
 }
 
 fn on_run_event(app: &AppHandle, event: RunEvent) {

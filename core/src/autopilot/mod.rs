@@ -36,6 +36,7 @@ use crate::engine::Engine;
 use crate::model::{Job, JobId, Trigger};
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -48,6 +49,8 @@ const STARTUP_DELAY: Duration = Duration::from_secs(3);
 const QUIET_AFTER_RUN: Duration = Duration::from_secs(3);
 /// How long changes must settle before a job that doesn't sync on change is looked at.
 const CHECK_SETTLE: Duration = Duration::from_secs(5);
+/// After a tick ran into a mistake in Charon itself, the next one waits this long.
+const AFTER_A_PANIC: Duration = Duration::from_secs(60);
 
 pub struct Autopilot {
     engine: Engine,
@@ -74,8 +77,15 @@ impl Autopilot {
                 Autopilot { engine, watcher, changes, changed: HashMap::new(), reachable: HashMap::new(), scheduled: HashMap::new() };
             thread::sleep(STARTUP_DELAY);
             loop {
-                pilot.tick();
-                thread::sleep(TICK);
+                // A mistake in Charon itself stops nothing for good: the next tick tries
+                // again, a little later.
+                match std::panic::catch_unwind(AssertUnwindSafe(|| pilot.tick())) {
+                    Ok(()) => thread::sleep(TICK),
+                    Err(_) => {
+                        log::error!("the autopilot ran into a panic; it carries on in a minute");
+                        thread::sleep(AFTER_A_PANIC);
+                    }
+                }
             }
         });
         if let Err(e) = spawned {

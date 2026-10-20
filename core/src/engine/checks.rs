@@ -1,12 +1,13 @@
 //! Looking for changes without touching anything, and telling the person when changes wait
 //! for their OK.
 
-use crate::engine::survey::Purpose;
+use crate::engine::survey::{Purpose, INTERNAL_LOOK};
 use crate::engine::{Engine, EngineEvent};
 use crate::error::Error;
 use crate::model::{JobId, JobStatus, Trigger, WaitingJob};
 use crate::scan::{ExcludeFilter, Keys};
 use chrono::Utc;
+use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -42,14 +43,21 @@ impl Engine {
         let engine = self.clone();
         let flag = stop.clone();
         let spawned = thread::Builder::new().name("charon-check".into()).spawn(move || {
-            let result = engine.survey(&job, &flag, Purpose::Check);
-            // A look made for a setup that changed meanwhile tells nothing.
-            let current = engine.stored_job(&job.id).ok().is_some_and(|now| now.setup == job.setup);
-            match result {
-                Ok(survey) if current => engine.note_look(&job, &survey),
-                Ok(_) | Err(Error::Cancelled) | Err(Error::Offline(_)) => {}
-                Err(e) if current => engine.change_runtime(&job.id, |rt| rt.problem = Some(e.to_string())),
-                Err(_) => {}
+            let looked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                let result = engine.survey(&job, &flag, Purpose::Check);
+                // A look made for a setup that changed meanwhile tells nothing.
+                let current = engine.stored_job(&job.id).ok().is_some_and(|now| now.setup == job.setup);
+                match result {
+                    Ok(survey) if current => engine.note_look(&job, &survey),
+                    Ok(_) | Err(Error::Cancelled) | Err(Error::Offline(_)) => {}
+                    Err(e) if current => engine.change_runtime(&job.id, |rt| rt.problem = Some(e.to_string())),
+                    Err(_) => {}
+                }
+            }));
+            // A mistake in Charon itself never leaves the job marked as being looked at.
+            if looked.is_err() {
+                log::error!("a look at job {} ended on a panic", job.id);
+                engine.change_runtime(&job.id, |rt| rt.problem = Some(INTERNAL_LOOK.into()));
             }
             engine.change_runtime(&job.id, |rt| {
                 if rt.checking.as_ref().is_some_and(|f| Arc::ptr_eq(f, &flag)) {

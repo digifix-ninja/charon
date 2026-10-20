@@ -15,6 +15,7 @@ use crate::scan::{
 use crate::store::Memory;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeSet;
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -28,6 +29,9 @@ const LEFTOVERS_NAMED: usize = 5;
 const CHECK_COMPARE_BYTES: u64 = 1 << 30;
 /// Comparison progress reaches the window at most this often.
 const COMPARE_PROGRESS_EVERY: std::time::Duration = std::time::Duration::from_millis(250);
+/// What a look says when it ran into a mistake in Charon itself.
+pub(crate) const INTERNAL_LOOK: &str =
+    "Charon ran into an error of its own while looking at the folders, so it changed nothing. If this keeps happening, please report it.";
 
 /// Why a survey is made.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,8 +213,17 @@ impl Survey {
 
 impl Engine {
     /// Scans both folders of `job` and plans its next sync, with every check that goes with
-    /// it. `cancel` stops the scans.
+    /// it. `cancel` stops the scans. A mistake in Charon itself (a panic) ends the look with
+    /// an error, like any other failed look: nothing is changed, and the job isn't left
+    /// marked as being looked at forever.
     pub(crate) fn survey(&self, job: &Job, cancel: &AtomicBool, purpose: Purpose) -> Result<Survey> {
+        std::panic::catch_unwind(AssertUnwindSafe(|| self.look_at(job, cancel, purpose))).unwrap_or_else(|_| {
+            log::error!("looking at the folders of {} ran into a panic", job.setup.name);
+            Err(Error::Invalid(INTERNAL_LOOK.into()))
+        })
+    }
+
+    fn look_at(&self, job: &Job, cancel: &AtomicBool, purpose: Purpose) -> Result<Survey> {
         let setup = job.setup.clone();
         for root in [&setup.source, &setup.destination] {
             if !root.is_dir() {

@@ -2,7 +2,9 @@
 //! Small routine syncs stay silent.
 
 use crate::state::AppState;
-use charon_core::{human_bytes, plural, Finished, WaitingJob};
+use charon_core::{human_bytes, plural, Finished, JobId, WaitingJob};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use tauri_plugin_notification::NotificationExt;
 
@@ -12,10 +14,46 @@ const BIG_SYNC_FILES: u64 = 1_000;
 
 pub struct Notifier;
 
+/// The last problem told about each job. A job that runs by itself and fails the same way
+/// every hour is told about once, until a run of it goes well again.
+#[derive(Default)]
+pub struct Repeats {
+    told: Mutex<HashMap<JobId, String>>,
+}
+
+impl Repeats {
+    /// Whether `problem` (title and text) about `job` is news. `None`: the run went well, so
+    /// the next problem is news again.
+    fn is_news(&self, job: &JobId, problem: Option<&(String, String)>) -> bool {
+        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        match problem {
+            Some((title, body)) => {
+                let said = format!("{title}\n{body}");
+                told.insert(job.clone(), said.clone()).as_ref() != Some(&said)
+            }
+            None => {
+                told.remove(job);
+                true
+            }
+        }
+    }
+}
+
 impl Notifier {
-    /// Tells the person about a finished run, if it's worth it.
+    /// Tells the person about a finished run, if it's worth it, and not about the same
+    /// problem again and again.
     pub fn announce(app: &AppHandle, finished: &Finished) {
-        if let Some((title, body)) = Self::finished(finished) {
+        let message = Self::finished(finished);
+        let run = &finished.summary;
+        if !run.cancelled {
+            let failed = run.error.is_some() || run.failed > 0 || run.left_out > 0;
+            let news = app.try_state::<Repeats>().is_none_or(|repeats| repeats.is_news(&finished.id, message.as_ref().filter(|_| failed)));
+            if !news {
+                log::info!("didn't tell again about {}: {}", finished.name, run.describe());
+                return;
+            }
+        }
+        if let Some((title, body)) = message {
             Self::show(app, &title, &body);
         }
     }
@@ -154,6 +192,20 @@ mod tests {
 
     fn waiting(name: &str, items: u64, removals: u64, conflicts: u64) -> WaitingJob {
         WaitingJob { id: name.into(), name: name.into(), items, removals, conflicts, drive_connected: false }
+    }
+
+    #[test]
+    fn the_same_problem_is_told_once_until_a_run_goes_well() {
+        let repeats = Repeats::default();
+        let job = "job".to_string();
+        let failed = ("Photos didn't sync".to_string(), "The drive is full.".to_string());
+        assert!(repeats.is_news(&job, Some(&failed)));
+        assert!(!repeats.is_news(&job, Some(&failed)));
+        assert!(repeats.is_news(&"other".to_string(), Some(&failed)), "each job on its own");
+        let other = ("Photos didn't sync".to_string(), "A folder can't be read.".to_string());
+        assert!(repeats.is_news(&job, Some(&other)), "another problem is news");
+        assert!(repeats.is_news(&job, None));
+        assert!(repeats.is_news(&job, Some(&other)), "after a good run, the problem is news again");
     }
 
     #[test]
