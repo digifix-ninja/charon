@@ -47,7 +47,7 @@ runs), and buttons to open either folder or pause the job.
 
 By default Charon never changes your files by itself. When a job is due, it looks at both
 folders and counts what would change. If anything would, the row says *Needs your OK* (or
-*Files to compare*, when all it found is large files it couldn't compare yet), a
+*Files to compare*, when all it found is files it couldn't compare yet), a
 notification tells you (if *Notifications* is on in Settings), and nothing crosses until you
 press *Review and sync*, which makes the list afresh, and confirm it. A new job shows its first
 list as soon as you save it.
@@ -93,7 +93,7 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
 | In sync | green, a tick | The last look found nothing to carry, apart from what the row's flags say couldn't be read or isn't synced. |
 | Syncing | blue, turning arrows | Files are crossing right now. |
 | Needs your OK | pink, a checklist | Changes wait for you to look at the list and confirm it, or a full-automation run was held back for your OK. |
-| Files to compare | pink, a checklist | A look in the background found nothing else to carry, but couldn't compare some large files by their contents yet (it reads at most 1 GB), so their copies may differ. *Review and sync* compares them, and its list may well have nothing to confirm. |
+| Files to compare | pink, a checklist | A look in the background found nothing else to carry, but couldn't compare some files by their contents yet (it reads at most 1 GB), so their copies may differ. *Review and sync* compares them, and its list may well have nothing to confirm. |
 | Ready | cyan, a spark | A new job that hasn't synced yet. Nothing crosses until you confirm its first list. |
 | Looking | no colour yet, a magnifying glass | Charon hasn't finished a new look at this job yet, so it doesn't claim the folders match. |
 | Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run (which also reads the files a look couldn't compare yet), or removals were left for a later sync. |
@@ -214,14 +214,14 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
 - **Room to spare, in a safe order.** Charon keeps 2% of the receiving drive free (at most 2 GB),
   and the list warns when a sync won't fit. The old versions a sync keeps in `.charon-trash`
   count as their drive frees room: one at a time on most local drives, all together on drives
-  that keep snapshots and on network shares, and not at all on APFS, where they're clones. New
-  folders and copies go first and removals last. Where an item of another kind takes an item's
-  place, the item there goes as late as it can: after every other copy, right before what takes
-  its place. When a copy to one side fails, that side's removals wait for the next sync. When a
-  copy is skipped because its file changed meanwhile, or waits with the rest of its app library,
-  only the removals that could be its old copy wait (the same name, or the same size and date),
-  so one busy file doesn't stop every removal. The list's notes say which copy each of them
-  waits for, and why.
+  that may keep snapshots, on network shares and on drives Charon doesn't know, and not at all
+  on APFS, where they're clones. New folders and copies go first and removals last. Where an
+  item of another kind takes an item's place, the item there goes as late as it can: after
+  every other copy, right before what takes its place. When a copy to one side fails, that
+  side's removals wait for the next sync. When a copy is skipped because its file changed
+  meanwhile, or waits with the rest of its app library, only the removals that could be its old
+  copy wait (the same name, or the same size and date), so one busy file doesn't stop every
+  removal. The activity log says which copy each of them waits for, and why.
 - **App libraries and databases stay whole.** A Photos or Final Cut library, a Logic project or
   a Pages document that changed on both sides of a two-way job becomes one conflict, kept whole
   from the side you choose. A sync carries each library, and each SQLite database with its
@@ -240,12 +240,13 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   backwards); otherwise both versions are kept. When the dates can't tell (no record of the
   last sync, both sides changed, or a date that only moved by a rounding), two-way jobs compare
   files of the same size byte by byte: identical ones aren't copied, and look-alikes that differ
-  inside become a conflict. A look in the background reads at most 1 GB this way and never
-  counts what it left unread as in sync: the row says how many files it couldn't compare yet,
-  and the list and the sync read them all. What a read found identical is remembered, even
-  after a restart, while both files and the folders they're in stay as they were, so a large
-  file whose details alone changed isn't left to compare at every launch. Mirror and Backup go
-  by size and modification time only.
+  inside become a conflict. A look in the background reads at most 1 GB this way. Past that, it
+  counts two files as in sync only where a read found them identical before (Charon remembers
+  that, even after a restart, while both files and the folders they're in stay as they were),
+  so a large file whose details alone changed isn't left to compare at every launch. It never
+  counts any other file it left unread as in sync: the row says how many files it couldn't
+  compare yet, and the list and the sync read them all. Mirror and Backup go by size and
+  modification time only.
 - **Crashes and quitting.** Quitting lets a sync stop at a safe point (a file being copied stays
   as it was) and records what it carried. If Charon or the computer stops mid-sync, a two-way
   job's next look compares both folders afresh and removes nothing. After your *Stop*, the next
