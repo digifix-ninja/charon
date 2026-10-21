@@ -81,9 +81,12 @@ impl Housekeeping {
             let (claims, partials): (Vec<&str>, Vec<&str>) = leftovers.iter().map(|(path, _)| path.as_str()).partition(|path| !is_partial(Keys::name(path)));
             let (legacy, current): (Vec<&str>, Vec<&str>) = partials.into_iter().partition(|path| is_legacy_partial(Keys::name(path)));
             if !current.is_empty() {
+                // Most are half-copied files; one may also be a whole file a sync had renamed
+                // aside (an old journal, a file it was removing, or a version an app saved
+                // that the trash couldn't take).
                 lines.push(format!(
-                    "Also moves {} left by an interrupted sync into .charon-trash on the {}.",
-                    plural(current.len() as u64, "half-copied file"),
+                    "Also moves {} a sync left under a temporary name (most often half-copied by an interrupted sync) into .charon-trash on the {}.",
+                    plural(current.len() as u64, "file"),
                     side.word()
                 ));
             }
@@ -1241,7 +1244,7 @@ mod tests {
 
         let leftovers = vec![(Side::Destination, Housekeeping::leftovers(&snapshot, now, Purpose::Review))];
         let lines = Housekeeping { trash: Vec::new(), leftovers }.lines(30);
-        assert_eq!(lines[0], "Also moves 1 half-copied file left by an interrupted sync into .charon-trash on the destination.");
+        assert_eq!(lines[0], "Also moves 1 file a sync left under a temporary name (most often half-copied by an interrupted sync) into .charon-trash on the destination.");
         assert!(lines[1].starts_with("Also moves “notes.charon-partial” into .charon-trash on the destination:"), "{}", lines[1]);
     }
 

@@ -106,10 +106,11 @@ answers, and mounting one takes `CAP_SYS_ADMIN` and `/dev/fuse`: run it as root 
 command above keeps that right). Without them it skips the same way, and with
 `CHARON_REQUIRE_PERMISSION_TESTS=1` it fails instead.
 
-One test in `safety_regressions.rs` runs on Linux only too: it mounts a folder of the same drive
-inside a job's folder (a bind mount) to check that what goes into the trash from there gets
-there, and mounting takes `CAP_SYS_ADMIN` (the `capsh` command above keeps it). Without it the
-test skips the same way, and with `CHARON_REQUIRE_PERMISSION_TESTS=1` it fails instead.
+Two tests in `safety_regressions.rs` run on Linux only too: they mount a folder of the same
+drive inside a job's folder (a bind mount) to check that what goes into the trash from there
+gets there, a database's old journal among it, and mounting takes `CAP_SYS_ADMIN` (the `capsh`
+command above keeps it). Without it the tests skip the same way, and with
+`CHARON_REQUIRE_PERMISSION_TESTS=1` they fail instead.
 
 The tests about upper and lower case in `names_left_alone.rs` need a folder on a drive that
 ignores case for every letter. The temporary folder is one on macOS and Windows; on Linux, set
@@ -309,7 +310,11 @@ each get the drive's own answer, and every look passes over such names.) It:
    pair whose contents can't be read counts as differing for that look. A pair read before in
    this session isn't read again while both sides are exactly as they were then and both folders
    carry the markers they carried then (`Reads`, in the job's live state; a sync of Charon's own
-   carries them on to the markers it writes). A background look reads at most 1 GB
+   carries them on to the markers it writes). Folders without a marker Charon can read (before
+   the job's first two-way sync, or with a damaged marker) keep none, as `store/same_contents.rs`
+   keeps none for them: nothing tells them from another drive under the same name. So each list
+   before the first sync reads such pairs again, and the first list after that sync reads a
+   conflict it left once more. A background look reads at most 1 GB
    (`CHECK_COMPARE_BYTES`); lists and runs read everything. Past that, a background look goes by
    what full reads found before: identical, while both sides are exactly as they were then
    (`store/same_contents.rs`, kept across restarts while both folders carry the markers they
@@ -625,7 +630,8 @@ folder's drive; if the drive went away, the run stops there.
   checked; if an app saved a new version at that very moment, the two swap back. Elsewhere
   (Windows, FAT and exFAT, most network shares) the old file is renamed aside and checked first,
   and only then does the copy take the free name. Either way, what an app saved is put back or
-  kept in `.charon-trash`, never written over.
+  kept in `.charon-trash`, never written over; when the trash can't take it, it stays under its
+  temporary name next to the file, and the step says where.
 - **Keeping the old version:** with safe deletes, always in two-way jobs, and always when a copy
   settles a conflict, a file being replaced is first *copied* into the trash and then replaced
   in place (a link is moved into the trash, if it's still the one the plan saw: one removed or
@@ -692,8 +698,12 @@ folder's drive; if the drive went away, the run stops there.
   other copies didn't land in this run…"). A failure once the files are taking their places
   (rare) stops the ones after it, but for what only adds to it, and puts the old journals of
   those databases back; the unit can be left part old and part new, but nothing of it is removed
-  except the old journals of a database that landed, which go to `.charon-trash`. The next sync
-  looks at it again. The run's summary counts what waited ("3 items left for the next sync with
+  except the old journals of a database that landed, which go to `.charon-trash`. An old journal
+  set aside goes into `.charon-trash` under its own name once its database's new version landed
+  (with safe deletes, or when its removal is held back). Where a rename can't reach the trash (a
+  folder mounted inside the job's), it is copied there and then removed, like a removal
+  (`trash_aside`). One that changed after it was set aside stays under its temporary name, its
+  copy goes, and the step says where it is. The next sync looks at it again. The run's summary counts what waited ("3 items left for the next sync with
   the rest of their app library or database"). A library holding an item Charon leaves alone
   (one it can't read, one only in the cloud) is left alone whole, with a note
   (`Ground::keep_units_whole`); an item the other drive can never hold (a link on a drive
@@ -703,7 +713,9 @@ folder's drive; if the drive went away, the run stops there.
   where the drive says how much room it has, so other apps can still save. A copy that would eat
   into that fails with a clear reason. On a Mac, room the system can free by itself counts as
   free. The copies of replaced versions kept in the trash need room too, and how much at one
-  time depends on the drive (`KeptCopies`): none on APFS, where they're clones; the largest
+  time depends on the drive (`KeptCopies`): none on APFS, where they're clones, but for a file
+  on another drive than the trash (one mounted inside the job's folder after the scan), whose
+  copy is a full one and is counted in full, as on any drive (`Executor::clones_at`); the largest
   one's on a drive that gives a removed file's room back at once (Mac OS Extended, FAT, exFAT,
   NTFS, ext, XFS, tmpfs and `fuseblk`, not over a network), plus those of files with other names
   (hard links, `Identity::names`), which keep their room; and every one's elsewhere (Btrfs, ZFS
@@ -963,7 +975,13 @@ the jobs found waiting come in one notification. The tray's status line (`Overvi
 names each kind ("1 job waits for your OK, 1 has files to compare"), and the header, the tray's
 *Review Waiting Jobs…*, the Dock badge and the quit prompt count both (`Overview.to_compare`,
 `Overview::lists_waiting`). A job that was held back waits for an OK, whatever else its look
-found.
+found. A job that syncs by itself and whose look found only files it couldn't compare yet
+waits for nobody. It's counted apart from the jobs with changes queued
+(`Overview.pending_compare`, `JobView::compares_at_next_sync`): the tray says "1 job with files
+to compare at its next sync" and the header "1 job has files to compare at its next sync", and
+both name both kinds when both exist ("1 job with changes waiting, 1 with files to compare at
+its next sync"). A confirmed list that waits for another sync still counts as changes queued,
+since that sync carries out exactly the list.
 
 ### Overlapping jobs and other Charons
 

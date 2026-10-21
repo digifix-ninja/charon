@@ -96,7 +96,7 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
 | Files to compare | pink, a checklist | A look in the background found nothing else to carry, but couldn't compare some files by their contents yet (it reads at most 1 GB), so their copies may differ. *Review and sync* compares them, and its list may well have nothing to confirm. |
 | Ready | cyan, a spark | A new job that hasn't synced yet. Nothing crosses until you confirm its first list. |
 | Looking | no colour yet, a magnifying glass | Charon hasn't finished a new look at this job yet, so it doesn't claim the folders match. |
-| Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run (which also reads the files a look couldn't compare yet), or removals were left for a later sync. |
+| Pending | amber, an up arrow | Changes are queued: a list you confirmed waits for another sync of the same folders to end, or, with full automation, changes were found and cross at the job's next run, or a look found files it couldn't compare yet, which that run reads (the tray then says *1 job with files to compare at its next sync*), or removals were left for a later sync. |
 | Paused | grey, two bars | Doesn't sync by itself. Charon still looks and shows what waits, and you can still sync it from its row. |
 | Conflict | violet, a fork | A file changed on both sides and waits for you to choose which version to keep. |
 | Error | red, an exclamation mark | The last look or sync failed, or some files couldn't be copied. The row says why and names what failed. |

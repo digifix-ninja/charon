@@ -1279,20 +1279,24 @@ impl<'a> Executor<'a> {
     /// version gives its room back once removed, the largest copy is all that needs room at
     /// a time, with those of files that have other names (hard links) on top; where the
     /// drive may hold on to a removed file's data, every copy does; where the copies are
-    /// clones, none does (see `KeptCopies`).
+    /// clones, none does (see `KeptCopies`). The copy of a version on another drive (in a
+    /// folder mounted inside the job's) is never a clone, and replacing that version gives
+    /// its room back on that other drive only: each of those needs room of its own.
     fn room_for_replaced(&self, unit: &Unit, staged: &[(&Action, Staged)]) -> Option<(usize, Error)> {
         for side in [Side::Source, Side::Destination] {
             let copies = self.kept_copies(side);
             let gives_back = |target: &Path| copies == KeptCopies::OneAtATime && Identity::names(target) == Some(1);
             let kept = |ready: &Staged| {
                 let old = ready.existing.filter(|old| ready.to == side && old.is_file() && self.keeps_replaced(ready.settles))?;
-                Some((old.size, gives_back(&ready.target)))
+                Some((old.size, self.on_folders_drive(side, &ready.target)))
             };
             let replaced: Vec<(usize, (u64, bool))> = staged.iter().enumerate().filter_map(|(at, (_, ready))| Some((at, kept(ready)?))).collect();
-            let bytes = copies.room(replaced.iter().map(|(_, old)| *old));
+            let near = replaced.iter().filter(|(_, (_, near))| *near).map(|&(at, (size, _))| (size, gives_back(&staged[at].1.target)));
+            let far = replaced.iter().filter(|(_, (_, near))| !near).fold(0u64, |room, (_, (size, _))| room.saturating_add(*size));
+            let bytes = copies.room(near).saturating_add(far);
             let Some(&(largest, _)) = replaced.iter().max_by_key(|(_, (size, _))| *size).filter(|_| bytes > 0) else { continue };
             let what = format!("the replaced versions of “{}”", self.spellings.disk(side, unit.key()));
-            if let Err(e) = self.room_for_kept_copy(side, bytes, &what) {
+            if let Err(e) = self.room_to_keep(side, bytes, &what) {
                 return Some((largest, e));
             }
         }
@@ -1922,7 +1926,7 @@ impl<'a> Executor<'a> {
             Some(old) if keep_old && old.is_file() => {
                 // Keep a copy of the old version, then replace it in place (see `Trash`).
                 // The old version may be only in the cloud since the scan: then it's left alone.
-                let kept = match self.room_for_kept_copy(to, old.size, "the replaced version").and_then(|()| self.trash.preserve(root, &relative)) {
+                let kept = match self.room_for_kept_copy(to, &target, old.size, "the replaced version").and_then(|()| self.trash.preserve(root, &relative)) {
                     Ok(kept) => kept,
                     Err(e) => {
                         Copier::discard(&partial);
@@ -2165,7 +2169,8 @@ impl<'a> Executor<'a> {
             Some(expected) => *expected,
             None => self.look_fresh(side, aside)?.ok_or_else(|| Error::file(aside, io::Error::from(io::ErrorKind::NotFound)))?,
         };
-        self.room_for_kept_copy(side, expected.size, what)?;
+        // On another drive than the trash: the copy is never a clone.
+        self.room_to_keep(side, expected.size, what)?;
         let kept = self.trash.preserve_from(aside, root, relative)?;
         self.touch(&kept);
         let now = self.look_fresh(side, aside);
@@ -2232,19 +2237,43 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// The room for keeping a copy of `what` ("the replaced version"), of `bytes`, in the
-    /// trash: none on a drive where that copy is a clone.
-    fn room_for_kept_copy(&self, side: Side, bytes: u64, what: &str) -> Result<()> {
-        if self.clones(side) {
+    /// The room for keeping a copy of `what` ("the replaced version"), the item at `item` of
+    /// `bytes`, in the trash: none where that copy is a clone.
+    fn room_for_kept_copy(&self, side: Side, item: &Path, bytes: u64, what: &str) -> Result<()> {
+        if self.clones_at(side, item) {
             Ok(())
         } else {
-            self.room_for(side, bytes).map_err(|e| Error::NoRoom(format!("{e} (to keep {what} in .charon-trash)")))
+            self.room_to_keep(side, bytes, what)
         }
     }
 
-    /// Whether copies on `side`'s drive are clones, instant and taking no room (APFS).
-    fn clones(&self, side: Side) -> bool {
-        self.kept_copies(side) == KeptCopies::Clones
+    /// The room for keeping copies of `what`, of `bytes`, in the trash, copied in full.
+    fn room_to_keep(&self, side: Side, bytes: u64, what: &str) -> Result<()> {
+        self.room_for(side, bytes).map_err(|e| Error::NoRoom(format!("{e} (to keep {what} in .charon-trash)")))
+    }
+
+    /// Whether a copy of the item at `item` in `side`'s trash is a clone, instant and taking
+    /// no room: on APFS, with the item on that drive too. One on a drive mounted inside the
+    /// job's folder is copied in full.
+    fn clones_at(&self, side: Side, item: &Path) -> bool {
+        self.kept_copies(side) == KeptCopies::Clones && self.on_folders_drive(side, item)
+    }
+
+    /// Whether the item at `item` is on the drive of `side`'s folder, where its trash is, and
+    /// not in a folder mounted inside the job's. One that can't be asked counts as elsewhere.
+    #[cfg(unix)]
+    fn on_folders_drive(&self, side: Side, item: &Path) -> bool {
+        match (fs::metadata(self.shores.root(side)), fs::symlink_metadata(item)) {
+            (Ok(folder), Ok(item)) => RootId::device_of(&folder) == RootId::device_of(&item),
+            _ => false,
+        }
+    }
+
+    /// Windows: Charon doesn't tell the drives inside a folder apart there, and copies there
+    /// are never clones.
+    #[cfg(not(unix))]
+    fn on_folders_drive(&self, _side: Side, _item: &Path) -> bool {
+        true
     }
 
     /// How the copies of replaced versions kept in the trash take room on `side`'s drive.
@@ -2384,7 +2413,7 @@ impl<'a> Executor<'a> {
     /// name, so a moved file would take the person's next saves into the trash with it.
     /// Removed, the app saves again where the file was, and the next sync sees it.
     fn remove(&self, side: Side, relative: &str, target: &Path, keep: bool, planned: &Entry) -> Result<bool> {
-        let removal = if keep && planned.is_file() && self.clones(side) {
+        let removal = if keep && planned.is_file() && self.clones_at(side, target) {
             self.remove_after_copying(side, relative, target, planned)
         } else if keep {
             self.move_to_trash(side, relative, target, planned)
@@ -2429,9 +2458,10 @@ impl<'a> Executor<'a> {
 
     /// Keeps a copy of the file or link at `target` in the trash, then removes it for good if
     /// it's still `planned` (see `remove_checked`). A file's copy is a clone on APFS (instant,
-    /// and it takes no room); elsewhere it needs room on the drive.
+    /// and it takes no room) when the file is on the trash's drive; elsewhere, and from a
+    /// drive mounted inside the job's folder, it needs room on the drive.
     fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<Removal> {
-        self.room_for_kept_copy(side, planned.size, Self::removed(planned))?;
+        self.room_for_kept_copy(side, target, planned.size, Self::removed(planned))?;
         let kept = self.trash.preserve(self.shores.root(side), relative)?;
         self.touch(&kept);
         let removed = self.remove_checked(side, relative, target, planned);
@@ -3257,6 +3287,59 @@ mod tests {
         assert!(executor.remove(Side::Destination, "photos/x.jpg", &target, true, &seen(&target)).unwrap());
         assert!(!other_drive.path().join("x.jpg").exists());
         assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 9, "the trash holds the copy");
+    }
+
+    /// On APFS a kept copy is a clone and takes no room, but only of a file on the trash's own
+    /// drive: one from a drive mounted inside the job's folder is copied in full, so it needs
+    /// room like anywhere else. Short of it, the file stays where it is and nothing goes into
+    /// the trash.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_kept_copy_from_a_drive_mounted_inside_needs_room_even_where_copies_are_clones() {
+        let (_tmp, shores) = shores();
+        let other_drive = photos_on_another_drive(&shores);
+        let mut apfs = Snapshot::new();
+        apfs.facts_mut().volume = Some(Volume {
+            kind: FsKind::Apfs,
+            fs: "apfs".into(),
+            mount: "/".into(),
+            name: "Macintosh HD".into(),
+            network: false,
+            case_sensitive: false,
+            case_guessed: false,
+            refuses_links: false,
+        });
+        let source = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &source, &apfs, KEEP, &cancel);
+        let (far, near) = (shores.destination.join("photos/photo.jpg"), shores.destination.join("notes.txt"));
+        write(&far, "the photo", 1_600_000_000);
+        write(&near, "the notes", 1_600_000_000);
+        let huge = u64::MAX / 2;
+
+        assert!(matches!(executor.room_for_kept_copy(Side::Destination, &far, huge, "the replaced version"), Err(Error::NoRoom(_))));
+        assert!(executor.room_for_kept_copy(Side::Destination, &near, huge, "the replaced version").is_ok(), "a clone takes no room");
+
+        let planned = Entry { size: huge, ..seen(&far) };
+        let e = executor.remove(Side::Destination, "photos/photo.jpg", &far, true, &planned).expect_err("no room for the photo's copy");
+        assert!(matches!(e, Error::NoRoom(_)), "{e}");
+        assert!(e.to_string().contains("to keep the removed file in .charon-trash"), "{e}");
+        assert_eq!(fs::read_to_string(other_drive.path().join("photo.jpg")).unwrap(), "the photo");
+        assert_eq!(trashed(&shores.destination), Vec::<(String, String)>::new());
+
+        // A library's replaced versions, checked before any of them is: the same.
+        let replaced = |path: &str| vec![Action::copy(Side::Destination, path, Entry::file(10, 2_000), Some(Entry::file(huge, 1_000)))];
+        fs::create_dir(shores.destination.join("photos/Photos.photoslibrary")).unwrap();
+        write(&shores.destination.join("photos/Photos.photoslibrary/original.heic"), "the original", 1_600_000_000);
+        let library = Unit::Package("photos/Photos.photoslibrary".into());
+        let far = replaced("photos/Photos.photoslibrary/original.heic");
+        let (at, e) = executor.room_for_replaced(&library, &staged_in(&shores.destination, &far)).expect("no room for the original's replaced version");
+        assert_eq!(at, 0);
+        assert!(e.to_string().contains("to keep the replaced versions of “photos/Photos.photoslibrary” in .charon-trash"), "{e}");
+        fs::create_dir(shores.destination.join("Song.logicx")).unwrap();
+        write(&shores.destination.join("Song.logicx/take0.wav"), "the take", 1_600_000_000);
+        let near = replaced("Song.logicx/take0.wav");
+        assert!(executor.room_for_replaced(&Unit::Package("Song.logicx".into()), &staged_in(&shores.destination, &near)).is_none(), "a clone takes no room");
     }
 
     /// So is everything else that goes into the trash there: the files the system left in a
