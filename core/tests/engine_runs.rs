@@ -606,6 +606,38 @@ fn what_this_session_read_holds_only_while_the_folders_carry_the_same_markers() 
     not_compared(&again);
 }
 
+/// Before a job's first sync neither folder carries Charon's marker, and nothing tells them
+/// from other folders under the same names: what this session read in them never stands for
+/// another. A list reads a pair whose times differ and finds both sides identical. Then
+/// another drive under the same name takes the destination's place, holding another version
+/// of the file with the same size and time (an encrypted container keeps its time). The next
+/// list reads it again and finds the conflict, and confirming that list leaves it for the
+/// person: the two copies are never recorded as in sync.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_this_session_read_before_the_first_sync_never_stands_for_another_folder() {
+    let Some(far) = untimed_folder() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), far.path().join("b"), tmp.path().join("data"));
+    let other = far.path().join("other");
+    if !vaults(&[&a, &b, &other]) {
+        return;
+    }
+    // Copied without its time: the same contents, another date, so a list reads the pair.
+    filetime::set_file_mtime(b.join("vault.hc"), vault_time(5)).unwrap();
+    // Another version of the file, with the same size and time as the destination's.
+    edit_vault(&other, 5);
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    assert_eq!(engine.prepare_review(&id).unwrap().tally.conflicts, 0, "the list reads it: both sides are identical");
+
+    // Another drive under the same name takes the destination's place.
+    fs::rename(&b, far.path().join("b-before")).unwrap();
+    fs::rename(&other, &b).unwrap();
+    assert_eq!(confirm(&engine, &id).tally.conflicts, 1, "the list reads it: the sides differ");
+    assert_eq!(engine.prepare_review(&id).unwrap().tally.conflicts, 1, "the conflict waits for the person");
+}
+
 /// What a list found about a large file holds only while neither side changes: an edit that
 /// keeps the file's size and time (an encrypted container does) is never taken for in sync,
 /// before or after a restart, and the list carries it.

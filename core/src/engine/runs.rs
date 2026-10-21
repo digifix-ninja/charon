@@ -1788,13 +1788,10 @@ mod tests {
     fn what_this_session_read_still_holds_after_a_sync_of_its_own() {
         let tmp = tempfile::tempdir().unwrap();
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
-        // Each side holds its own version of the file, of the same size: the list reads both
-        // and leaves the conflict for the person.
-        for (folder, text, seconds) in [(&a, "ours", 0), (&b, "mine", 60)] {
+        for folder in [&a, &b] {
             std::fs::create_dir_all(folder).unwrap();
-            std::fs::write(folder.join("notes.txt"), text).unwrap();
-            filetime::set_file_mtime(folder.join("notes.txt"), filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0)).unwrap();
         }
+        std::fs::write(a.join("readme.txt"), "hello").unwrap();
         let engine = Engine::open(tmp.path().join("data"), Arc::new(|_: EngineEvent| {})).unwrap();
         let setup = JobSetup {
             name: "Notes".into(),
@@ -1808,17 +1805,29 @@ mod tests {
             full_automation: false,
         };
         let id = engine.add_job(setup).unwrap().job.id;
-        let review = engine.prepare_review(&id).unwrap();
-        assert_eq!(review.tally.conflicts, 1);
-        engine.approve(&id, &review.review_id, true).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while engine.is_running(&id) {
-            assert!(Instant::now() < deadline, "the sync took too long");
-            thread::sleep(Duration::from_millis(10));
+        let confirm = || {
+            let review = engine.prepare_review(&id).unwrap();
+            engine.approve(&id, &review.review_id, true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while engine.is_running(&id) {
+                assert!(Instant::now() < deadline, "the sync took too long");
+                thread::sleep(Duration::from_millis(10));
+            }
+            review
+        };
+        // The first sync leaves both folders' markers: only folders that carry them keep what
+        // was read in them.
+        assert_eq!(confirm().tally.conflicts, 0);
+        // Each side holds its own version of the file, of the same size: the list reads both
+        // and leaves the conflict for the person.
+        for (folder, text, seconds) in [(&a, "ours", 0), (&b, "mine", 60)] {
+            std::fs::write(folder.join("notes.txt"), text).unwrap();
+            filetime::set_file_mtime(folder.join("notes.txt"), filetime::FileTime::from_unix_time(1_700_000_000 + seconds, 0)).unwrap();
         }
+        assert_eq!(confirm().tally.conflicts, 1);
 
         let markers = Markers::read(&a, &b, &id);
-        assert!(matches!(markers.destination, Found::Marker(_)), "the sync left its markers");
+        assert!(matches!(&markers.destination, Found::Marker(marker) if marker.generation == 2), "the sync moved the markers on");
         let filter = ExcludeFilter::new(&[], false).unwrap();
         let entry = |root: &Path| *Scanner::new(&filter).scan(root, Volume::of(root)).unwrap().get("notes.txt").unwrap();
         let verdict = engine.change_runtime(&id, |rt| rt.reads.verdict("notes.txt", &entry(&a), &entry(&b), &markers));
