@@ -362,8 +362,8 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   *Confirmed: starts as soon as “Photos” finishes syncing*. While Charon runs, the list stays
   good however long it waits, and each step still checks the disk when its turn comes. *Stop*,
   pausing the job or everything, or editing the job calls it off, and so does quitting Charon,
-  which doesn't ask first: the job then waits for your OK again, and its activity log says the
-  sync was called off. If a drive is swapped meanwhile, the list is dropped and the row says why.
+  which doesn't ask first: that list is then never carried out, and the job's activity log says
+  the sync was called off. If a drive is swapped meanwhile, the list is dropped and the row says why.
   The waiting sync starts the moment a sync of this Charon ends, and within seconds of another
   Charon's. Once it's done, Charon looks at the folders again at once, since the sync it waited
   for changed them.
