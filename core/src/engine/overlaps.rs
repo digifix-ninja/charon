@@ -294,6 +294,22 @@ mod tests {
         }
     }
 
+    /// Moves the folder `from` to `to`. Windows refuses to while anything holds a file inside
+    /// open, as a virus scanner may for a moment after files were written, so it is tried
+    /// again for a few seconds.
+    fn move_folder(from: &Path, to: &Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match fs::rename(from, to) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => panic!("{} can't be moved: {e}", from.display()),
+            }
+        }
+    }
+
     fn found(side: Side, folder: &Path, job: &Job) -> Vec<MarkerAround> {
         vec![MarkerAround { side, folder: folder.to_path_buf(), job: job.id.clone() }]
     }
@@ -364,7 +380,7 @@ mod tests {
         let note = copies.iter().next().expect("the copy is mentioned");
         assert!(note.contains("Old photos") && note.contains("“Photos”"), "{note}");
         // The drive is unplugged: the Mirror can't sync, and nothing is said.
-        fs::rename(&usb, tmp.path().join("unplugged")).unwrap();
+        move_folder(&usb, &tmp.path().join("unplugged"));
         let mut copies = BTreeSet::new();
         assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies).is_empty());
         assert!(copies.is_empty());
