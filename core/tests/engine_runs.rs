@@ -755,6 +755,41 @@ fn a_large_file_a_background_look_leaves_unread_starts_a_sync_of_a_job_that_sync
     assert!(engine.has_pending(&id), "its sync reads the file");
 }
 
+/// A job that syncs by itself once an hour, not on change, waits for its next sync to compare
+/// what its background look couldn't. A large file whose details alone changed on one side
+/// (both copies identical) is all the look found: the row says "1 file not compared yet", and
+/// the tray says so too, never that the job has changes waiting.
+#[cfg(unix)]
+#[test]
+fn a_job_that_syncs_by_itself_with_only_files_to_compare_is_not_said_to_have_changes_waiting() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    job.trigger = Trigger::Interval { minutes: 60 };
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+    look(&engine, &id);
+    assert_eq!(engine.job(&id).unwrap().status, JobStatus::InSync);
+
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Pending);
+    let pending = view.pending.as_ref().unwrap();
+    assert_eq!((pending.items, pending.uncompared), (0, 1), "no change found, one file not compared yet");
+    assert!(view.compares_at_next_sync());
+    let overview = engine.overview();
+    assert_eq!((overview.pending, overview.pending_compare, overview.lists_waiting()), (0, 1, 0));
+    assert_eq!(overview.headline(), "1 job with files to compare at its next sync");
+    assert_eq!(engine.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
+}
+
 /// What reads found identical goes with the job's memory: when its folders or its mode
 /// change, and when it's removed.
 #[test]

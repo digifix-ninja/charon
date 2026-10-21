@@ -1,7 +1,7 @@
 // The title bar's status line, the "Pause all" button and the overview tiles.
 
 import { Dom } from "../dom.js";
-import { GROUPS, needsYou, onlyToCompare } from "../store.js";
+import { GROUPS, comparesAtNextSync, needsYou, onlyToCompare } from "../store.js";
 import { Counter } from "../effects/counter.js";
 import { Icons } from "../icons.js";
 
@@ -72,6 +72,8 @@ export class Header {
     return {
       ...overview,
       jobs: Math.max(overview.jobs ?? 0, jobs.length),
+      pending: most("pending", job => job.status === "pending" && !comparesAtNextSync(job)),
+      pendingCompare: most("pendingCompare", comparesAtNextSync),
       waiting: most("waiting", job => job.waiting && !onlyToCompare(job.waiting)),
       toCompare: most("toCompare", job => job.waiting && onlyToCompare(job.waiting)),
       attention: most("attention", needsYou),
@@ -88,7 +90,7 @@ export class Header {
     if (o.attention) return "attention";
     if (o.waiting || o.toCompare) return "review";
     if (o.pausedAll) return "paused";
-    if (o.pending || o.incomplete) return "pending";
+    if (o.pending || o.pendingCompare || o.incomplete) return "pending";
     if (o.looking) return "looking";
     return "calm";
   }
@@ -99,6 +101,12 @@ export class Header {
     const compare = o.toCompare === 1 ? "1 job has files to compare" : `${o.toCompare} jobs have files to compare`;
     // What waits for the person: changes to confirm, files to compare, or both.
     const asks = [o.waiting && waits, o.toCompare && compare].filter(Boolean).join(" · ");
+    const changes = o.pending === 1 ? "1 job has changes queued" : `${o.pending} jobs have changes queued`;
+    const compareNext = o.pendingCompare === 1
+      ? "1 job has files to compare at its next sync"
+      : `${o.pendingCompare} jobs have files to compare at their next sync`;
+    // What is queued without waiting for the person: changes, files to compare, or both.
+    const queued = [o.pending && changes, o.pendingCompare && compareNext].filter(Boolean).join(" · ");
     const need = `${o.attention} ${o.attention === 1 ? "job needs" : "jobs need"} your attention`;
     if (o.problem) return "Charon needs your attention";
     if (o.jobs === 0) return "No crossings yet. Create your first sync job.";
@@ -106,7 +114,7 @@ export class Header {
     if (o.attention) return asks ? `${need} · ${asks}` : need;
     if (o.pausedAll) return asks ? `Everything is paused · ${asks}` : "Everything is paused";
     if (asks) return asks;
-    if (o.pending) return `${o.pending} ${o.pending === 1 ? "job has" : "jobs have"} changes queued`;
+    if (queued) return queued;
     if (o.incomplete) return `${o.incomplete} ${o.incomplete === 1 ? "job doesn't" : "jobs don't"} sync everything`;
     if (o.looking) return "Looking for changes…";
     return o.offline ? `All reachable jobs in sync · ${o.offline} offline` : "All in sync. The river is calm.";
