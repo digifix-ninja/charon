@@ -1373,8 +1373,9 @@ impl<'a> Executor<'a> {
     /// Finishes the removal of an old journal set aside (see `set_aside`), once its
     /// database's new version took its place: into the trash with safe deletes or when
     /// `keep` (its removal waits, but it can't go back next to the new version), deleted for
-    /// good otherwise. One that can't go stays under its temporary name, never next to the
-    /// new database (the next sync moves it into the trash).
+    /// good otherwise. One that can't go, or that changed since it was set aside where it
+    /// can only be copied into the trash (see `trash_aside`), stays under its temporary name,
+    /// never next to the new database (a later sync moves it into the trash).
     fn finish_aside(&self, aside: Aside, keep: bool) -> Result<Done> {
         let Aside { side, key, planned, relative, target, at, .. } = aside;
         let Some(at) = at else {
@@ -1382,8 +1383,7 @@ impl<'a> Executor<'a> {
             return Ok(Done::Nothing);
         };
         if self.care.safe_delete || keep {
-            let kept = self.trash.put_from(&at, self.shores.root(side), &relative)?;
-            self.touch(&kept);
+            self.trash_aside(side, &at, &relative, Some(&planned), Self::removed(&planned))?;
         } else {
             Self::remove_item(&at).map_err(|e| Error::file(&target, e))?;
         }
@@ -2047,8 +2047,12 @@ impl<'a> Executor<'a> {
                 Ok(false)
             }
             Err(e) => {
-                self.keep_aside(to, partial, relative);
-                Err(Error::Changed(format!("an app saved a new version while Charon replaced it ({e}); that version is in .charon-trash")))
+                let kept = if self.keep_aside(to, partial, relative) {
+                    "that version is in .charon-trash".to_string()
+                } else {
+                    format!("that version stays under a temporary name, as {}", self.place_of(to, partial))
+                };
+                Err(Error::Changed(format!("an app saved a new version while Charon replaced it ({e}); {kept}")))
             }
         }
     }
@@ -2125,12 +2129,72 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Moves an item Charon renamed aside into the trash, under its own name.
-    fn keep_aside(&self, side: Side, aside: &Path, relative: &str) {
-        match self.trash.put_from(aside, self.shores.root(side), relative) {
-            Ok(kept) => self.touch(&kept),
-            // Under its temporary name, the next sync moves it into the trash.
-            Err(e) => log::error!("couldn't move {} into the trash: {e}; it stays at {}", relative, aside.display()),
+    /// Moves an item Charon renamed aside into the trash, under its own name (see
+    /// `trash_aside`). Returns whether it's there: one that can't go stays under its
+    /// temporary name, and a later sync moves it into the trash.
+    fn keep_aside(&self, side: Side, aside: &Path, relative: &str) -> bool {
+        match self.trash_aside(side, aside, relative, None, "the version set aside") {
+            Ok(_) => true,
+            Err(e) => {
+                log::error!("couldn't move {} into the trash: {e}; it stays at {}", relative, aside.display());
+                false
+            }
+        }
+    }
+
+    /// Moves the item Charon renamed aside to `aside` into the trash as `relative` (its own
+    /// place in `side`'s folder), and returns where it is there. Where the trash is on another
+    /// drive than the item (a folder mounted inside the job's), nothing moves there in one
+    /// step: the item is copied into the trash instead, if the trash's drive has room for
+    /// `what` ("the removed file"), and then removed, as long as it's still `expected` (as the
+    /// plan saw it) or, without `expected`, as it was right before it was copied. One that
+    /// changed meanwhile stays where it is, under its temporary name, and its copy goes. One
+    /// that can't be removed stays too, and so does its copy: a drive may say a removal failed
+    /// that it carried out (a network share), and then the copy is all that's left of it.
+    fn trash_aside(&self, side: Side, aside: &Path, relative: &str, expected: Option<&Entry>, what: &str) -> Result<PathBuf> {
+        let root = self.shores.root(side);
+        match self.trash.put_from(aside, root, relative) {
+            Ok(kept) => {
+                self.touch(&kept);
+                return Ok(kept);
+            }
+            Err(Error::File { source, .. }) if source.kind() == io::ErrorKind::CrossesDevices => {}
+            Err(e) => return Err(e),
+        }
+        let expected = match expected {
+            Some(expected) => *expected,
+            None => self.look_fresh(side, aside)?.ok_or_else(|| Error::file(aside, io::Error::from(io::ErrorKind::NotFound)))?,
+        };
+        self.room_for_kept_copy(side, expected.size, what)?;
+        let kept = self.trash.preserve_from(aside, root, relative)?;
+        self.touch(&kept);
+        let now = self.look_fresh(side, aside);
+        match &now {
+            Ok(Some(found)) if Self::same_after_rename(found, &expected) => {
+                Self::remove_item(aside).map_err(|e| Error::file(aside, e))?;
+                self.touch(aside);
+            }
+            // Gone meanwhile: its copy is all that's left of it.
+            Ok(None) => {}
+            _ => {
+                Copier::discard(&kept);
+                now?;
+                return Err(Error::Changed(format!(
+                    "changed on the {} side since the scan; it stays under a temporary name, as {}",
+                    side.word(),
+                    self.place_of(side, aside)
+                )));
+            }
+        }
+        Ok(kept)
+    }
+
+    /// Where `path` is in `side`'s folder, for the person: `/`-separated from the folder's
+    /// top, or in full when it isn't inside.
+    fn place_of(&self, side: Side, path: &Path) -> String {
+        match path.strip_prefix(self.shores.root(side)) {
+            Ok(inside) => inside.components().map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"),
+            Err(_) => path.display().to_string(),
         }
     }
 
@@ -2367,8 +2431,7 @@ impl<'a> Executor<'a> {
     /// it's still `planned` (see `remove_checked`). A file's copy is a clone on APFS (instant,
     /// and it takes no room); elsewhere it needs room on the drive.
     fn remove_after_copying(&self, side: Side, relative: &str, target: &Path, planned: &Entry) -> Result<Removal> {
-        let what = if planned.is_link() { "the removed link" } else { "the removed file" };
-        self.room_for_kept_copy(side, planned.size, what)?;
+        self.room_for_kept_copy(side, planned.size, Self::removed(planned))?;
         let kept = self.trash.preserve(self.shores.root(side), relative)?;
         self.touch(&kept);
         let removed = self.remove_checked(side, relative, target, planned);
@@ -2376,6 +2439,16 @@ impl<'a> Executor<'a> {
             Copier::discard(&kept);
         }
         removed
+    }
+
+    /// What a removed item kept in the trash is called where the drive has no room for its
+    /// copy (see `room_for_kept_copy`).
+    fn removed(item: &Entry) -> &'static str {
+        if item.is_link() {
+            "the removed link"
+        } else {
+            "the removed file"
+        }
     }
 
     /// Removes the file or link at `target` for good, if it's still `planned`: renamed aside,
@@ -2920,6 +2993,38 @@ mod tests {
         assert_eq!(names_in(&shores.destination), vec!["notes.txt"], "the copy is gone, nothing else is left");
     }
 
+    /// When the version an app saved can't be swapped back (here the name it would go back to
+    /// is gone), the step says where that version is: in the trash, or, when the trash can't
+    /// take it, under the temporary name it has.
+    #[test]
+    fn a_version_that_cant_be_swapped_back_is_said_to_be_where_it_is() {
+        let (_tmp, shores) = shores();
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("notes.txt");
+        let planned = Entry::file(3, 1_600_000_000_000);
+        let swapped = Swapped { checked: None, copy: None };
+        let trash = shores.destination.join(crate::scan::TRASH_FOLDER);
+        fs::write(&trash, "a file where the trash would be").unwrap();
+        let partial = Copier::partial_path(&target);
+        write(&partial, "the app's version", 1_700_000_000);
+        let Err(Error::Changed(why)) = executor.check_swapped(Side::Destination, &partial, &target, "notes.txt", &planned, swapped) else {
+            panic!("the step says the file changed")
+        };
+        let name = partial.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(why.ends_with(&format!("that version stays under a temporary name, as {name}")), "{why}");
+        assert_eq!(fs::read_to_string(&partial).unwrap(), "the app's version");
+
+        fs::remove_file(&trash).unwrap();
+        let Err(Error::Changed(why)) = executor.check_swapped(Side::Destination, &partial, &target, "notes.txt", &planned, swapped) else {
+            panic!("the step says the file changed")
+        };
+        assert!(why.ends_with("that version is in .charon-trash"), "{why}");
+        assert!(names_in(&shores.destination).is_empty());
+        assert_eq!(Trash::look(&shores.destination, 0, true, false).bytes, 17, "the trash holds the app's version");
+    }
+
     #[test]
     fn a_checked_version_is_replaced_and_nothing_is_left_behind() {
         let (_tmp, shores) = shores();
@@ -3214,6 +3319,82 @@ mod tests {
         assert!(executor.commit(staged).unwrap().is_some());
         assert_eq!(fs::read_link(&target).unwrap(), Path::new("2020/y.jpg"));
         assert_eq!(trashed(&shores.destination), vec![("photos/newest".to_string(), "link to 2019/x.jpg".to_string())]);
+    }
+
+    /// The old journal of a database on another drive than its trash, renamed aside by the
+    /// step `removal` while the new database takes its place (see `Executor::set_aside`).
+    #[cfg(target_os = "linux")]
+    fn journal_aside<'p>(shores: &Shores, removal: &'p Action) -> Aside<'p> {
+        let Action::Delete { path, entry, .. } = removal else { unreachable!("only removals") };
+        let target = shores.destination.join(path);
+        let at = Executor::move_aside(&target, &shores.destination).unwrap();
+        Aside { step: removal, side: Side::Destination, key: path, planned: *entry, relative: path.clone(), target, at }
+    }
+
+    /// The old journal of a database renamed aside on another drive than its trash can't be
+    /// moved there either, once the new database took its place: it's copied into the trash
+    /// under its own name, then removed. Its step doesn't fail, and nothing is left under the
+    /// temporary name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_old_journal_on_another_drive_than_its_trash_is_copied_there_then_removed() {
+        let (_tmp, shores) = shores();
+        let other_drive = photos_on_another_drive(&shores);
+        let journal = shores.destination.join("photos/data.db-wal");
+        write(&journal, "changes not in the database yet", 1_600_000_000);
+        let removal = Action::delete(Side::Destination, "photos/data.db-wal", seen(&journal), None);
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let aside = journal_aside(&shores, &removal);
+        assert!(matches!(executor.finish_aside(aside, false), Ok(Done::Deleted)));
+        assert!(names_in(other_drive.path()).is_empty(), "nothing is left under a temporary name");
+        assert_eq!(trashed(&shores.destination), vec![("photos/data.db-wal".to_string(), "changes not in the database yet".to_string())]);
+    }
+
+    /// One that changed after it was renamed aside (its app still had it open) isn't what the
+    /// plan saw anymore, and its copy might miss what was written into it last: it stays
+    /// under its temporary name, its copy goes, and the step says where it is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_old_journal_that_changed_aside_on_another_drive_than_its_trash_stays_where_it_is() {
+        let (_tmp, shores) = shores();
+        let other_drive = photos_on_another_drive(&shores);
+        let journal = shores.destination.join("photos/data.db-wal");
+        write(&journal, "changes not in the database yet", 1_600_000_000);
+        let removal = Action::delete(Side::Destination, "photos/data.db-wal", seen(&journal), None);
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let aside = journal_aside(&shores, &removal);
+        let at = aside.at.clone().unwrap();
+        write(&at, "changes the app wrote after it was renamed aside", 1_600_000_100);
+        let Err(Error::Changed(why)) = executor.finish_aside(aside, false) else { panic!("the removal is skipped as changed") };
+        let name = at.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(why.ends_with(&format!("it stays under a temporary name, as photos/{name}")), "{why}");
+        assert_eq!(names_in(other_drive.path()), vec![name]);
+        assert_eq!(fs::read_to_string(&at).unwrap(), "changes the app wrote after it was renamed aside");
+        assert!(trashed(&shores.destination).is_empty(), "no copy of it is left in the trash");
+    }
+
+    /// An item put back on another drive than its trash, while something new took its name,
+    /// is copied into the trash and then removed, rather than left under its temporary name.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_item_put_back_on_another_drive_than_its_trash_goes_into_the_trash() {
+        let (_tmp, shores) = shores();
+        let other_drive = photos_on_another_drive(&shores);
+        let empty = Snapshot::new();
+        let cancel = AtomicBool::new(false);
+        let executor = Executor::new(&shores, &empty, &empty, KEEP, &cancel);
+        let target = shores.destination.join("photos/notes.txt");
+        write(&target, "old", 1_600_000_000);
+        let aside = Executor::move_aside(&target, &shores.destination).unwrap().unwrap();
+        write(&target, "newer", 1_700_000_000);
+        executor.put_back(Side::Destination, &aside, &target, "photos/notes.txt", None);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "newer");
+        assert_eq!(names_in(other_drive.path()), vec!["notes.txt"]);
+        assert_eq!(trashed(&shores.destination), vec![("photos/notes.txt".to_string(), "old".to_string())]);
     }
 
     /// The person removes a link a moment before the newer one from the other side takes its

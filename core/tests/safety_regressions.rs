@@ -1350,6 +1350,53 @@ fn whatever_goes_into_the_trash_from_a_folder_mounted_inside_the_jobs_gets_there
     assert_eq!(again.total_steps, 0, "nothing is left to do: {:?}", again.steps);
 }
 
+/// So does the old journal of a database in such a folder. The app wrote the journal into the
+/// database in the source, so the database changed and its journal is gone. The old journal
+/// is renamed aside while the new database takes its place, and it can't move from there into
+/// the trash in one step either: it's copied there under its own name and then removed, in a
+/// mirror and in a two-way job. Its step doesn't fail, and nothing is left in the mounted
+/// folder under a temporary name.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_databases_old_journal_in_a_folder_mounted_inside_the_jobs_goes_into_the_trash() {
+    for mode in [SyncMode::Mirror, SyncMode::TwoWay] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (a, b, data, store) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"), tmp.path().join("store"));
+        write(&a.join("keep.txt"), "keep");
+        write(&a.join("photos/app/data.db"), "the database");
+        write(&a.join("photos/app/data.db-wal"), "changes not in the database yet");
+        fs::create_dir_all(b.join("photos")).unwrap();
+        fs::create_dir_all(&store).unwrap();
+        let Some(_mounted) = BindMount::new("a_databases_old_journal_in_a_folder_mounted_inside_the_jobs_goes_into_the_trash", &store, &b.join("photos")) else {
+            return;
+        };
+        let engine = plain_engine(&data);
+        let id = add(&engine, job_setup(&a, &b, mode));
+        confirm(&engine, &id);
+        assert_eq!(read(&store.join("app/data.db-wal")), "changes not in the database yet", "{mode:?}: the sync went into the mounted folder");
+
+        write(&a.join("photos/app/data.db"), "the database, with the changes written into it");
+        fs::remove_file(a.join("photos/app/data.db-wal")).unwrap();
+        let review = confirm(&engine, &id);
+        assert_eq!((review.tally.destination.replaced, review.tally.destination.removed, review.total_steps), (1, 1, 2), "{mode:?}: {:?}", review.steps);
+        let run = view(&engine, &id).job.last_run.unwrap();
+        let log: Vec<String> = engine.log(&id, 8).into_iter().map(|line| line.text).collect();
+        assert_eq!((run.failed, run.skipped), (0, 0), "{mode:?}: {log:#?}");
+        let mounted = BTreeMap::from([("app".to_string(), "folder".to_string()), ("app/data.db".to_string(), "file: the database, with the changes written into it".to_string())]);
+        assert_eq!(tree(&store), mounted, "{mode:?}: nothing is left under a temporary name");
+        let kept: BTreeMap<String, String> = tree(&b.join(".charon-trash"))
+            .into_iter()
+            .filter_map(|(path, what)| path.split_once('/').map(|(_, inside)| (inside.to_string(), what)))
+            .filter(|(inside, what)| inside != ".charon" && what != "folder")
+            .collect();
+        let expected = [("photos/app/data.db", "file: the database"), ("photos/app/data.db-wal", "file: changes not in the database yet")];
+        assert_eq!(kept, expected.iter().map(|(path, what)| (path.to_string(), what.to_string())).collect::<BTreeMap<_, _>>(), "{mode:?}");
+
+        let again = engine.prepare_review(&id).unwrap();
+        assert_eq!((again.total_steps, again.housekeeping.len()), (0, 0), "{mode:?}: nothing is left to do: {:?} {:?}", again.steps, again.housekeeping);
+    }
+}
+
 // ------------------------------------------------------------------ probe 9: the wipe guard is narrow
 
 #[test]
