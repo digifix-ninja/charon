@@ -1286,15 +1286,21 @@ impl<'a> Executor<'a> {
         for side in [Side::Source, Side::Destination] {
             let copies = self.kept_copies(side);
             let gives_back = |target: &Path| copies == KeptCopies::OneAtATime && Identity::names(target) == Some(1);
+            // Where every copy needs room of its own, near and far count alike: no need to ask.
+            let near = |target: &Path| copies == KeptCopies::All || self.on_folders_drive(side, target);
             let kept = |ready: &Staged| {
                 let old = ready.existing.filter(|old| ready.to == side && old.is_file() && self.keeps_replaced(ready.settles))?;
-                Some((old.size, self.on_folders_drive(side, &ready.target)))
+                Some((old.size, near(&ready.target)))
             };
             let replaced: Vec<(usize, (u64, bool))> = staged.iter().enumerate().filter_map(|(at, (_, ready))| Some((at, kept(ready)?))).collect();
-            let near = replaced.iter().filter(|(_, (_, near))| *near).map(|&(at, (size, _))| (size, gives_back(&staged[at].1.target)));
+            let nearby = replaced.iter().filter(|(_, (_, near))| *near).map(|&(at, (size, _))| (size, gives_back(&staged[at].1.target)));
             let far = replaced.iter().filter(|(_, (_, near))| !near).fold(0u64, |room, (_, (size, _))| room.saturating_add(*size));
-            let bytes = copies.room(near).saturating_add(far);
-            let Some(&(largest, _)) = replaced.iter().max_by_key(|(_, (size, _))| *size).filter(|_| bytes > 0) else { continue };
+            let bytes = copies.room(nearby).saturating_add(far);
+            // The step blamed is the largest of the versions that take room: a clone takes none.
+            let takes_room = |near: bool| copies != KeptCopies::Clones || !near;
+            let Some(&(largest, _)) = replaced.iter().filter(|(_, (_, near))| takes_room(*near)).max_by_key(|(_, (size, _))| *size).filter(|_| bytes > 0) else {
+                continue;
+            };
             let what = format!("the replaced versions of “{}”", self.spellings.disk(side, unit.key()));
             if let Err(e) = self.room_to_keep(side, bytes, &what) {
                 return Some((largest, e));
@@ -2260,7 +2266,8 @@ impl<'a> Executor<'a> {
     }
 
     /// Whether the item at `item` is on the drive of `side`'s folder, where its trash is, and
-    /// not in a folder mounted inside the job's. One that can't be asked counts as elsewhere.
+    /// not on another drive mounted inside the job's folder (a folder of the same drive bound
+    /// there is on it). One that can't be asked counts as elsewhere.
     #[cfg(unix)]
     fn on_folders_drive(&self, side: Side, item: &Path) -> bool {
         match (fs::metadata(self.shores.root(side)), fs::symlink_metadata(item)) {
@@ -2411,9 +2418,10 @@ impl<'a> Executor<'a> {
     /// On APFS a kept file isn't moved into the trash but cloned there (instant, and it takes
     /// no room), and then removed: an app that has it open follows the file itself, not its
     /// name, so a moved file would take the person's next saves into the trash with it.
-    /// Removed, the app saves again where the file was, and the next sync sees it.
+    /// Removed, the app saves again where the file was, and the next sync sees it. (One on
+    /// another drive mounted inside the job's folder is copied in full, see `clones_at`.)
     fn remove(&self, side: Side, relative: &str, target: &Path, keep: bool, planned: &Entry) -> Result<bool> {
-        let removal = if keep && planned.is_file() && self.clones_at(side, target) {
+        let removal = if keep && planned.is_file() && self.kept_copies(side) == KeptCopies::Clones {
             self.remove_after_copying(side, relative, target, planned)
         } else if keep {
             self.move_to_trash(side, relative, target, planned)
@@ -3260,6 +3268,9 @@ mod tests {
     fn trashed(root: &Path) -> Vec<(String, String)> {
         let trash = root.join(crate::scan::TRASH_FOLDER);
         let mut found = Vec::new();
+        if !trash.exists() {
+            return found;
+        }
         for item in walkdir::WalkDir::new(&trash).min_depth(2).follow_links(false).sort_by_file_name() {
             let item = item.unwrap();
             let inside = item.path().strip_prefix(&trash).unwrap().components().skip(1).map(|part| part.as_os_str().to_string_lossy()).collect::<Vec<_>>();

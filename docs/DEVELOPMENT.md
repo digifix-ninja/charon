@@ -630,8 +630,8 @@ folder's drive; if the drive went away, the run stops there.
   checked; if an app saved a new version at that very moment, the two swap back. Elsewhere
   (Windows, FAT and exFAT, most network shares) the old file is renamed aside and checked first,
   and only then does the copy take the free name. Either way, what an app saved is put back or
-  kept in `.charon-trash`, never written over; when the trash can't take it, it stays under its
-  temporary name next to the file, and the step says where.
+  kept in `.charon-trash`, never written over; when the trash can't take it, it stays under a
+  temporary name in the job's folder, and a later sync moves it into the trash and says so.
 - **Keeping the old version:** with safe deletes, always in two-way jobs, and always when a copy
   settles a conflict, a file being replaced is first *copied* into the trash and then replaced
   in place (a link is moved into the trash, if it's still the one the plan saw: one removed or
@@ -698,13 +698,13 @@ folder's drive; if the drive went away, the run stops there.
   other copies didn't land in this run…"). A failure once the files are taking their places
   (rare) stops the ones after it, but for what only adds to it, and puts the old journals of
   those databases back; the unit can be left part old and part new, but nothing of it is removed
-  except the old journals of a database that landed, which go to `.charon-trash`. An old journal
-  set aside goes into `.charon-trash` under its own name once its database's new version landed
-  (with safe deletes, or when its removal is held back). Where a rename can't reach the trash (a
-  folder mounted inside the job's), it is copied there and then removed, like a removal
-  (`trash_aside`). One that changed after it was set aside stays under its temporary name, its
-  copy goes, and the step says where it is. The next sync looks at it again. The run's summary counts what waited ("3 items left for the next sync with
-  the rest of their app library or database"). A library holding an item Charon leaves alone
+  except the old journals of a database that landed, which go to `.charon-trash`. The next sync
+  looks at the unit again. An old journal set aside that isn't removed for good goes into
+  `.charon-trash` under its own name. Where a rename can't reach the trash (a folder mounted
+  inside the job's), it is copied there and then removed, like a removal (`trash_aside`); one
+  that changed after it was set aside then stays under its temporary name, its copy goes, and
+  the step says where it is. The run's summary counts what waited ("3 items left for the next
+  sync with the rest of their app library or database"). A library holding an item Charon leaves alone
   (one it can't read, one only in the cloud) is left alone whole, with a note
   (`Ground::keep_units_whole`); an item the other drive can never hold (a link on a drive
   without links, a name it can't take, a file too big for it) is left out of it on its own,
@@ -713,9 +713,10 @@ folder's drive; if the drive went away, the run stops there.
   where the drive says how much room it has, so other apps can still save. A copy that would eat
   into that fails with a clear reason. On a Mac, room the system can free by itself counts as
   free. The copies of replaced versions kept in the trash need room too, and how much at one
-  time depends on the drive (`KeptCopies`): none on APFS, where they're clones, but for a file
-  on another drive than the trash (one mounted inside the job's folder after the scan), whose
-  copy is a full one and is counted in full, as on any drive (`Executor::clones_at`); the largest
+  time depends on the drive (`KeptCopies`): none on APFS, where they're clones (a file on
+  another drive than the trash, one mounted inside the job's folder after the scan, is copied in
+  full, and on macOS and Linux its copy counts in full on every kind of drive:
+  `Executor::clones_at`, `room_for_replaced`); the largest
   one's on a drive that gives a removed file's room back at once (Mac OS Extended, FAT, exFAT,
   NTFS, ext, XFS, tmpfs and `fuseblk`, not over a network), plus those of files with other names
   (hard links, `Identity::names`), which keep their room; and every one's elsewhere (Btrfs, ZFS
@@ -979,8 +980,9 @@ found. A job that syncs by itself and whose look found only files it couldn't co
 waits for nobody. It's counted apart from the jobs with changes queued
 (`Overview.pending_compare`, `JobView::compares_at_next_sync`): the tray says "1 job with files
 to compare at its next sync" and the header "1 job has files to compare at its next sync", and
-both name both kinds when both exist ("1 job with changes waiting, 1 with files to compare at
-its next sync"). A confirmed list that waits for another sync still counts as changes queued,
+both name both kinds when both exist (the tray: "1 job with changes waiting, 1 with files to
+compare at its next sync"; the header: "1 job has changes queued · 1 job has files to compare
+at its next sync"). A confirmed list that waits for another sync still counts as changes queued,
 since that sync carries out exactly the list.
 
 ### Overlapping jobs and other Charons
