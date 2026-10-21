@@ -82,6 +82,14 @@ pub struct Pending {
     pub checked_at: DateTime<Utc>,
 }
 
+impl Pending {
+    /// Whether all that waits to cross is files the last check couldn't compare yet: the next
+    /// sync compares them, and may well find nothing to carry.
+    pub fn only_to_compare(&self) -> bool {
+        self.items == 0 && self.uncompared > 0
+    }
+}
+
 /// An item that changed on both sides and waits for a decision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -465,6 +473,13 @@ impl JobView {
             || !self.conflicts.is_empty()
             || (failed && !matches!(self.status, JobStatus::Offline | JobStatus::Syncing))
     }
+
+    /// Whether all the job has queued is files its last look couldn't compare yet, and its
+    /// next sync compares them: it syncs by itself, and no list the person confirmed waits to
+    /// start (that sync carries out exactly the list).
+    pub fn compares_at_next_sync(&self) -> bool {
+        self.status == JobStatus::Pending && !self.confirmed && self.pending.as_ref().is_some_and(Pending::only_to_compare)
+    }
 }
 
 /// One line per state for the tray icon and the header.
@@ -473,7 +488,12 @@ impl JobView {
 pub struct Overview {
     pub jobs: usize,
     pub syncing: usize,
+    /// Jobs with changes queued to cross: they sync by themselves, or the person confirmed
+    /// their list while another sync used their folders.
     pub pending: usize,
+    /// Jobs that sync by themselves with nothing queued but files the last look couldn't
+    /// compare yet (see `JobView::compares_at_next_sync`).
+    pub pending_compare: usize,
     /// Jobs with changes waiting for the person's OK, or held back for it.
     pub waiting: usize,
     /// Jobs with nothing else waiting for the person but files the last look couldn't compare
@@ -499,7 +519,8 @@ impl Overview {
         Self {
             jobs: views.len(),
             syncing: count(&[JobStatus::Syncing]),
-            pending: count(&[JobStatus::Pending]),
+            pending: views.iter().filter(|v| v.status == JobStatus::Pending && !v.compares_at_next_sync()).count(),
+            pending_compare: views.iter().filter(|v| v.compares_at_next_sync()).count(),
             waiting: views.iter().filter(|v| v.waiting.as_ref().is_some_and(|w| !w.only_to_compare())).count(),
             to_compare: views.iter().filter(|v| v.waiting.as_ref().is_some_and(Waiting::only_to_compare)).count(),
             attention: views.iter().filter(|v| v.needs_you()).count(),
@@ -529,8 +550,8 @@ impl Overview {
             asks
         } else if self.paused_all {
             "Everything paused".into()
-        } else if self.pending > 0 {
-            format!("{} with changes waiting", plural(self.pending as u64, "job"))
+        } else if let Some(queued) = self.queued() {
+            queued
         } else if self.incomplete > 0 {
             format!("{} {} sync everything", plural(self.incomplete as u64, "job"), if self.incomplete == 1 { "doesn't" } else { "don't" })
         } else if self.looking > 0 {
@@ -547,22 +568,36 @@ impl Overview {
     /// hidden behind another: "1 job needs attention, 2 wait for your OK, 1 has files to
     /// compare". `None` when no job waits for the person.
     fn asks(&self) -> Option<String> {
-        let kinds = [
+        Self::each_named([
             (self.attention, "needs attention", "need attention"),
             (self.waiting, "waits for your OK", "wait for your OK"),
             (self.to_compare, "has files to compare", "have files to compare"),
-        ];
-        let asks: Vec<String> = kinds
+        ])
+    }
+
+    /// What is queued without waiting for the person, each kind named, so that neither is
+    /// hidden behind the other: "1 job with changes waiting, 1 with files to compare at its
+    /// next sync". `None` when no job has anything queued.
+    fn queued(&self) -> Option<String> {
+        Self::each_named([
+            (self.pending, "with changes waiting", "with changes waiting"),
+            (self.pending_compare, "with files to compare at its next sync", "with files to compare at their next sync"),
+        ])
+    }
+
+    /// The kinds of jobs counted, each with its count and what is said of one job or of more,
+    /// in one line: the first one names what is counted. `None` when none is counted.
+    fn each_named<const N: usize>(kinds: [(usize, &str, &str); N]) -> Option<String> {
+        let named: Vec<String> = kinds
             .into_iter()
             .filter(|(jobs, ..)| *jobs > 0)
             .enumerate()
             .map(|(i, (jobs, one, more))| {
-                // The first one names what is counted.
                 let count = if i == 0 { plural(jobs as u64, "job") } else { human_count(jobs as u64) };
                 format!("{count} {}", if jobs == 1 { one } else { more })
             })
             .collect();
-        (!asks.is_empty()).then(|| asks.join(", "))
+        (!named.is_empty()).then(|| named.join(", "))
     }
 }
 
@@ -739,6 +774,29 @@ mod tests {
             let overview = Overview::of(&[videos.clone(), row_waiting(other)], false, None);
             assert_eq!((overview.waiting, overview.to_compare), (1, 1));
             assert_eq!(overview.headline(), "1 job waits for your OK, 1 has files to compare");
+        }
+    }
+
+    /// A job that syncs by itself, and whose look left only files it couldn't compare yet, has
+    /// no changes waiting: its next sync compares them, and may well find both copies identical.
+    #[test]
+    fn jobs_that_sync_by_themselves_with_only_files_to_compare_are_not_said_to_have_changes_waiting() {
+        let pending = |items: u64, uncompared: u64| Pending { items, bytes: 0, uncompared, checked_at: Utc::now() };
+        let row_pending = |pending: Pending| JobView { runs_by_itself: true, pending: Some(pending), ..row(JobStatus::Pending) };
+        let videos = row_pending(pending(0, 1));
+        let overview = Overview::of(std::slice::from_ref(&videos), false, None);
+        assert_eq!((overview.pending, overview.pending_compare), (0, 1));
+        assert_eq!(overview.lists_waiting(), 0, "nothing waits for the person");
+        assert_eq!(overview.headline(), "1 job with files to compare at its next sync");
+        assert_eq!(Overview::of(&[videos.clone(), videos.clone()], false, None).headline(), "2 jobs with files to compare at their next sync");
+
+        // Changes queued as well, or a list the person confirmed that waits to start (that sync
+        // carries out exactly the list, and compares nothing else): changes wait to cross.
+        let confirmed = JobView { runs_by_itself: false, confirmed: true, ..videos.clone() };
+        for other in [row_pending(pending(3, 1)), confirmed] {
+            let overview = Overview::of(&[videos.clone(), other], false, None);
+            assert_eq!((overview.pending, overview.pending_compare), (1, 1));
+            assert_eq!(overview.headline(), "1 job with changes waiting, 1 with files to compare at its next sync");
         }
     }
 

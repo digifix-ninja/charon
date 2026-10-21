@@ -45,6 +45,9 @@ const needsYou = j => j.status === "error" || j.status === "conflict" || j.confl
 /** Whether all that waits is files a look couldn't compare yet, as Rust's Waiting::only_to_compare says. */
 const onlyToCompare = waiting => !waiting.held && !waiting.items && !waiting.conflicts && waiting.uncompared > 0;
 
+/** Whether all a job has queued is files to compare at its next sync, as Rust's JobView::compares_at_next_sync says. */
+const comparesAtNextSync = j => j.status === "pending" && !j.confirmed && !j.pending?.items && j.pending?.uncompared > 0;
+
 /** The order steps are listed in: what can hurt first. */
 const KIND_ORDER = ["conflict", "remove", "replace", "settle", "keep-both", "new", "folder"];
 
@@ -391,7 +394,8 @@ export class DemoBackend {
     return {
       jobs: this.jobs.length,
       syncing: count("syncing"),
-      pending: count("pending"),
+      pending: this.jobs.filter(j => j.status === "pending" && !comparesAtNextSync(j)).length,
+      pendingCompare: this.jobs.filter(comparesAtNextSync).length,
       waiting: this.jobs.filter(j => j.waiting && !onlyToCompare(j.waiting)).length,
       toCompare: this.jobs.filter(j => j.waiting && onlyToCompare(j.waiting)).length,
       attention: this.jobs.filter(needsYou).length,

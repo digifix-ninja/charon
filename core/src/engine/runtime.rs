@@ -3,7 +3,7 @@
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, DatedAhead, Job, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side, Unit};
-use crate::run::{Markers, Refused, Unread};
+use crate::run::{Found, Markers, Refused, Unread};
 use crate::scan::{Entry, ExcludeFilter, Keys, Snapshot, Volume};
 use crate::store::Absence;
 use chrono::{DateTime, Utc};
@@ -265,10 +265,11 @@ impl OwnWrites {
 /// whether they were identical. A verdict is reused while neither file changes and both
 /// folders carry the markers they carried when it was read (see `run::Marker`): another
 /// drive under the same name, or a folder restored from an older copy, may hold other files
-/// that look the same.
+/// that look the same. Folders without a marker Charon can read (before the job's first
+/// sync) keep none: nothing tells them from any other folder under the same name.
 #[derive(Debug, Default)]
 pub(crate) struct Reads {
-    /// The markers both folders carried when the pairs were read.
+    /// The markers both folders carried when the pairs were read: a readable marker on each side.
     markers: Option<Markers>,
     pairs: HashMap<String, (Entry, Entry, bool)>,
 }
@@ -277,15 +278,20 @@ impl Reads {
     /// What the read of the pair at `key` found, while its items are still `source` and
     /// `destination` and both folders carry `markers` (as a look found them before its scans).
     pub fn verdict(&self, key: &str, source: &Entry, destination: &Entry, markers: &Markers) -> Option<bool> {
-        if self.markers.as_ref() != Some(markers) {
+        if !Self::marked(markers) || self.markers.as_ref() != Some(markers) {
             return None;
         }
         self.pairs.get(key).filter(|(s, d, _)| s == source && d == destination).map(|(_, _, same)| *same)
     }
 
     /// Notes what the read of the pair at `key` found in folders that carry `markers`. What
-    /// was read while they carried other markers goes.
+    /// was read while they carried other markers goes, and nothing is kept while a folder
+    /// carries no marker Charon can read.
     pub fn note(&mut self, key: &str, source: Entry, destination: Entry, same: bool, markers: &Markers) {
+        if !Self::marked(markers) {
+            *self = Self::default();
+            return;
+        }
         if self.markers.as_ref() != Some(markers) {
             self.pairs.clear();
             self.markers = Some(markers.clone());
@@ -307,6 +313,12 @@ impl Reads {
         if self.markers.as_ref() == Some(before) {
             self.markers = Some(after);
         }
+    }
+
+    /// Whether both folders carry a marker Charon can read: only then can what was read in
+    /// them be told from what other folders under the same names hold.
+    fn marked(markers: &Markers) -> bool {
+        matches!((&markers.source, &markers.destination), (Found::Marker(_), Found::Marker(_)))
     }
 }
 
@@ -1109,6 +1121,26 @@ mod tests {
         assert_eq!(reads.verdict("b.txt", &s, &d, &markers(2)), Some(false), "read while the folders carried other markers");
         reads.forget(&markers(2));
         assert_eq!(reads.verdict("b.txt", &s, &d, &markers(2)), None);
+    }
+
+    /// Folders without a marker Charon can read (before the job's first sync, or with a
+    /// damaged marker) can't be told from other folders under the same names: what was read
+    /// in them is kept for none, and what was read in other folders before goes.
+    #[test]
+    fn what_was_read_in_folders_without_a_marker_is_kept_for_none() {
+        let (s, d) = (Entry::file(4, 10_000), Entry::file(4, 20_000));
+        let damaged = || Found::Unusable("damaged".into());
+        for unmarked in [
+            Markers { source: Found::Missing, destination: Found::Missing },
+            Markers { destination: Found::Missing, ..markers(3) },
+            Markers { source: damaged(), destination: damaged() },
+        ] {
+            let mut reads = Reads::default();
+            reads.note("a.txt", s, d, true, &markers(3));
+            reads.note("b.txt", s, d, false, &unmarked);
+            assert_eq!(reads.verdict("b.txt", &s, &d, &unmarked), None, "{unmarked:?}");
+            assert_eq!(reads.verdict("a.txt", &s, &d, &markers(3)), None, "{unmarked:?}: read in other folders before");
+        }
     }
 
     /// A sync of Charon's own moves the folders' markers on: what was read in the same

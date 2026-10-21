@@ -15,6 +15,14 @@ export const needsYou = job => job.status === "error" || job.status === "conflic
  */
 export const onlyToCompare = waiting => !waiting.held && !waiting.items && !waiting.conflicts && waiting.uncompared > 0;
 
+/**
+ * Whether all a job has queued is files its last look couldn't compare yet, and its next sync
+ * compares them, as Rust's `JobView::compares_at_next_sync` says: it syncs by itself, and no
+ * list the person confirmed waits to start.
+ */
+export const comparesAtNextSync = job => job.status === "pending" && !job.confirmed
+  && !job.pending?.items && job.pending?.uncompared > 0;
+
 /** The overview tiles and which jobs each one counts. */
 export const GROUPS = [
   { key: "all", label: "Jobs", tone: "var(--text-dim)", match: () => true },

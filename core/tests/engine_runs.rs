@@ -606,6 +606,38 @@ fn what_this_session_read_holds_only_while_the_folders_carry_the_same_markers() 
     not_compared(&again);
 }
 
+/// Before a job's first sync neither folder carries Charon's marker, and nothing tells them
+/// from other folders under the same names: what this session read in them never stands for
+/// another. A list reads a pair whose times differ and finds both sides identical. Then
+/// another drive under the same name takes the destination's place, holding another version
+/// of the file with the same size and time (an encrypted container keeps its time). The next
+/// list reads it again and finds the conflict, and confirming that list leaves it for the
+/// person: the two copies are never recorded as in sync.
+#[cfg(target_os = "linux")]
+#[test]
+fn what_this_session_read_before_the_first_sync_never_stands_for_another_folder() {
+    let Some(far) = untimed_folder() else { return };
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), far.path().join("b"), tmp.path().join("data"));
+    let other = far.path().join("other");
+    if !vaults(&[&a, &b, &other]) {
+        return;
+    }
+    // Copied without its time: the same contents, another date, so a list reads the pair.
+    filetime::set_file_mtime(b.join("vault.hc"), vault_time(5)).unwrap();
+    // Another version of the file, with the same size and time as the destination's.
+    edit_vault(&other, 5);
+    let engine = engine(&data);
+    let id = engine.add_job(setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask)).unwrap().job.id;
+    assert_eq!(engine.prepare_review(&id).unwrap().tally.conflicts, 0, "the list reads it: both sides are identical");
+
+    // Another drive under the same name takes the destination's place.
+    fs::rename(&b, far.path().join("b-before")).unwrap();
+    fs::rename(&other, &b).unwrap();
+    assert_eq!(confirm(&engine, &id).tally.conflicts, 1, "the list reads it: the sides differ");
+    assert_eq!(engine.prepare_review(&id).unwrap().tally.conflicts, 1, "the conflict waits for the person");
+}
+
 /// What a list found about a large file holds only while neither side changes: an edit that
 /// keeps the file's size and time (an encrypted container does) is never taken for in sync,
 /// before or after a restart, and the list carries it.
@@ -721,6 +753,41 @@ fn a_large_file_a_background_look_leaves_unread_starts_a_sync_of_a_job_that_sync
     let pending = view.pending.unwrap();
     assert_eq!((pending.items, pending.uncompared), (0, 1));
     assert!(engine.has_pending(&id), "its sync reads the file");
+}
+
+/// A job that syncs by itself once an hour, not on change, waits for its next sync to compare
+/// what its background look couldn't. A large file whose details alone changed on one side
+/// (both copies identical) is all the look found: the row says "1 file not compared yet", and
+/// the tray says so too, never that the job has changes waiting.
+#[cfg(unix)]
+#[test]
+fn a_job_that_syncs_by_itself_with_only_files_to_compare_is_not_said_to_have_changes_waiting() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let (a, b, data) = (tmp.path().join("a"), tmp.path().join("b"), tmp.path().join("data"));
+    if !vaults(&[&a, &b]) || !keeps_change_times(&a) {
+        return;
+    }
+    let engine = engine(&data);
+    let mut job = setup(&a, &b, SyncMode::TwoWay, ConflictRule::Ask);
+    job.full_automation = true;
+    job.trigger = Trigger::Interval { minutes: 60 };
+    let id = engine.add_job(job).unwrap().job.id;
+    confirm(&engine, &id);
+    look(&engine, &id);
+    assert_eq!(engine.job(&id).unwrap().status, JobStatus::InSync);
+
+    fs::set_permissions(a.join("vault.hc"), fs::Permissions::from_mode(0o600)).unwrap();
+    look(&engine, &id);
+    let view = engine.job(&id).unwrap();
+    assert_eq!(view.status, JobStatus::Pending);
+    let pending = view.pending.as_ref().unwrap();
+    assert_eq!((pending.items, pending.uncompared), (0, 1), "no change found, one file not compared yet");
+    assert!(view.compares_at_next_sync());
+    let overview = engine.overview();
+    assert_eq!((overview.pending, overview.pending_compare, overview.lists_waiting()), (0, 1, 0));
+    assert_eq!(overview.headline(), "1 job with files to compare at its next sync");
+    assert_eq!(engine.prepare_review(&id).unwrap().total_steps, 0, "the list reads it: both sides are identical");
 }
 
 /// What reads found identical goes with the job's memory: when its folders or its mode
