@@ -286,10 +286,16 @@ fn respell(dir: &Path, nfc: &str) -> String {
     assert_eq!(nfc.nfc().collect::<String>(), nfc, "{nfc:?} is given composed");
     let nfd: String = nfc.nfd().collect();
     assert_ne!(nfd, nfc, "{nfc:?} has a second spelling");
-    let present: Vec<&str> = [nfc, nfd.as_str()].into_iter().filter(|name| fs::symlink_metadata(dir.join(name)).is_ok()).collect();
+    // Read from the folder's listing, not by looking the names up: a drive that ignores the
+    // Unicode form (APFS) finds the item under either spelling.
+    let present: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|item| item.unwrap().file_name().into_string().ok())
+        .filter(|name| *name == nfc || *name == nfd)
+        .collect();
     assert_eq!(present.len(), 1, "exactly one spelling of {nfc:?} in {}: {:?}", dir.display(), names_in(dir));
     let to = if present[0] == nfc { nfd.clone() } else { nfc.to_string() };
-    fs::rename(dir.join(present[0]), dir.join(&to)).unwrap();
+    fs::rename(dir.join(&present[0]), dir.join(&to)).unwrap();
     to
 }
 
