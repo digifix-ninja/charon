@@ -10,8 +10,9 @@
 //! the trash. Replaced in place, the app notices the new version instead. (On APFS, where a
 //! copy takes no time and no room, a removed file is copied there too and then removed. So is
 //! anything that goes into the trash from another drive than the trash's, in a folder
-//! mounted inside the job's: a removed file or link, the system's files left in a removed
-//! folder, a leftover of an interrupted sync. See `Executor::move_to_trash`.)
+//! mounted inside the job's: a removed file or link, the old journal of a database, the
+//! system's files left in a removed folder, a leftover of an interrupted sync. See
+//! `Executor::move_to_trash` and `Executor::trash_aside`.)
 //!
 //! Each dated folder holds a list of what its run put there, with each file's size and time
 //! (`.charon`). A file that no longer matches it was changed after it went into the trash:
@@ -164,15 +165,21 @@ impl Trash {
     /// trash can't take the copy (its folders, or the copy's place in it), it fails with that
     /// place in the trash: that is never a file Charon couldn't read.
     pub fn preserve(&self, root: &Path, relative: &str) -> Result<PathBuf> {
-        let from = root.join(relative);
+        self.preserve_from(&root.join(relative), root, relative)
+    }
+
+    /// `preserve`, for the file or link at `from` (in `root`'s folder), which goes into the
+    /// trash as `relative`: an item Charon had moved aside under a temporary name goes in
+    /// under its own.
+    pub fn preserve_from(&self, from: &Path, root: &Path, relative: &str) -> Result<PathBuf> {
         let base = self.dated(root)?;
-        if fs::symlink_metadata(&from).is_ok_and(|meta| meta.is_symlink()) {
-            return self.keep(root, &base, relative, |place| Self::copy_link(&from, place));
+        if fs::symlink_metadata(from).is_ok_and(|meta| meta.is_symlink()) {
+            return self.keep(root, &base, relative, |place| Self::copy_link(from, place));
         }
         // Written under a temporary name at the top of the dated folder first: a half-written
         // copy never takes a name, and nothing already in the trash is ever written over.
         let temp = Copier::partial_in(&base);
-        Self::copy_file(&from, &temp)?;
+        Self::copy_file(from, &temp)?;
         self.keep(root, &base, relative, |place| rename_new(&temp, place).map_err(|e| Error::file(place, e))).inspect_err(|_| Copier::discard(&temp))
     }
 
