@@ -117,7 +117,7 @@ fn a_link_left_under_a_temporary_name_by_an_interrupted_sync_is_tidied_away() {
 
     let review = confirm(&engine, &id);
     assert!(review.notes.iter().all(|note| !note.path.contains(".charon-")), "Charon's own link isn't told to the person as theirs: {:?}", review.notes);
-    assert!(review.housekeeping.iter().any(|line| line.contains("1 half-copied file left by an interrupted sync")), "{:?}", review.housekeeping);
+    assert!(review.housekeeping.iter().any(|line| line.contains("1 file a sync left under a temporary name")), "{:?}", review.housekeeping);
     assert!(fs::symlink_metadata(&leftover).is_err(), "tidied away");
     let kept = walk(&dst.join(".charon-trash"));
     assert!(kept.iter().any(|path| fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())), "into the trash: {kept:?}");

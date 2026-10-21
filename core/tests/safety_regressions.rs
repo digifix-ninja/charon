@@ -1320,7 +1320,7 @@ fn whatever_goes_into_the_trash_from_a_folder_mounted_inside_the_jobs_gets_there
     std::os::unix::fs::symlink("2020/y.jpg", a.join("photos/newest")).unwrap();
 
     let review = engine.prepare_review(&id).unwrap();
-    let tidies = "Also moves 1 half-copied file left by an interrupted sync into .charon-trash on the destination.";
+    let tidies = "Also moves 1 file a sync left under a temporary name (most often half-copied by an interrupted sync) into .charon-trash on the destination.";
     assert!(review.housekeeping.iter().any(|line| line == tidies), "{:?}", review.housekeeping);
     engine.approve(&id, &review.review_id, true).unwrap();
     wait_idle(&engine, &id);
