@@ -9,7 +9,9 @@
 //! the background and, when changes wait, shows them and tells the person. Nothing changes
 //! in its folders until the person confirms the list.
 //!
-//! Every second, for each job, in this order:
+//! Every second, first for every job, a sync that waits (a list the person confirmed, or a
+//! run of a job that runs by itself) starts if nothing stands in its way anymore. Then, for
+//! each job, in this order:
 //! 1. **Drive connected:** both folders just became reachable → sync, or look. A folder
 //!    that is there but on another drive than at the last sync (the folder an unplugged
 //!    drive leaves behind) doesn't count as reachable, nor does one that doesn't answer
@@ -157,6 +159,11 @@ impl Autopilot {
         self.collect_changes();
         let now = Utc::now();
 
+        // Runs and lists that wait go first, for every job, before any job's steps below can
+        // start a look: on a drive run by an add-on driver, a run that waited for another
+        // job's look starts once that look ends, ahead of the next job's look there (see
+        // `engine::quiet`).
+        let mut ready = Vec::new();
         for (job, found) in jobs.iter().zip(&whereabouts) {
             let id = &job.id;
             // A folder on another drive than at the last sync (a leftover mount folder) isn't
@@ -197,10 +204,6 @@ impl Autopilot {
             if self.confirmed_tried.get(id).is_none_or(|tried| tried.elapsed() >= CONFIRMED_RETRY) {
                 self.confirmed_tried.insert(id.clone(), Instant::now());
                 if self.engine.start_confirmed(id) {
-                    // Its sync may be waiting for the folder watcher to stop watching a drive
-                    // it keeps quiet before it writes there (see `engine::quiet`): that needn't
-                    // wait for the next tick.
-                    self.follow_folders(&jobs, &whereabouts);
                     continue;
                 }
             }
@@ -211,14 +214,17 @@ impl Autopilot {
             // list of its changes open for the person. A trigger's own run also needs the
             // job and everything not paused (runs by itself now).
             let may_start = job.runs_by_itself() && !self.engine.review_open(id);
-            let by_itself = automatic && may_start;
             if may_start {
                 self.engine.start_wanted(id);
                 if self.engine.is_running(id) {
                     continue;
                 }
             }
+            ready.push((job, was_reachable, automatic, automatic && may_start));
+        }
 
+        for (job, was_reachable, automatic, by_itself) in ready {
+            let id = &job.id;
             // 1. Drive connected (also at launch, when the drive was already there).
             if job.setup.trigger == Trigger::DriveConnected && was_reachable != Some(true) {
                 if by_itself {
@@ -516,6 +522,61 @@ mod tests {
         }
         let waited = syncing.join().unwrap();
         assert!(waited < Duration::from_secs(2), "{waited:?}");
+    }
+
+    #[test]
+    fn a_run_that_waited_for_a_look_on_the_drive_goes_before_the_next_look_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, photos, notes], _) = jobs_on_a_stick(tmp.path());
+        // "Backup", listed after them, syncs onto the stick by itself.
+        let (source, destination) = (tmp.path().join("home").join("backup"), tmp.path().join("stick").join("backup"));
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("a.txt"), "a").unwrap();
+        let setup = JobSetup {
+            name: "Backup".into(),
+            source: source.clone(),
+            destination: destination.clone(),
+            mode: SyncMode::Backup,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: true,
+        };
+        let backup = engine.add_job(setup).unwrap().job.id;
+        until("the first looks", || [&documents, &photos, &notes, &backup].iter().all(|id| !engine.job(id).unwrap().looking));
+        let review = engine.prepare_review(&backup).unwrap();
+        engine.approve(&backup, &review.review_id, true).unwrap();
+        until("the first sync", || !engine.is_running(&backup));
+        fs::write(source.join("b.txt"), "b").unwrap();
+
+        // Documents' look reads the stick. Photos' look waits for it, and so does Backup's run.
+        let (mut pilot, _changes) = pilot(&engine);
+        engine.whereabouts_of(&engine.job_list());
+        for id in [&notes, &backup] {
+            engine.just_looked_at(id);
+        }
+        engine.begin_a_look(&documents);
+        engine.hold_back_a_look(&photos);
+        engine.want(&backup, "after changes");
+        engine.start_wanted(&backup);
+        assert_eq!(engine.job(&backup).unwrap().waiting_for.as_deref(), Some("Documents"));
+
+        // The look ends. At the next tick the run goes first, though Photos is listed before
+        // it (or Photos' look would start, and Backup wait for it; then Documents' look, and so
+        // on), and Photos' look comes once the run is done.
+        engine.end_a_look(&documents);
+        pilot.tick();
+        assert!(!engine.run_wanted(&backup), "the run started");
+        until("the sync", || !engine.is_running(&backup));
+        assert!(destination.join("b.txt").exists());
+        let deadline = Instant::now() + DEADLINE;
+        while engine.look_held_back(&photos) {
+            assert!(Instant::now() < deadline, "Photos' look took too long to come");
+            pilot.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// A two-way job with full automation that syncs once changes have settled for

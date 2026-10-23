@@ -862,9 +862,13 @@ Charon scans and plans in the background, the row shows *Needs your OK* when cha
 *Syncing*, *Offline*, *Paused*, *Conflict* or *Error*, which come first), and nothing changes in
 its folders until the person confirms a list.
 
-For each job whose folders are reachable (a folder now on another drive than at the last sync
-doesn't count, nor one that doesn't answer in time: see *Folders that don't answer* below) and
-that isn't syncing, in this order:
+Each tick first starts, for every job, what waits for its turn: a list the person confirmed
+while another sync worked in its folders (`start_confirmed`), or a run nobody looks at that a
+trigger started and that waits (`start_wanted`). Only then does it go through the steps below,
+so a run that waited for another job's look gets the drive before the next look there. For each
+job whose folders are reachable (a folder now on another drive than at the last sync doesn't
+count, nor one that doesn't answer in time: see *Folders that don't answer* below) and that
+isn't syncing, in this order:
 
 1. **Drive connected:** a *Drive connected* job whose folders just became reachable (at launch
    too) syncs, or is looked at.
@@ -1148,10 +1152,10 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   list whose sync is about to start marked as running, and leaves it; the list then sees that
   everything was paused since it was confirmed (`Confirmed::pauses`) and is called off where it
   ends up: it no longer waits for the other sync (`keep_waiting`), its sync ends before it
-  changes anything (`carry_out`), or, confirmed just then, it isn't kept at all
+  changes anything (`claim_for_list`), or, confirmed just then, it isn't kept at all
   (`queue_confirmed`, and the window says "You paused everything just as this list was about to
-  start, and “X” is still syncing, so the list doesn't wait for it. Look again
-  once that sync is done."). It lives only in `JobRuntime`: quitting Charon drops it, and after
+  start, and “X” isn't done yet, so the list doesn't wait for it. Look again once it's
+  done."). It lives only in `JobRuntime`: quitting Charon drops it, and after
   a restart the job is where it was before the list was confirmed. While it waits, runs nobody
   looks at are refused, and the row (`JobView::confirmed`) has no `waiting`: it shows *Pending*
   when its look found changes, unless a folder that's away, *Pause everything*, conflicts, or a
@@ -1205,9 +1209,16 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   soon as the drive is free; *Look for changes* says why, `look_now`). One look at a time: with
   `check`, another job's background look there holds it too. A run a trigger started (neither
   `by_hand` nor `approved`) also waits for another job's background look there, or a job that
-  syncs often could keep stopping a long look of the other's for good. A run or a list the
-  person asked for stops that look instead (`stop_looks_sharing_a_drive`; it counts for
-  nothing, and comes again). Its folders there are still asked about meanwhile (where they are,
+  syncs often could keep stopping a long look of the other's for good. Such a run gets the next
+  turn: each autopilot tick first tries every job's waiting runs and confirmed lists, then
+  every job's steps, so a look that ends lets the run start before the next job's look there
+  (`Autopilot::tick`; otherwise two jobs listed first whose folders keep changing could take
+  turns looking and keep the run waiting all day). A background look holds others back for ten
+  minutes at most (`LOOKS_HOLD_FOR`, `JobRuntime::checking_within`): one at it longer is most
+  likely stuck on its other folder, a share that stopped answering, and no longer reads the
+  drive. A run or a list the person asked for, or a trigger's run that met such a stuck look,
+  stops that look instead (`stop_looks_sharing_a_drive`; it counts for nothing, and comes
+  again); another job's look no longer waits for a stuck one. Its folders there are still asked about meanwhile (where they are,
   and whether they overlap another job's) until a sync keeps the drive quiet. `remove_job` is
   refused while another job's run or list uses the drive, naming it (*Remove “X” once it's
   done*), since removing takes Charon's marker out of its folders; it doesn't wait or retry, and
@@ -1231,14 +1242,18 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   autopilot starts itself claims its folders on its sync's own thread, so the wait works for it
   too). When either wait runs out, the sync writes all the same, and the app's log says so.
   What changes in the folders there meanwhile isn't heard, as on a network share, and isn't
-  counted as a change: the next regular look finds it. That look counts from when the folders
-  stopped being watched (`finish` sets the sync's own `last_checked` to the keep's start,
-  `Claimed::unwatched_since`; other jobs' looks there were held, and come once it's done if
-  they came due), so a run nobody looked at still ends as any run does: its row says what's
-  left, and a file that fails every time is tried again only at the regular look. A list of
-  another job there made before the keep can still be confirmed, as each step checks its items
-  right before it acts, but it's carried out as one that waited (`StoredReview::unheard`, set by
-  `let_looks_end`; `Crossing::outdated`): its folders are looked at again once it's done. A look
+  counted as a change: the next regular look finds it. After a sync that left nothing, that
+  look counts from when the folders stopped being watched (`finish` sets the sync's own
+  `last_checked` to the keep's start, `Claimed::unwatched_since`); after one that left
+  something (a step failed, was skipped or waited, or the run ended on an error), it counts
+  from the sync's end, however long it kept the drive quiet, so a file that fails every time is
+  tried again a whole interval later at the soonest, and the drive isn't written to again and
+  again. Other jobs' looks there were held, and come once it's done if they came due. Either
+  way a run nobody looked at ends as any run does: its row says what's left. A list of another
+  job there made before the keep can still be confirmed, as each step checks its items right
+  before it acts, and it's still checked for its age and for changes heard meanwhile; once it's
+  carried out, its folders are looked at again (`StoredReview::unheard`, set by
+  `let_looks_end`; `Crossing::outdated`). A look
   scans a job's two folders on one such drive one after the other (`scan_both`).
 - **An older Charon, and a state that can't be saved.** Two Charons can't work with one data
   folder (`DataLock`). Charon 0.2 doesn't know that lock, nor that its jobs moved: it writes

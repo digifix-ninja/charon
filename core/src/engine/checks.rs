@@ -84,6 +84,7 @@ impl Engine {
                 return drive_used;
             }
             rt.checking = Some(stop.clone());
+            rt.checking_since = Some(Instant::now());
             (job, rt.epoch)
         };
         let engine = self.clone();

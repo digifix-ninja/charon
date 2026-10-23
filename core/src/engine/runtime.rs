@@ -38,6 +38,8 @@ pub(crate) struct JobRuntime {
     pub preparing: Option<Arc<AtomicBool>>,
     /// Set while a background check runs; setting it to true stops it.
     pub checking: Option<Arc<AtomicBool>>,
+    /// When the background check that runs now began.
+    pub checking_since: Option<Instant>,
     pub progress: Option<Progress>,
     /// What the last look found.
     pub look: Option<Look>,
@@ -95,6 +97,12 @@ impl JobRuntime {
 
     pub fn is_checking(&self) -> bool {
         self.checking.is_some()
+    }
+
+    /// Whether a background check runs that began less than `within` ago (or at a time not
+    /// known).
+    pub fn checking_within(&self, within: Duration) -> bool {
+        self.is_checking() && self.checking_since.is_none_or(|since| since.elapsed() < within)
     }
 
     /// Stops the running sync, if there is one, as the person asked (Stop, pausing the job):

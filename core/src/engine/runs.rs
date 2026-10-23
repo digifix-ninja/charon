@@ -1324,13 +1324,17 @@ impl Engine {
             // After a stopped run, a confirmed run that left something, or a run whose plan the
             // folders outgrew, look again at once, so the row shows what's still waiting. Runs
             // by themselves wait for the regular look otherwise: a file that fails every time
-            // mustn't start a run every few seconds. That look counts from when the folders on
-            // a drive the run kept quiet stopped being watched: what changed there since,
-            // besides the run's own items, wasn't heard.
-            if summary.cancelled || outdated || (crossing.approved && (left || summary.error.is_some())) {
+            // mustn't start a run every few seconds. After a run that left nothing, that look
+            // counts from when the folders on a drive the run kept quiet stopped being watched:
+            // what changed there since, besides the run's own items, wasn't heard. After one
+            // that left something, it counts from now, however long the run kept the drive
+            // quiet: what it left is tried again a whole interval later at the soonest.
+            let left_something = left || summary.error.is_some();
+            if summary.cancelled || outdated || (crossing.approved && left_something) {
                 rt.last_checked = None;
             } else {
-                rt.last_checked = Some(unwatched_since.unwrap_or_else(Instant::now));
+                let since = unwatched_since.filter(|_| !left_something);
+                rt.last_checked = Some(since.unwrap_or_else(Instant::now));
             }
         });
         self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name.clone(), summary }));

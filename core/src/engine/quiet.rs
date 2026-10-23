@@ -9,18 +9,20 @@
 //! So Charon works on one job at a time on such a drive (see `Engine::drive_used_by_another`):
 //! while a job's run (its look, then its sync) or a list being made for it reads the drive,
 //! no other job's run, list or look starts there. A run nobody asked for also waits for
-//! another job's look in the background there; a run or a list the person asked for stops
-//! that look instead, and it comes again once they're done. A run that waits says so in its
-//! row, and starts by itself. And while a sync writes to the drive, its thread is meant to be
-//! the only one of Charon's at work there:
+//! another job's look in the background there (for ten minutes at most: a look at it longer
+//! is most likely stuck on its other folder); a run or a list the person asked for stops that
+//! look instead, and it comes again once they're done. A run that waits says so in its row,
+//! and starts by itself, ahead of the next look there (see `Autopilot::tick`). And while a
+//! sync writes to the drive, its thread is meant to be the only one of Charon's at work there:
 //! * the sync refreshes its busy notes there itself, as it goes (see `run::Claim::beat`; the
 //!   heartbeat does only when the sync is held up so long that they'd go stale);
 //! * what the window, the autopilot and the reminders ask about folders on the drive is
 //!   answered from what was found before (see `Engine::whereabouts_of`, `Engine::folders_of`);
 //! * the autopilot stops watching the folders on the drive for changes until the sync is done.
 //!   What changes there meanwhile isn't heard, as on a network share: the next regular look
-//!   finds it, at most one look interval after the folders stopped being watched (see
-//!   `Engine::finish`), and a list made before is carried out as one that waited (see
+//!   finds it, at most one look interval after the folders stopped being watched, or after
+//!   the sync ended when it left something (see `Engine::finish`). A list made before can
+//!   still be confirmed, and its folders are looked at again once it's carried out (see
 //!   `Engine::let_looks_end`).
 //!
 //! Before it writes, the sync waits a moment for other looks there to stop and for the
@@ -56,6 +58,12 @@ const LOOKS_END_WITHIN: Duration = Duration::from_secs(5);
 const UNWATCHED_WITHIN: Duration = Duration::from_secs(3);
 /// The name of the autopilot's thread, which follows the drives kept quiet itself.
 pub(crate) const AUTOPILOT_THREAD: &str = "charon-autopilot";
+/// How long a look in the background holds other jobs back on a drive run by an add-on
+/// driver. A look of a folder there takes a few minutes at most: one at it longer is most
+/// likely stuck on its other folder (a network share that stopped answering), and no longer
+/// reads the drive. A run nobody asked for then stops it, as one the person asked for does,
+/// and another job's look no longer waits for it.
+const LOOKS_HOLD_FOR: Duration = Duration::from_secs(10 * 60);
 
 /// The drives kept quiet now, and what's known of the folders on them.
 #[derive(Default)]
@@ -67,6 +75,9 @@ pub(crate) struct QuietDrives {
     followed: AtomicU64,
     /// Whether the autopilot follows them at all (it runs, and watches folders).
     following: std::sync::atomic::AtomicBool,
+    /// `LOOKS_HOLD_FOR`, for a test that can't wait that long.
+    #[cfg(test)]
+    looks_hold_for: Mutex<Option<Duration>>,
 }
 
 #[derive(Default)]
@@ -143,6 +154,15 @@ impl Known {
 impl QuietDrives {
     fn known(&self) -> MutexGuard<'_, Known> {
         self.known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// How long a look in the background holds other jobs back (see `LOOKS_HOLD_FOR`).
+    fn looks_hold_for(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(hold) = *self.looks_hold_for.lock().unwrap() {
+            return hold;
+        }
+        LOOKS_HOLD_FOR
     }
 
     /// Whether `folder` is on a drive kept quiet now.
@@ -360,9 +380,10 @@ impl Engine {
     /// before Charon knew the drive.
     ///
     /// The other jobs' folders there aren't watched from now on, so a list of theirs made
-    /// before can't be told outgrown by what changes there meanwhile: it's carried out as one
-    /// that waited, its folders looked at again once it's done (see `carry_out`). It isn't
-    /// refused for that: each step checks its items right before it acts.
+    /// before can't be told outgrown by what changes there meanwhile. It isn't refused for
+    /// that (each step checks its items right before it acts, and the list is still checked
+    /// for its age and for changes heard meanwhile), but once it's carried out, its
+    /// folders are looked at again (see `carry_out`).
     fn let_looks_end(&self, job: &Job) {
         let on_drive: Vec<JobId> = self
             .job_list()
@@ -397,10 +418,11 @@ impl Engine {
 
     /// The name of another job at work on a drive run by an add-on driver that one of the
     /// folders of the job `id` is on: its run (its look or its sync), a list being made for
-    /// it, or with `looks` a look of it in the background. The job isn't looked at, listed or
-    /// synced until that's done (see the module's notes). Its folders there are still asked
-    /// about meanwhile (where they are, and whether they overlap another job's), until a sync
-    /// keeps the drive quiet: from then on, they're answered from memory.
+    /// it, or with `looks` a look of it in the background (one at it for less than
+    /// `LOOKS_HOLD_FOR`). The job isn't looked at, listed or synced until that's done (see the
+    /// module's notes). Its folders there are still asked about meanwhile (where they are,
+    /// and whether they overlap another job's), until a sync keeps the drive quiet: from then
+    /// on, they're answered from memory.
     pub(crate) fn drive_used_by_another(&self, id: &JobId, looks: bool) -> Option<String> {
         let state = self.state();
         let runtime = self.runtime();
@@ -411,9 +433,10 @@ impl Engine {
     /// `drive_used_by_another` for `job`, with the live state locked (`jobs`, `runtime`).
     pub(crate) fn drive_used_among(&self, jobs: &[Job], runtime: &HashMap<JobId, JobRuntime>, job: &Job, looks: bool) -> Option<String> {
         let mine = [job.setup.source.as_path(), job.setup.destination.as_path()];
+        let hold = self.inner.quiet.looks_hold_for();
         jobs.iter()
             .filter(|other| other.id != job.id)
-            .filter(|other| runtime.get(&other.id).is_some_and(|rt| rt.is_running() || rt.preparing.is_some() || (looks && rt.is_checking())))
+            .filter(|other| runtime.get(&other.id).is_some_and(|rt| rt.is_running() || rt.preparing.is_some() || (looks && rt.checking_within(hold))))
             .find(|other| self.inner.quiet.share_an_add_on_drive(&mine, &[&other.setup.source, &other.setup.destination]))
             .map(|other| other.setup.name.clone())
             .or_else(|| self.kept_quiet_by_another(job))
@@ -465,6 +488,8 @@ mod testing {
     use super::*;
     use crate::engine::runs::Crossing;
     use crate::engine::survey::Purpose;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     /// A sync that has looked at its job's folders and claimed them, and goes no further:
     /// dropped, it ends without changing anything.
@@ -487,6 +512,41 @@ mod testing {
         /// Marks the job as just looked at.
         pub(crate) fn just_looked_at(&self, id: &JobId) {
             self.change_runtime(id, |rt| rt.last_checked = Some(Instant::now()));
+        }
+
+        /// Marks a look at the job in the background as at work, as if it read the job's
+        /// folders, until `end_a_look`. Returns its stop flag.
+        pub(crate) fn begin_a_look(&self, id: &JobId) -> Arc<AtomicBool> {
+            let flag = Arc::new(AtomicBool::new(false));
+            self.change_runtime(id, |rt| {
+                rt.checking = Some(flag.clone());
+                rt.checking_since = Some(Instant::now());
+            });
+            flag
+        }
+
+        /// Ends the look `begin_a_look` marked, as a look that counts.
+        pub(crate) fn end_a_look(&self, id: &JobId) {
+            self.change_runtime(id, |rt| {
+                rt.checking = None;
+                rt.last_checked = Some(Instant::now());
+            });
+        }
+
+        /// Holds the job's next look back, as another job at work on its drive does: it's due
+        /// as soon as nothing holds it back anymore.
+        pub(crate) fn hold_back_a_look(&self, id: &JobId) {
+            self.change_runtime(id, |rt| rt.last_checked = None);
+        }
+
+        /// Whether the job's next look is held back, and no look of it is at work.
+        pub(crate) fn look_held_back(&self, id: &JobId) -> bool {
+            self.runtime().get(id).is_some_and(|rt| rt.checking.is_none() && rt.last_checked.is_none())
+        }
+
+        /// Whether the job has a wanted run that didn't start yet.
+        pub(crate) fn run_wanted(&self, id: &JobId) -> bool {
+            self.runtime().get(id).is_some_and(|rt| rt.wanted.is_some())
         }
 
         /// Whether the job's list `review_id` waits for an OK but can't be confirmed anymore,
@@ -734,9 +794,13 @@ mod tests {
     fn a_look_that_began_before_charon_knew_the_drive_is_stopped_at_the_keep() {
         let Jobs { _tmp, _stick, engine, documents, photos, .. } = jobs();
         // Nothing is known yet of where the folders are, as right after a launch (once the
-        // first looks are done: they say).
+        // first looks are done: the rows they publish as they end say where the folders are).
         until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
-        engine.inner.quiet.known().presences.clear();
+        until(|| {
+            engine.inner.quiet.known().presences.clear();
+            thread::sleep(Duration::from_millis(50));
+            engine.inner.quiet.known().presences.is_empty()
+        });
         let flag = Arc::new(AtomicBool::new(false));
         engine.change_runtime(&photos, |rt| {
             rt.checking = Some(flag.clone());
@@ -820,6 +884,102 @@ mod tests {
         assert!(rt.look.is_some(), "its look still says what's left");
         let (checked, finished) = (rt.last_checked.unwrap(), rt.finished_at.unwrap());
         assert!(finished.duration_since(checked) >= Duration::from_millis(100), "{checked:?} {finished:?}");
+    }
+
+    #[test]
+    fn after_a_sync_that_left_something_the_regular_look_counts_from_its_end() {
+        let Jobs { _tmp, _stick, engine, documents, on_stick: [docs_on_stick, _], .. } = jobs();
+        let crossing = Crossing::unattended("for a test", true);
+        let (job, cancel) = engine.begin_run(&documents, &crossing, |_, _| Ok(())).unwrap();
+        let survey = engine.survey(&job, &cancel, Purpose::Automatic).unwrap();
+        // Since the look, a folder took the place the letter was to be copied to: the sync
+        // leaves the letter where it is.
+        fs::create_dir(docs_on_stick.join("letter.txt")).unwrap();
+        let claim = engine.claim_folders(&job, &survey).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        engine.cross(&job, &survey, &cancel, &crossing, claim);
+        let run = engine.stored_job(&documents).unwrap().last_run.unwrap();
+        assert!(run.skipped + run.failed > 0, "{run:?}");
+        // However long it kept the stick quiet, what it left is tried again a whole interval
+        // after it ended at the soonest: a file that fails every time mustn't sync again and
+        // again on the very drive the keep is meant to spare.
+        let (checked, finished) = engine.runtime().get(&documents).map(|rt| (rt.last_checked.unwrap(), rt.finished_at.unwrap())).unwrap();
+        assert!(checked >= finished, "{checked:?} {finished:?}");
+    }
+
+    #[test]
+    fn a_look_at_it_for_too_long_no_longer_holds_the_drive() {
+        let Jobs { _tmp, _stick, engine, documents, photos, .. } = jobs();
+        until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
+        engine.whereabouts_of(&engine.job_list());
+        // A look at Photos that doesn't end, as one stuck on a network share on its other side.
+        let stuck = engine.begin_a_look(&photos);
+        let after_changes = Crossing::unattended("after changes", false);
+        let refused = engine.begin_run(&documents, &after_changes, |_, _| Ok(())).unwrap_err();
+        assert!(matches!(&refused, Error::DriveBusy(name) if name == "Photos"), "{refused:?}");
+        engine.check(&documents);
+        assert!(engine.look_held_back(&documents), "a look that just began holds the drive");
+
+        // Once it's been at it too long, it holds nothing back: another job's look goes ahead...
+        *engine.inner.quiet.looks_hold_for.lock().unwrap() = Some(Duration::from_millis(500));
+        engine.change_runtime(&photos, |rt| rt.checking_since = Instant::now().checked_sub(Duration::from_secs(1)));
+        engine.check(&documents);
+        assert!(!engine.look_held_back(&documents), "Documents was looked at");
+        until(|| engine.runtime().get(&documents).is_some_and(|rt| rt.checking.is_none()));
+        // ...and a run nobody asked for stops it, as one the person asked for does.
+        engine.begin_run(&documents, &after_changes, |_, _| Ok(())).unwrap();
+        assert!(stuck.load(Ordering::Relaxed), "the look was stopped");
+        engine.change_runtime(&documents, |rt| {
+            Engine::unmark_run(rt);
+        });
+        engine.change_runtime(&photos, |rt| rt.checking = None);
+    }
+
+    /// The busy notes in Charon's folder in `folder`.
+    fn busy_notes(folder: &Path) -> usize {
+        fs::read_dir(folder.join(".charon"))
+            .map(|items| items.flatten().filter(|item| item.file_name().to_string_lossy().ends_with(crate::run::BUSY_EXTENSION)).count())
+            .unwrap_or(0)
+    }
+
+    /// Tries the confirmed list of `id` again as the autopilot does, on a thread of its name.
+    /// Returns whether its sync started, and how long that took.
+    fn start_confirmed_as_the_autopilot(engine: &Engine, id: &JobId) -> (bool, Duration) {
+        let (engine, id) = (engine.clone(), id.clone());
+        let pilot = thread::Builder::new().name(AUTOPILOT_THREAD.into()).spawn(move || {
+            let began = Instant::now();
+            (engine.start_confirmed(&id), began.elapsed())
+        });
+        pilot.unwrap().join().unwrap()
+    }
+
+    #[test]
+    fn a_list_the_autopilot_starts_claims_its_folders_on_its_sync_thread() {
+        let Jobs { _tmp, _stick, engine, documents, photos, on_stick: [_, photos_on_stick], .. } = jobs();
+        engine.whereabouts_of(&engine.job_list());
+        let list = engine.prepare_review(&photos).unwrap();
+        let held = engine.hold_a_sync(&documents).unwrap();
+        let approved = engine.approve(&photos, &list.review_id, true).unwrap();
+        assert!(matches!(&approved, crate::engine::Approval::Waiting { waiting_for } if waiting_for == "Documents"), "{approved:?}");
+        // The autopilot follows the keeps from now on, and has followed all of them so far.
+        engine.quiet_followed(engine.quiet_keeps());
+        drop(held);
+
+        // The autopilot tries the list again. It can't wait for its own next follow: the sync
+        // claims its folders on its own thread, and the autopilot goes on at once.
+        let (started, took) = start_confirmed_as_the_autopilot(&engine, &photos);
+        assert!(started && took < UNWATCHED_WITHIN, "{took:?}");
+        until(|| engine.kept_quiet(&photos_on_stick));
+        let kept_at = Instant::now();
+        thread::sleep(Duration::from_millis(100));
+        let notes = busy_notes(&photos_on_stick);
+        if kept_at.elapsed() < UNWATCHED_WITHIN {
+            assert_eq!(notes, 0, "no note on the stick before the autopilot stopped watching it");
+        }
+        // Its next tick does, and the sync goes ahead.
+        engine.quiet_followed(engine.quiet_keeps());
+        until(|| !engine.is_running(&photos));
+        assert!(photos_on_stick.join("letter.txt").exists(), "the list was carried out");
     }
 
     #[test]

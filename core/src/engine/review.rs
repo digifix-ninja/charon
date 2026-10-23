@@ -193,7 +193,10 @@ impl Engine {
     /// Starts the sync of a list the person confirmed while another sync was at work in the
     /// job's folders, if nothing stands in its way anymore. Returns whether it started. A
     /// list that can't be carried out anymore (the job changed, synced, or a drive was
-    /// swapped meanwhile) is dropped, and the row says why.
+    /// swapped meanwhile) is dropped, and the row says why. On the autopilot's thread, the
+    /// sync claims its folders on its own thread (see `carry_out`): true then means it was
+    /// handed to that thread, which keeps the list waiting if it finds another sync at work
+    /// there after all.
     pub fn start_confirmed(&self, id: &JobId) -> bool {
         if self.is_shutting_down() {
             return false;
@@ -1150,6 +1153,59 @@ mod tests {
         fs::remove_file(note).unwrap();
         assert!(!engine.start_confirmed(&id));
         assert!(!engine.is_running(&id) && !dst.join("Projects/plan.txt").exists(), "nothing ran");
+    }
+
+    /// Runs `try_it` as the autopilot does, on a thread of its name.
+    fn as_the_autopilot<T: Send + 'static>(engine: &Engine, id: &JobId, try_it: impl FnOnce(&Engine, &JobId) -> T + Send + 'static) -> T {
+        let (engine, id) = (engine.clone(), id.clone());
+        thread::Builder::new().name(AUTOPILOT_THREAD.into()).spawn(move || try_it(&engine, &id)).unwrap().join().unwrap()
+    }
+
+    #[test]
+    fn a_list_the_autopilot_tries_again_keeps_waiting_when_its_sync_meets_another_sync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+        let note = another_charon_syncs(&dst.join("Projects"));
+        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+
+        // The autopilot tries the list again. It hands the sync to a thread of its own, which
+        // claims the folders there and meets the other sync still at work: the list waits on.
+        assert!(as_the_autopilot(&engine, &id, |engine, id| engine.start_confirmed(id)), "handed to its sync's thread");
+        wait_idle(&engine, &id);
+        let row = engine.job(&id).unwrap();
+        assert!(row.confirmed, "the list still waits");
+        assert_eq!(row.waiting_for.as_deref(), Some("Charon on studio-mac"));
+        assert!(!dst.join("Projects/plan.txt").exists() && engine.job(&id).unwrap().job.last_run.is_none(), "nothing ran");
+
+        // Once that sync is done, the next try carries it out.
+        fs::remove_file(note).unwrap();
+        assert!(as_the_autopilot(&engine, &id, |engine, id| engine.start_confirmed(id)));
+        wait_idle(&engine, &id);
+        assert!(dst.join("Projects/plan.txt").exists());
+    }
+
+    #[test]
+    fn pausing_everything_as_the_autopilot_starts_a_waiting_list_calls_it_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, id, dst, review_id) = docs(tmp.path());
+        let note = another_charon_syncs(&dst.join("Projects"));
+        assert!(matches!(engine.approve(&id, &review_id, true).unwrap(), Approval::Waiting { .. }));
+
+        // The other sync ends, and the autopilot tries the list again: its sync is marked as
+        // running, and before its thread claims the folders, the person pauses everything.
+        fs::remove_file(note).unwrap();
+        let started = as_the_autopilot(&engine, &id, |engine, id| {
+            pause_everything_when_claiming(engine, id);
+            let started = engine.start_confirmed(id);
+            assert!(ran_when_claiming());
+            started
+        });
+        assert!(started, "handed to its sync's thread");
+        wait_idle(&engine, &id);
+        assert!(engine.settings().paused_all && !dst.join("Projects/plan.txt").exists(), "nothing ran");
+        called_off_by_pausing_everything(&engine, &id);
+        assert!(engine.job(&id).unwrap().job.last_run.is_none(), "no sync began");
+        assert_eq!(busy_notes(&dst) + busy_notes(&dst.join("Projects")), 0, "its busy notes are gone");
     }
 
     #[test]
