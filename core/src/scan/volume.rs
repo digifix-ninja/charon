@@ -150,7 +150,7 @@ impl Volume {
     /// The drive `root` is on, without asking how it treats case: quick enough to ask
     /// every second. `None` where the system can't tell.
     pub fn basics(root: &Path) -> Option<Volume> {
-        system::volume_of(root)
+        system::volume_of(root).map(|volume| pretend::applied(root, volume))
     }
 
     /// The drive of the folder `root`. Never fails: what can't be found out is assumed in the
@@ -169,7 +169,7 @@ impl Volume {
         let answer = system::case_sensitive(root).or_else(|| probe_case(root)).or_else(|| probe_case_with_own_file(root));
         volume.case_sensitive = answer.unwrap_or_else(|| volume.kind.usually_case_sensitive());
         volume.case_guessed = answer.is_none();
-        volume
+        pretend::applied(root, volume)
     }
 
     /// The kind of drive in words: "APFS", "exFAT", "network share (SMB)".
@@ -207,6 +207,22 @@ impl Volume {
     fn run_by_a_program(&self) -> bool {
         let fs = self.fs.to_ascii_lowercase();
         fs.contains("fuse") && fs != "fuseblk"
+    }
+
+    /// Whether this drive is run by a driver Apple didn't make, on a Mac: Paragon's or
+    /// Tuxera's NTFS, macFUSE and the like. Such drivers work inside the system's own core,
+    /// and one has brought the whole Mac down (a kernel panic) during a sync, while Spotlight
+    /// read the drive too. So Charon works on one job at a time there, and while a sync writes
+    /// to such a drive, nothing else of Charon's asks it anything (see `engine::quiet`). A
+    /// drive whose kind couldn't be found out counts too, the careful direction. A disk image
+    /// kept on such a drive (a VeraCrypt volume over macFUSE) is Apple's own file system, and
+    /// doesn't count. Elsewhere the system's own drivers are used.
+    pub fn run_by_an_add_on_driver(&self) -> bool {
+        #[cfg(test)]
+        if self.fs == pretend::ADD_ON {
+            return true;
+        }
+        cfg!(target_os = "macos") && (!apple_made(&self.fs) || has_add_on_bundle(&self.fs))
     }
 
     /// Whether this drive keeps times in local time, so a daylight-saving change or a trip
@@ -344,6 +360,23 @@ impl FsKind {
             _ => FsKind::Other,
         }
     }
+}
+
+/// Whether macOS itself brings the file system named `fs` (as the system names it: "apfs",
+/// "msdos", "smbfs"). Paragon's drivers name theirs "ufsd_NTFS" and the like, Tuxera's
+/// "tuxera_ntfs", macFUSE's "macfuse".
+fn apple_made(fs: &str) -> bool {
+    matches!(
+        fs.to_ascii_lowercase().as_str(),
+        "apfs" | "hfs" | "msdos" | "exfat" | "ntfs" | "lifs" | "smbfs" | "nfs" | "afpfs" | "webdav" | "ftp" | "acfs" | "cd9660" | "udf" | "cddafs" | "devfs" | "autofs" | "mtmfs" | "nullfs"
+    )
+}
+
+/// Whether another maker installed a driver for the file system named `fs` (in
+/// /Library/Filesystems; Apple's own are in /System/Library/Filesystems), which would then
+/// run the drive even under one of Apple's names.
+fn has_add_on_bundle(fs: &str) -> bool {
+    !fs.is_empty() && !fs.contains(['/', '\\']) && !fs.starts_with('.') && Path::new("/Library/Filesystems").join(format!("{fs}.fs")).exists()
 }
 
 /// What Windows (and any drive formatted for it) can't take in a name.
@@ -675,6 +708,57 @@ mod system {
     }
 }
 
+#[cfg(not(test))]
+mod pretend {
+    use super::Volume;
+    use std::path::Path;
+
+    pub(super) fn applied(_root: &Path, volume: Volume) -> Volume {
+        volume
+    }
+}
+
+/// Tests can't plug in a drive run by an add-on driver: a folder pretends to be one.
+#[cfg(test)]
+pub(crate) mod pretend {
+    use super::Volume;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    /// The name of the file system such a folder's drive reports.
+    pub const ADD_ON: &str = "pretend_add_on";
+
+    static FOLDERS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    /// While this lives, everything in its folder is on a drive of its own, mounted at that
+    /// folder and run by an add-on driver (see `Volume::run_by_an_add_on_driver`).
+    pub struct AddOnDrive(PathBuf);
+
+    impl AddOnDrive {
+        pub fn at(folder: &Path) -> AddOnDrive {
+            FOLDERS.lock().unwrap_or_else(|e| e.into_inner()).push(folder.to_path_buf());
+            AddOnDrive(folder.to_path_buf())
+        }
+    }
+
+    impl Drop for AddOnDrive {
+        fn drop(&mut self) {
+            FOLDERS.lock().unwrap_or_else(|e| e.into_inner()).retain(|folder| folder != &self.0);
+        }
+    }
+
+    /// `volume`, the drive of `root`, as it pretends to be.
+    pub(super) fn applied(root: &Path, mut volume: Volume) -> Volume {
+        let folders = FOLDERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(folder) = folders.iter().find(|folder| root.starts_with(folder)) {
+            volume.fs = ADD_ON.into();
+            volume.mount = folder.to_string_lossy().into_owned();
+            volume.name = "Stick".into();
+        }
+        volume
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +803,51 @@ mod tests {
             assert_eq!(drive.kind, FsKind::Ntfs, "{name}");
             assert!(drive.cannot_hold("Q3: plan.txt").is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn drivers_apple_didnt_make_are_told_apart_on_a_mac() {
+        let on = |fs: &str| Volume { fs: fs.into(), ..volume(FsKind::from_name(fs)) }.run_by_an_add_on_driver();
+        for (fs, apple) in [
+            ("ufsd_NTFS", false),
+            ("ufsd_ExtFS", false),
+            ("tuxera_ntfs", false),
+            ("fusefs_txantfs", false),
+            ("macfuse", false),
+            ("osxfuse", false),
+            ("unknown", false),
+            ("apfs", true),
+            ("hfs", true),
+            ("msdos", true),
+            ("exfat", true),
+            ("ntfs", true),
+            ("smbfs", true),
+            ("nfs", true),
+            ("lifs", true),
+        ] {
+            assert_eq!(apple_made(fs), apple, "{fs}");
+            if !apple {
+                assert_eq!(on(fs), cfg!(target_os = "macos"), "{fs}");
+            }
+        }
+        assert!(!on("ext4") || cfg!(target_os = "macos"));
+        assert!(!has_add_on_bundle("") && !has_add_on_bundle("../x") && !has_add_on_bundle("a/b"));
+    }
+
+    #[test]
+    fn a_folder_can_pretend_to_be_on_an_add_on_drive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stick = tmp.path().join("stick");
+        std::fs::create_dir_all(stick.join("dest")).unwrap();
+        assert!(!Volume::of(tmp.path()).run_by_an_add_on_driver() || cfg!(target_os = "macos") && !apple_made(&Volume::of(tmp.path()).fs));
+        let pretending = pretend::AddOnDrive::at(&stick);
+        for drive in [Volume::of(&stick.join("dest")), Volume::basics(&stick.join("dest")).unwrap()] {
+            assert!(drive.run_by_an_add_on_driver());
+            assert_eq!(drive.mount, stick.to_string_lossy());
+        }
+        assert_ne!(Volume::of(tmp.path()).fs, pretend::ADD_ON);
+        drop(pretending);
+        assert_ne!(Volume::of(&stick).fs, pretend::ADD_ON);
     }
 
     #[test]

@@ -43,6 +43,12 @@ pub enum Error {
     #[error("“{0}” is syncing one of these folders right now. Look again when it's done.")]
     FoldersBusy(String),
 
+    /// Another job (named) is at work on the drive of one of the folders, a drive run by a
+    /// driver Apple didn't make, where Charon works on one job at a time: it syncs there, or
+    /// its folders are being looked at.
+    #[error("“{0}” is using the same drive right now. Its driver isn't Apple's own (like Paragon's NTFS), so Charon works on one job at a time there. Look again when it's done.")]
+    DriveBusy(String),
+
     /// The list the person looked at no longer matches the folders or the job.
     #[error("{0}")]
     ReviewOutdated(String),
@@ -86,6 +92,14 @@ pub enum Error {
 }
 
 impl Error {
+    /// The sync this one waits for, when another sync at work is why it can't go ahead now.
+    pub fn waits_for(&self) -> Option<&str> {
+        match self {
+            Error::FoldersBusy(who) | Error::DriveBusy(who) => Some(who),
+            _ => None,
+        }
+    }
+
     /// Wraps an I/O error with the path it happened on.
     pub fn file(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::File {

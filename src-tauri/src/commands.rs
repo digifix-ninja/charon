@@ -157,10 +157,11 @@ pub async fn cancel(state: State<'_, AppState>, id: JobId) -> Answer<()> {
     .await
 }
 
-/// Looks for changes in the background (changes nothing).
+/// Looks for changes in the background (changes nothing). Says why when the look waits for
+/// another job on the same drive.
 #[tauri::command]
-pub fn check(state: State<AppState>, id: JobId) {
-    state.engine.check(&id);
+pub fn check(state: State<AppState>, id: JobId) -> Answer<()> {
+    state.engine.look_now(&id).map_err(say)
 }
 
 // ---------------------------------------------------------------- the list of changes

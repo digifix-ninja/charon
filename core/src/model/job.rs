@@ -111,8 +111,14 @@ impl JobSetup {
         format!("{} {arrow} {}", Self::folder_name(source), Self::folder_name(destination))
     }
 
-    /// Checks that the setup makes sense before it's saved.
+    /// Checks that the setup makes sense before it's saved. Asks the disk.
     pub fn validate(&mut self) -> Result<()> {
+        self.validate_as(|paths| paths.iter().map(|path| Some(Folder::of(path))).collect())
+    }
+
+    /// `validate`, with each folder as `resolve` finds it (see `clashes_as`): one it can't
+    /// tell now (`None`) is compared with nothing.
+    pub fn validate_as(&mut self, resolve: impl Fn(&[&Path]) -> Vec<Option<Folder>>) -> Result<()> {
         self.name = self.name.trim().to_string();
         self.excludes = self
             .excludes
@@ -127,14 +133,15 @@ impl JobSetup {
         if !self.source.is_absolute() || !self.destination.is_absolute() {
             return Err(Error::Invalid("Folders must be full paths.".into()));
         }
-        let (source, destination) = (Folder::of(&self.source), Folder::of(&self.destination));
-        if source.is(&destination) {
-            return Err(Error::Invalid("Source and destination are the same folder.".into()));
-        }
-        if source.overlaps(&destination) {
-            return Err(Error::Invalid(
-                "One folder is inside the other. Charon would end up copying its own copies.".into(),
-            ));
+        if let [Some(source), Some(destination)] = resolve(&[&self.source, &self.destination]).as_slice() {
+            if source.is(destination) {
+                return Err(Error::Invalid("Source and destination are the same folder.".into()));
+            }
+            if source.overlaps(destination) {
+                return Err(Error::Invalid(
+                    "One folder is inside the other. Charon would end up copying its own copies.".into(),
+                ));
+            }
         }
         self.trigger = match self.trigger {
             Trigger::OnChange { settle_seconds } => Trigger::OnChange {
@@ -449,6 +456,8 @@ impl Folder {
     /// Asks the disk: for links, and for how the drive treats upper and lower case.
     pub fn of(path: &Path) -> Self {
         use unicode_normalization::UnicodeNormalization;
+        #[cfg(test)]
+        asking::note(path);
         let (resolved, existing) = Self::resolve(path);
         let mut text: String = resolved.to_string_lossy().nfc().collect();
         if let Some(rest) = text.strip_prefix(r"\\?\") {
@@ -530,6 +539,28 @@ impl Folder {
             }
         }
         out
+    }
+}
+
+/// What `Folder::of` asked the disk about, for tests that make sure a drive isn't asked.
+#[cfg(test)]
+pub(crate) mod asking {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        /// The folders `Folder::of` asked the disk about on this thread.
+        static ASKED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Notes that `Folder::of` asks the disk about `path` on this thread.
+    pub(crate) fn note(path: &Path) {
+        ASKED.with(|asked| asked.borrow_mut().push(path.to_path_buf()));
+    }
+
+    /// The folders `Folder::of` asked the disk about on this thread since the last call.
+    pub(crate) fn taken() -> Vec<PathBuf> {
+        ASKED.with(|asked| asked.take())
     }
 }
 

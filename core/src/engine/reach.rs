@@ -148,10 +148,12 @@ impl<T> Question<T> {
 
 impl Engine {
     /// Looks at both folders of each of `jobs`, all at once: waits at most `LIMIT` in all,
-    /// and a folder that doesn't answer by then counts as `Presence::Silent`.
+    /// and a folder that doesn't answer by then counts as `Presence::Silent`. A folder on a
+    /// drive a sync keeps quiet isn't asked: what was found before is said (see `quiet.rs`).
     pub(crate) fn whereabouts_of<'a>(&self, jobs: impl IntoIterator<Item = &'a Job>) -> Vec<Whereabouts> {
         let folders: Vec<&Path> = jobs.into_iter().flat_map(|job| [job.setup.source.as_path(), job.setup.destination.as_path()]).collect();
-        let found: Vec<Presence> = self.inner.reach.ask_each(&folders, Presence::of).into_iter().map(|p| p.unwrap_or(Presence::Silent)).collect();
+        let found = self.inner.quiet.presences(&folders, |asked| self.inner.reach.ask_each(asked, Presence::of));
+        let found: Vec<Presence> = found.into_iter().map(|p| p.unwrap_or(Presence::Silent)).collect();
         found.chunks_exact(2).map(|pair| Whereabouts { source: pair[0].clone(), destination: pair[1].clone() }).collect()
     }
 
@@ -162,9 +164,10 @@ impl Engine {
     }
 
     /// Each of `paths` as a folder two paths can be compared in (see `Folder::of`), all at
-    /// once: `None` for one that doesn't answer in time.
+    /// once: `None` for one that doesn't answer in time. One on a drive a sync keeps quiet
+    /// isn't asked: it's as found before, or `None` (see `quiet.rs`).
     pub(crate) fn folders_of(&self, paths: &[&Path]) -> Vec<Option<Folder>> {
-        self.inner.reach.ask_each(paths, Folder::of)
+        self.inner.quiet.folders(paths, |asked| self.inner.reach.ask_each(asked, Folder::of))
     }
 
     /// Asks `question` about `folder` with the time limit: `None` when it doesn't answer.

@@ -36,14 +36,23 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 /// What the name of a busy note ends with.
 pub const BUSY_EXTENSION: &str = ".busy";
 /// How often a running sync refreshes its notes.
+#[cfg(not(test))]
 const HEARTBEAT: Duration = Duration::from_secs(20);
+#[cfg(test)]
+const HEARTBEAT: Duration = Duration::from_millis(100);
+/// How long the notes on a drive kept quiet may go without the sync's own refresh before the
+/// heartbeat refreshes them after all (see `Claim::beat`): well before they'd go stale.
+#[cfg(not(test))]
+pub(crate) const QUIET_OVERDUE: Duration = Duration::from_secs(60);
+#[cfg(test)]
+pub(crate) const QUIET_OVERDUE: Duration = Duration::from_secs(1);
 /// A note that stayed the same this long, by this computer's clock, belongs to a Charon that
 /// stopped.
 const STALE_AFTER: Duration = Duration::from_secs(120);
@@ -330,7 +339,12 @@ pub struct Claim {
     watch: Arc<BusyWatch>,
     /// The name of the claim's notes, the same in every folder.
     name: OsString,
+    /// The notes the heartbeat refreshes, on a thread of its own.
     notes: Arc<Mutex<Notes>>,
+    /// The notes on drives kept quiet while the sync runs, where Charon keeps to one thread
+    /// (see `Volume::run_by_an_add_on_driver`): the sync's own thread refreshes them as it
+    /// goes (see `beat`), and the heartbeat only when that's overdue.
+    quiet: Arc<Mutex<Notes>>,
     /// Dropped with the claim, which stops the heartbeat.
     _heartbeat: Option<Sender<()>>,
 }
@@ -341,6 +355,8 @@ struct Notes {
     roots: Vec<PathBuf>,
     files: Vec<PathBuf>,
     note: BusyNote,
+    /// When they were last written.
+    written: Instant,
 }
 
 impl Notes {
@@ -350,6 +366,7 @@ impl Notes {
     /// folder is back. So is one that is now reached through a link (a folder on the way
     /// was replaced by one while the sync runs): the link leads out of the sync's folders.
     fn refresh(&mut self) {
+        self.written = Instant::now();
         self.note.heartbeat = Utc::now();
         let Ok(bytes) = serde_json::to_vec_pretty(&self.note) else { return };
         for file in &self.files {
@@ -381,6 +398,21 @@ impl Claim {
     /// link since the folders were looked at would take the note out of the sync's folders.
     /// A Charon folder that's gone gets no note, and none is made.
     pub fn take(watch: &Arc<BusyWatch>, note: BusyNote, roots: &[&Path], inside: &[PathBuf]) -> std::result::Result<Claim, BusyNote> {
+        Self::take_keeping_quiet(watch, note, roots, inside, &[])
+    }
+
+    /// `take`, for a sync that keeps the drives of the folders `quiet` (some of `roots`)
+    /// quiet: its notes in them, and in the folders inside them, are refreshed by the sync's
+    /// own thread, when it calls `beat`. Only when the sync is held up longer than that
+    /// (`QUIET_OVERDUE`: a big file copied into the trash, a slow flush) does the heartbeat
+    /// refresh them, since other Charons would otherwise take them for stale.
+    pub fn take_keeping_quiet(
+        watch: &Arc<BusyWatch>,
+        note: BusyNote,
+        roots: &[&Path],
+        inside: &[PathBuf],
+        quiet: &[&Path],
+    ) -> std::result::Result<Claim, BusyNote> {
         let name = OsString::from(format!("{}{BUSY_EXTENSION}", uuid::Uuid::new_v4().simple()));
         let bytes = serde_json::to_vec_pretty(&note).unwrap_or_default();
         watch.hold(&name, true);
@@ -409,22 +441,48 @@ impl Claim {
             }
         }
         let other = watch.around(roots, inside, &note).into_iter().next();
-        let roots = roots.iter().map(|root| root.to_path_buf()).collect();
-        let mut claim = Claim { watch: watch.clone(), name, notes: Arc::new(Mutex::new(Notes { roots, files, note })), _heartbeat: None };
+        let roots: Vec<PathBuf> = roots.iter().map(|root| root.to_path_buf()).collect();
+        let (quiet_files, files): (Vec<PathBuf>, Vec<PathBuf>) = files.into_iter().partition(|file| quiet.iter().any(|root| file.starts_with(root)));
+        let notes = |files| Notes { roots: roots.clone(), files, note: note.clone(), written: Instant::now() };
+        let mut claim =
+            Claim { watch: watch.clone(), name, notes: Arc::new(Mutex::new(notes(files))), quiet: Arc::new(Mutex::new(notes(quiet_files))), _heartbeat: None };
         if let Some(other) = other {
             return Err(other);
         }
-        claim._heartbeat = claim.beat();
+        if !lock(&claim.notes).files.is_empty() || !lock(&claim.quiet).files.is_empty() {
+            claim._heartbeat = claim.start_heartbeat();
+        }
         Ok(claim)
     }
 
-    /// Starts refreshing the notes now and then, on a thread of its own.
-    fn beat(&self) -> Option<Sender<()>> {
+    /// Refreshes the notes on drives kept quiet, once a heartbeat's time has passed since
+    /// they were last written. Called by the sync's own thread as it goes: between steps,
+    /// and between the pieces of a file it copies.
+    pub fn beat(&self) {
+        let mut quiet = lock(&self.quiet);
+        if !quiet.files.is_empty() && quiet.written.elapsed() >= HEARTBEAT {
+            quiet.refresh();
+        }
+    }
+
+    /// Starts refreshing the other notes now and then, on a thread of its own, and the notes
+    /// on drives kept quiet when the sync's own refresh is overdue. One the sync is writing
+    /// right then is left to it.
+    fn start_heartbeat(&self) -> Option<Sender<()>> {
         let (stop, stopped) = mpsc::channel::<()>();
-        let notes = self.notes.clone();
+        let (notes, quiet) = (self.notes.clone(), self.quiet.clone());
         let spawned = thread::Builder::new().name("charon-busy".into()).spawn(move || {
             while let Err(RecvTimeoutError::Timeout) = stopped.recv_timeout(HEARTBEAT) {
-                notes.lock().unwrap_or_else(|e| e.into_inner()).refresh();
+                lock(&notes).refresh();
+                let mut quiet = match quiet.try_lock() {
+                    Ok(quiet) => quiet,
+                    Err(TryLockError::Poisoned(e)) => e.into_inner(),
+                    Err(TryLockError::WouldBlock) => continue,
+                };
+                if !quiet.files.is_empty() && quiet.written.elapsed() >= QUIET_OVERDUE {
+                    log::info!("the sync is held up, so its busy notes on a drive kept quiet are refreshed from the heartbeat");
+                    quiet.refresh();
+                }
             }
         });
         match spawned {
@@ -442,9 +500,14 @@ impl Claim {
 impl Drop for Claim {
     fn drop(&mut self) {
         // Under the lock the heartbeat takes, so a refresh can't put a note back.
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).remove();
+        lock(&self.notes).remove();
+        lock(&self.quiet).remove();
         self.watch.hold(&self.name, false);
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Whether `folder` is there as a folder of its own, not a link to one.
@@ -721,6 +784,76 @@ mod tests {
         // Once its file stays the same, it counts for nothing, and it's left where it is.
         assert!(watch.around_at(&[tmp.path()], &[], &me, start + STALE_AFTER * 2).is_empty());
         assert!(file.exists());
+    }
+
+    /// The heartbeat of the one note in the Charon folder of `root`.
+    fn heartbeat_in(root: &Path) -> DateTime<Utc> {
+        match BusyWatch::in_folder(&root.join(MARKER_FOLDER)).as_slice() {
+            [(_, Seen::Note(note))] => note.heartbeat,
+            other => panic!("not one note in {}: {other:?}", root.display()),
+        }
+    }
+
+    fn until_changed(read: impl Fn() -> DateTime<Utc>, from: DateTime<Utc>, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while read() == from {
+            assert!(Instant::now() < deadline, "{what} was never refreshed");
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn notes_on_a_quiet_drive_are_refreshed_by_the_sync_itself_and_by_the_heartbeat_only_when_overdue() {
+        let (data, stick, home) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let watch = watch(data.path());
+        let inside = stick.path().join("photos");
+        fs::create_dir_all(inside.join(MARKER_FOLDER)).unwrap();
+        let taken = Instant::now();
+        let claim =
+            Claim::take_keeping_quiet(&watch, watch.note(&"job".into(), "Job"), &[stick.path(), home.path()], std::slice::from_ref(&inside), &[stick.path()]).unwrap();
+        let (first, at_home) = ((heartbeat_in(stick.path()), heartbeat_in(&inside)), heartbeat_in(home.path()));
+        // The heartbeat's own thread refreshes the note on the other drive, again and again,
+        // and leaves the ones on the quiet drive to the sync.
+        until_changed(|| heartbeat_in(home.path()), at_home, "the note at home");
+        thread::sleep(HEARTBEAT * 2);
+        let quiet_ones = (heartbeat_in(stick.path()), heartbeat_in(&inside));
+        // The sync's own beat refreshes them, once a heartbeat's time has passed.
+        let beaten = Instant::now();
+        claim.beat();
+        let (on_stick, inside_stick) = (heartbeat_in(stick.path()), heartbeat_in(&inside));
+        // Unless the runner was so slow that they went overdue by now: the heartbeat may then
+        // have refreshed them first, and which one did what can't be told.
+        if taken.elapsed() < QUIET_OVERDUE {
+            assert_eq!(quiet_ones, first);
+            assert!(on_stick > quiet_ones.0 && inside_stick > quiet_ones.1);
+            // A sync held up longer than that (a big file copied into its trash) doesn't let
+            // them go stale: the heartbeat refreshes them once the sync's refresh is overdue.
+            until_changed(|| heartbeat_in(stick.path()), on_stick, "the note on the stick");
+            // It holds them while it refreshes them all: once it lets go, it's done.
+            drop(lock(&claim.quiet));
+            assert!(beaten.elapsed() >= QUIET_OVERDUE, "not before it was overdue");
+            assert!(heartbeat_in(&inside) > inside_stick);
+        }
+        drop(claim);
+        assert_eq!(notes_in(stick.path()) + notes_in(&inside) + notes_in(home.path()), 0, "all of them go with the claim");
+    }
+
+    #[test]
+    fn a_beat_refreshes_the_quiet_notes_once_a_heartbeat_has_passed() {
+        let (data, stick) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let watch = watch(data.path());
+        let claim = Claim::take_keeping_quiet(&watch, watch.note(&"job".into(), "Job"), &[stick.path()], &[], &[stick.path()]).unwrap();
+        assert!(claim._heartbeat.is_some(), "the heartbeat stands by in case the sync is held up");
+        let first = heartbeat_in(stick.path());
+        // Called before a heartbeat's time has passed, a beat writes nothing.
+        let before = lock(&claim.quiet).written;
+        claim.beat();
+        if before.elapsed() < HEARTBEAT {
+            assert_eq!(heartbeat_in(stick.path()), first);
+        }
+        thread::sleep(HEARTBEAT);
+        claim.beat();
+        assert!(heartbeat_in(stick.path()) > first);
     }
 
     #[test]

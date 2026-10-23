@@ -11,6 +11,7 @@
 //! * `status.rs`   – turning a job and its live state into the row the window shows
 //! * `runtime.rs`  – the live state of each job (running, progress, last look, review)
 //! * `reach.rs`    – questions to the disk about the jobs' folders, with a time limit
+//! * `quiet.rs`    – drives run by a driver Apple didn't make, kept quiet while a sync writes
 //!
 //! `Engine` is cheap to clone; all clones share the same jobs. Locks are always taken in
 //! the same order, the stored state before the live state. Nothing that looks at a job's
@@ -24,6 +25,8 @@
 mod checks;
 mod jobs;
 mod overlaps;
+mod quiet;
+pub(crate) use quiet::AUTOPILOT_THREAD;
 pub(crate) mod reach;
 mod review;
 mod runs;
@@ -116,6 +119,8 @@ struct Inner {
     busy: Arc<BusyWatch>,
     /// Asks the disk about the jobs' folders, with a time limit.
     reach: Reach,
+    /// The drives kept quiet while a sync writes to them (see `quiet.rs`).
+    quiet: quiet::QuietDrives,
     /// When the last save of the state file failed, if it did (a full disk?): runs nobody
     /// looks at are refused until a save works again (see `can_save`), and a run the person
     /// starts fails before it changes anything. Its lock is taken last, and no other lock is
@@ -177,6 +182,7 @@ impl Engine {
                 opened: Instant::now(),
                 busy: Arc::new(BusyWatch::open(&folder.instances())),
                 reach: Reach::new(reach::LIMIT),
+                quiet: Default::default(),
                 cannot_save: Mutex::new(None),
                 legacy_seen,
                 older_charon: AtomicBool::new(false),

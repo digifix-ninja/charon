@@ -13,6 +13,7 @@
 use crate::engine::checks::ChangeAt;
 use crate::engine::runtime::{Moment, OwnWrites, Wanted, MISSING_FOR};
 use crate::engine::survey::{Purpose, Survey};
+use crate::engine::quiet::{Claimed, Quiet};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Folder, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
@@ -358,10 +359,10 @@ impl Engine {
         }
     }
 
-    /// Says in the job's log that its wanted run, which waited for `who` to finish syncing,
-    /// was called off, and why.
+    /// Says in the job's log that its wanted run, which waited for `who` (another sync, or
+    /// another job's look or list on the same drive), was called off, and why.
     fn note_wanted_called_off(&self, id: &JobId, who: &str, why: &str) {
-        self.inner.journal.info(id, &format!("the sync that waited for “{who}” to finish syncing was called off: {why}"));
+        self.inner.journal.info(id, &format!("the sync that waited for “{who}” was called off: {why}"));
     }
 
     /// Starts the job's wanted run, if it has one. While another sync uses the folders it
@@ -380,7 +381,7 @@ impl Engine {
             // sync keeps it waiting. One no longer wanted so has nothing to start: the next
             // tick starts what's wanted now.
             Ok(()) | Err(Error::Busy) | Err(Error::Cancelled) => {}
-            Err(Error::FoldersBusy(name)) => {
+            Err(Error::FoldersBusy(name)) | Err(Error::DriveBusy(name)) => {
                 // Only while it's still wanted: pausing may have dropped it meanwhile.
                 let changed = self.change_runtime(id, |rt| rt.wanted.is_some() && rt.waiting_for.replace(name.clone()) != Some(name.clone()));
                 if changed {
@@ -430,8 +431,8 @@ impl Engine {
                 engine.hold_back_recent_removals(&job, &mut survey, Moment::now());
                 match engine.claim_folders(&job, &survey) {
                     Ok(claim) => engine.cross(&job, &survey, &cancel, &crossing, claim),
-                    Err(who) => {
-                        engine.not_begun(&job, &crossing, &who);
+                    Err(busy) => {
+                        engine.not_begun(&job, &crossing, busy.waits_for().unwrap_or_default());
                     }
                 }
             }
@@ -472,7 +473,10 @@ impl Engine {
     /// everything paused, `check` (the caller's own conditions) passes, and no other sync is
     /// at work in its folders: no running job of this Charon by their paths, and no sync of
     /// this or another Charon by its busy notes (see `run::Claim`; the run leaves its own
-    /// notes before it changes anything).
+    /// notes before it changes anything). Nor is another job at work on a drive of its folders
+    /// that's run by an add-on driver (see `quiet.rs`): its run, a list being made for it, or
+    /// for a run nobody asked for, a look of it in the background. A run the person asked for
+    /// stops such a look instead.
     pub(crate) fn begin_run(
         &self,
         id: &JobId,
@@ -482,9 +486,18 @@ impl Engine {
         if self.older_charon_running() {
             return Err(Error::Invalid(OLDER_CHARON.into()));
         }
-        // Both ask the disk, so they come before any lock is taken.
-        let neighbours = self.neighbours(id);
-        let in_use = self.folders_in_use(id);
+        // Both ask the disk, so they come before any lock is taken. Not while another job
+        // uses a drive of the folders that's run by an add-on driver: nothing is asked of it
+        // then, not even the busy notes on it, and the run waits for that job (below, after
+        // the caller's checks, so a list that can't go ahead anyway is refused now). A run a
+        // trigger started waits for a look in the background there too: stopping it every
+        // time could keep that job from ever being looked at.
+        let unasked = !crossing.by_hand && !crossing.approved;
+        let drive_used = self.drive_used_by_another(id, unasked);
+        let (neighbours, in_use) = match drive_used {
+            Some(_) => (Neighbours { mine: Self::nowhere(), others: HashMap::new() }, None),
+            None => (self.neighbours(id), self.folders_in_use(id)),
+        };
         let state = self.state();
         let job = state.jobs.iter().find(|job| &job.id == id).cloned().ok_or_else(|| Error::UnknownJob(id.clone()))?;
         let mut runtime = self.runtime();
@@ -500,9 +513,13 @@ impl Engine {
             return Err(Error::Invalid(PAUSED.into()));
         }
         check(&job, runtime.entry(id.clone()).or_default())?;
+        if let Some(name) = drive_used.or_else(|| self.drive_used_among(&state.jobs, &runtime, &job, unasked)) {
+            return Err(Error::DriveBusy(name));
+        }
         if let Some(name) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
             return Err(Error::FoldersBusy(name));
         }
+        self.stop_looks_sharing_a_drive(&state.jobs, &mut runtime, &job);
         let rt = runtime.entry(id.clone()).or_default();
         let cancel = Arc::new(AtomicBool::new(false));
         rt.cancel = Some(cancel.clone());
@@ -522,9 +539,14 @@ impl Engine {
 
     /// Who else is at work in the job's folders by their busy notes, if anyone: a job of
     /// this Charon whose folders are the same place under other names, or another Charon
-    /// (asks the disk; done before locking).
+    /// (asks the disk; done before locking). Not asked while another job's sync keeps a drive
+    /// of the folders quiet (see `quiet.rs`): the run or the list that asks waits for that job
+    /// anyway, and a sync's claim reads the notes again before it changes anything.
     pub(crate) fn folders_in_use(&self, id: &JobId) -> Option<String> {
         let job = self.stored_job(id).ok()?;
+        if self.kept_quiet_by_another(&job).is_some() {
+            return None;
+        }
         let inside = self.runtime().get(id).map(|rt| rt.folders_inside.clone()).unwrap_or_default();
         let me = self.inner.busy.note(id, &job.setup.name);
         self.inner.busy.around(&[&job.setup.source, &job.setup.destination], &inside, &me).first().map(|note| self.busy_with(note))
@@ -532,11 +554,17 @@ impl Engine {
 
     /// Leaves the run's busy notes in the job's folders and in the Charon folders inside them
     /// (see `run::Claim`), unless another sync is at work there or in the folders above and
-    /// inside them: then it says who.
-    pub(crate) fn claim_folders(&self, job: &Job, survey: &Survey) -> std::result::Result<Claim, String> {
+    /// inside them (`Error::FoldersBusy`, saying who). The drives of its folders that are run
+    /// by an add-on driver are kept quiet first, unless another job's sync keeps one of them
+    /// quiet already (`Error::DriveBusy`; see `quiet.rs`).
+    pub(crate) fn claim_folders(&self, job: &Job, survey: &Survey) -> Result<Claimed> {
+        let quiet = self.keep_quiet(job, survey)?;
         let inside = Self::folders_inside_now(survey);
         let note = self.inner.busy.note(&job.id, &job.setup.name);
-        Claim::take(&self.inner.busy, note, &[&survey.setup.source, &survey.setup.destination], &inside).map_err(|other| self.busy_with(&other))
+        let roots = [survey.setup.source.as_path(), survey.setup.destination.as_path()];
+        let notes = Claim::take_keeping_quiet(&self.inner.busy, note, &roots, &inside, &quiet.as_ref().map(Quiet::roots).unwrap_or_default())
+            .map_err(|other| Error::FoldersBusy(self.busy_with(&other)))?;
+        Ok(Claimed::new(notes, quiet))
     }
 
     /// The folders inside the job's folders where the scans met Charon's own folder.
@@ -624,7 +652,7 @@ impl Engine {
             return false;
         }
         if !crossing.approved {
-            self.inner.journal.info(id, &format!("waits for “{who}” to finish syncing these folders"));
+            self.inner.journal.info(id, &format!("waits for “{who}” to finish syncing"));
         }
         self.publish(id);
         true
@@ -769,8 +797,10 @@ impl Engine {
 
     /// Carries out the plan of `survey`, makes it durable and records it. Runs on the
     /// job's sync thread, with the job marked as running and its folders claimed (`claim`,
-    /// given up before the run's end is announced, so a sync waiting for it can start).
-    pub(crate) fn cross(&self, job: &Job, survey: &Survey, cancel: &AtomicBool, crossing: &Crossing, claim: Claim) {
+    /// given up before the run's end is announced, so a sync waiting for it can start). The
+    /// busy notes on drives kept quiet are refreshed as it goes, between steps and between
+    /// the pieces of a file it copies (see `quiet.rs`).
+    pub(crate) fn cross(&self, job: &Job, survey: &Survey, cancel: &AtomicBool, crossing: &Crossing, claim: Claimed) {
         let id = &job.id;
         let journal = &self.inner.journal;
         let started_at = Utc::now();
@@ -782,8 +812,9 @@ impl Engine {
         // Until this run is recorded, the job's record says files are being carried.
         if let Err(e) = self.change_job(id, |job| job.run_in_progress = true) {
             summary.error = Some(format!("Charon couldn't save its state before syncing ({e}), so it changed nothing."));
+            let unwatched_since = claim.unwatched_since();
             drop(claim);
-            self.finish(job, survey, crossing, summary, None);
+            self.finish(job, survey, crossing, summary, None, unwatched_since);
             return;
         }
 
@@ -791,7 +822,10 @@ impl Engine {
         let resolving = crossing.kind == ReviewKind::Resolve;
         let shores = Shores { source: survey.setup.source.clone(), destination: survey.setup.destination.clone() };
         let care = Care { safe_delete: survey.setup.safe_delete || resolving, keep_replaced: two_way || resolving, two_way };
-        let observer = |progress: &Progress| self.report_progress(id, progress);
+        let observer = |progress: &Progress| {
+            claim.beat();
+            self.report_progress(id, progress)
+        };
         let mut meter = ProgressMeter::for_plan(&survey.plan, &observer);
         // An item a step makes under a name the plan doesn't have (a conflict copy) is this
         // run's own write from right before it's made: a change the folder watcher hears
@@ -812,9 +846,11 @@ impl Engine {
         let mut tidied = 0;
         if complete {
             for (side, leftovers) in &survey.housekeeping.leftovers {
+                claim.beat();
                 tidied += executor.tidy(*side, leftovers);
             }
         }
+        claim.beat();
         let flushed = executor.flush(&mut outcome);
         // Old trash goes only after a list that said so was confirmed. A run nobody looked at
         // never empties it: the originals in there may be the only good copies of files a
@@ -823,10 +859,12 @@ impl Engine {
         if complete && flushed.is_ok() && crossing.approved {
             let days = self.settings().trash_days;
             for (side, look) in &survey.housekeeping.trash {
+                claim.beat();
                 let names: Vec<String> = look.expired.iter().map(|e| e.name.clone()).collect();
                 Trash::sweep(survey.setup.root(*side), &names, days, survey.snapshot(*side).shifts_times());
             }
         }
+        claim.beat();
 
         summary.copied = outcome.copied;
         summary.deleted = outcome.deleted;
@@ -942,8 +980,9 @@ impl Engine {
             _ => None,
         };
         let left = !outcome.failed.is_empty() || !outcome.skipped.is_empty() || !outcome.waited.is_empty() || !outcome.left_out.is_empty() || !unread.is_empty();
+        let unwatched_since = claim.unwatched_since();
         drop(claim);
-        self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left, unread }));
+        self.finish(job, survey, crossing, summary, Some(Recorded { recorded, drives, destroyed: outcome.destroyed, left, unread }), unwatched_since);
     }
 
     /// The conflicts this run settled by Newest wins, with the side the newer version was
@@ -1118,7 +1157,17 @@ impl Engine {
     }
 
     /// Records the end of a run: the job's record, the log, the live state, and the window.
-    fn finish(&self, job: &Job, survey: &Survey, crossing: &Crossing, mut summary: RunSummary, recorded: Option<Recorded>) {
+    /// `unwatched_since`: when the run began to keep a drive of the folders quiet, if it did
+    /// (see `quiet.rs`).
+    fn finish(
+        &self,
+        job: &Job,
+        survey: &Survey,
+        crossing: &Crossing,
+        mut summary: RunSummary,
+        recorded: Option<Recorded>,
+        unwatched_since: Option<Instant>,
+    ) {
         let id = &job.id;
         // A Stop from the person means something looked wrong: the next sync waits for an
         // OK. A run stopped only because Charon quit carries on as before next time.
@@ -1275,11 +1324,13 @@ impl Engine {
             // After a stopped run, a confirmed run that left something, or a run whose plan the
             // folders outgrew, look again at once, so the row shows what's still waiting. Runs
             // by themselves wait for the regular look otherwise: a file that fails every time
-            // mustn't start a run every few seconds.
+            // mustn't start a run every few seconds. That look counts from when the folders on
+            // a drive the run kept quiet stopped being watched: what changed there since,
+            // besides the run's own items, wasn't heard.
             if summary.cancelled || outdated || (crossing.approved && (left || summary.error.is_some())) {
                 rt.last_checked = None;
             } else {
-                rt.last_checked = Some(Instant::now());
+                rt.last_checked = Some(unwatched_since.unwrap_or_else(Instant::now));
             }
         });
         self.emit(EngineEvent::Finished(Finished { id: id.clone(), name: job.setup.name.clone(), summary }));
@@ -1348,7 +1399,7 @@ impl Engine {
             e => summary.error = Some(e.to_string()),
         }
         let empty = Survey::empty(job);
-        self.finish(job, &empty, crossing, summary, None);
+        self.finish(job, &empty, crossing, summary, None, None);
     }
 
     /// Holds back a run nobody looked at: nothing is touched, and the job waits for the

@@ -2,19 +2,20 @@
 
 use crate::engine::{Engine, EngineEvent};
 use crate::error::{Error, Result};
-use crate::model::{Job, JobId, JobSetup, JobView, SyncMode};
+use crate::model::{Folder, Job, JobId, JobSetup, JobView, SyncMode};
 use crate::plan::Side;
 use crate::run::Marker;
 use crate::scan::ExcludeFilter;
 use std::collections::BTreeMap;
+use std::path::Path;
 
 impl Engine {
     /// Adds a job and looks at what it would do. Its first sync always waits for the
     /// person's OK.
     pub fn add_job(&self, mut setup: JobSetup) -> Result<JobView> {
-        setup.validate()?;
+        self.resolving_for_saving(|resolve| setup.validate_as(resolve))??;
         ExcludeFilter::check(&setup.excludes)?;
-        let overlap = Overlap::of(&setup, &self.job_list(), None);
+        let overlap = self.overlap_of(&setup, &self.job_list(), None)?;
         let job = Job::new(setup);
         let id = job.id.clone();
         let automation = job.setup.full_automation;
@@ -39,12 +40,12 @@ impl Engine {
     /// makes the next sync wait for the person's OK; new folders or a new mode also make
     /// Charon forget what it remembers of the last sync.
     pub fn update_job(&self, id: &JobId, mut setup: JobSetup) -> Result<JobView> {
-        setup.validate()?;
+        self.resolving_for_saving(|resolve| setup.validate_as(resolve))??;
         ExcludeFilter::check(&setup.excludes)?;
         let (name, overlap) = {
             let jobs = self.job_list();
             let job = jobs.iter().find(|job| &job.id == id).ok_or_else(|| Error::UnknownJob(id.clone()))?;
-            (job.setup.name.clone(), Overlap::of(&setup, &jobs, Some(id)))
+            (job.setup.name.clone(), self.overlap_of(&setup, &jobs, Some(id))?)
         };
 
         // The setup it replaces is read where it's replaced, so two quick edits in a row
@@ -149,7 +150,7 @@ impl Engine {
         let mut setup = original.setup.clone();
         setup.name = format!("{} copy", setup.name);
         setup.full_automation = false;
-        let overlap = Overlap::of(&setup, &jobs, None);
+        let overlap = self.overlap_of(&setup, &jobs, None)?;
         let mut job = Job::new(setup);
         job.paused = true;
         let new_id = job.id.clone();
@@ -192,6 +193,14 @@ impl Engine {
             let name = job.setup.name.clone();
             (job, name)
         };
+        // Removing it takes Charon's marker out of its folders: not on a drive run by an
+        // add-on driver that another job's run or list uses right now (see `quiet.rs`). A
+        // look in the background there doesn't hold it up: that only reads.
+        if let Some(other) = self.drive_used_by_another(id, false) {
+            return Err(Error::Invalid(format!(
+                "“{other}” is using the same drive right now. Its driver isn't Apple's own, so Charon works on one job at a time there. Remove “{name}” once it's done."
+            )));
+        }
         self.with_job_at_rest(
             id,
             &format!("Stop “{name}” first, then remove it."),
@@ -296,11 +305,40 @@ struct Overlap {
 /// What a clash depends on: a job's folders and its mode.
 type Reach = (std::path::PathBuf, std::path::PathBuf, SyncMode);
 
+impl Engine {
+    /// Checks `setup` against every job in `jobs` but `edited` (see `Overlap`), asking about
+    /// folders on a drive a sync keeps quiet only what's known (see `resolving_for_saving`).
+    fn overlap_of(&self, setup: &JobSetup, jobs: &[Job], edited: Option<&JobId>) -> Result<Overlap> {
+        self.resolving_for_saving(|resolve| Overlap::of(setup, jobs, edited, resolve))
+    }
+
+    /// Runs `work` with folders resolved for saving a job: from the disk, but as last found
+    /// for those on a drive a sync keeps quiet (see `folders_for_saving`). One of those that
+    /// was never found can't be compared with anything, so the save waits for that sync.
+    fn resolving_for_saving<T>(&self, work: impl FnOnce(&dyn Fn(&[&Path]) -> Vec<Option<Folder>>) -> T) -> Result<T> {
+        let unknown = std::cell::RefCell::new(None);
+        let resolve = |paths: &[&Path]| {
+            self.folders_for_saving(paths).unwrap_or_else(|name| {
+                unknown.borrow_mut().get_or_insert(name);
+                vec![None; paths.len()]
+            })
+        };
+        let done = work(&resolve);
+        match unknown.into_inner() {
+            Some(name) => Err(Error::Invalid(format!(
+                "“{name}” is syncing on the same drive right now, and Charon leaves that drive to it. Save this job once it's done."
+            ))),
+            None => Ok(done),
+        }
+    }
+}
+
 impl Overlap {
-    /// Checks `setup` against every job in `jobs` but `edited`.
-    fn of(setup: &JobSetup, jobs: &[Job], edited: Option<&JobId>) -> Self {
+    /// Checks `setup` against every job in `jobs` but `edited`, with each folder as
+    /// `resolve` finds it (see `JobSetup::clashes_as`).
+    fn of(setup: &JobSetup, jobs: &[Job], edited: Option<&JobId>, resolve: impl Fn(&[&Path]) -> Vec<Option<Folder>>) -> Self {
         let others: Vec<&Job> = jobs.iter().filter(|job| Some(&job.id) != edited).collect();
-        let clash = others.iter().find(|other| setup.clashes_with(&other.setup)).map(|other| other.setup.name.clone());
+        let clash = others.iter().find(|other| setup.clashes_as(&other.setup, &resolve)).map(|other| other.setup.name.clone());
         Self { edited: edited.cloned(), others: others.into_iter().map(|job| (job.id.clone(), Self::reach(&job.setup))).collect(), clash }
     }
 

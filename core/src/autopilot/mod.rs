@@ -98,7 +98,7 @@ pub struct Autopilot {
 impl Autopilot {
     /// Starts the autopilot on its own thread. It runs until the app quits.
     pub fn start(engine: Engine) {
-        let spawned = thread::Builder::new().name("charon-autopilot".into()).spawn(move || {
+        let spawned = thread::Builder::new().name(crate::engine::AUTOPILOT_THREAD.into()).spawn(move || {
             let (sender, changes) = mpsc::channel();
             let watcher = FolderWatcher::new(sender)
                 .map_err(|e| log::error!("folder watching is unavailable: {e}"))
@@ -197,6 +197,10 @@ impl Autopilot {
             if self.confirmed_tried.get(id).is_none_or(|tried| tried.elapsed() >= CONFIRMED_RETRY) {
                 self.confirmed_tried.insert(id.clone(), Instant::now());
                 if self.engine.start_confirmed(id) {
+                    // Its sync may be waiting for the folder watcher to stop watching a drive
+                    // it keeps quiet before it writes there (see `engine::quiet`): that needn't
+                    // wait for the next tick.
+                    self.follow_folders(&jobs, &whereabouts);
                     continue;
                 }
             }
@@ -308,19 +312,36 @@ impl Autopilot {
         self.engine.start_wanted(id);
     }
 
-    /// Watches the folders of every job that are there (as `whereabouts` found them). Each
-    /// folder is known by its path as the job names it and as it really is (a link
-    /// resolved), since some systems report changes under the real path.
+    /// Watches the folders of every job that are there (as `whereabouts` found them), but not
+    /// those on a drive a sync keeps quiet (see `routes`).
     fn follow_folders(&mut self, jobs: &[Job], whereabouts: &[Whereabouts]) {
-        let Some(watcher) = self.watcher.as_mut() else { return };
+        if self.watcher.is_none() {
+            return;
+        }
+        let keeps = self.engine.quiet_keeps();
+        let routes = self.routes(jobs, whereabouts);
+        if let Some(watcher) = self.watcher.as_mut() {
+            watcher.follow(routes);
+        }
+        // A sync that keeps a drive quiet waits for this before it writes there.
+        self.engine.quiet_followed(keeps);
+    }
+
+    /// The folders to watch: every job's folders that are there (as `whereabouts` found them).
+    /// Each folder is known by its path as the job names it and as it really is (a link
+    /// resolved), since some systems report changes under the real path. A folder on a drive a
+    /// sync keeps quiet isn't watched until the sync is done: watching it has the system work
+    /// on the drive for Charon too (see `engine::quiet`). What changes there meanwhile isn't
+    /// heard; the regular look finds it.
+    fn routes(&mut self, jobs: &[Job], whereabouts: &[Whereabouts]) -> Vec<Route> {
         let mut routes: Vec<Route> = Vec::new();
         let mut real = HashMap::new();
         for (job, found) in jobs.iter().zip(whereabouts) {
             for side in [Side::Source, Side::Destination] {
-                if !found.side(side).is_there() {
+                let root = job.setup.root(side).to_path_buf();
+                if !found.side(side).is_there() || self.engine.kept_quiet(&root) {
                     continue;
                 }
-                let root = job.setup.root(side).to_path_buf();
                 // Resolved again only for a folder that just came (back), not every second.
                 // One that doesn't answer in time is watched from a later tick on.
                 let resolved = match self.real_roots.remove(&root) {
@@ -335,7 +356,7 @@ impl Autopilot {
             }
         }
         self.real_roots = real;
-        watcher.follow(routes);
+        routes
     }
 
     /// Notes which jobs saw changes that matter, leaving out changes to excluded items, and
@@ -370,6 +391,7 @@ mod tests {
     use super::*;
     use crate::engine::EngineEvent;
     use crate::model::{ConflictRule, JobSetup, Phase, SyncMode};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::Path;
     use std::sync::mpsc::Sender;
@@ -402,6 +424,98 @@ mod tests {
             assert!(Instant::now() < deadline, "{what} took too long");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// Two jobs back up into folders on a stick run by an add-on driver, "Documents" and
+    /// "Photos", and "Notes" from one folder of this computer's own disk to another. Returns
+    /// the engine, the jobs, and the folders on the stick.
+    fn jobs_on_a_stick(tmp: &Path) -> (Engine, crate::scan::pretend::AddOnDrive, [JobId; 3], [PathBuf; 2]) {
+        let (home, stick) = (tmp.join("home"), tmp.join("stick"));
+        let pretending = crate::scan::pretend::AddOnDrive::at(&stick);
+        let engine = Engine::open(tmp.join("data"), Arc::new(|_| {})).unwrap();
+        let add = |name: &str, source: PathBuf, destination: PathBuf| {
+            fs::create_dir_all(&source).unwrap();
+            fs::create_dir_all(&destination).unwrap();
+            fs::write(source.join("a.txt"), "a").unwrap();
+            let setup = JobSetup {
+                name: name.into(),
+                source,
+                destination: destination.clone(),
+                mode: SyncMode::Backup,
+                conflict: ConflictRule::Ask,
+                trigger: Trigger::Manual,
+                excludes: vec![],
+                safe_delete: true,
+                full_automation: false,
+            };
+            (engine.add_job(setup).unwrap().job.id, destination)
+        };
+        let (documents, docs_on_stick) = add("Documents", home.join("docs"), stick.join("docs"));
+        let (photos, photos_on_stick) = add("Photos", home.join("photos"), stick.join("photos"));
+        let (notes, _) = add("Notes", home.join("notes"), home.join("copies"));
+        (engine, pretending, [documents, photos, notes], [docs_on_stick, photos_on_stick])
+    }
+
+    #[test]
+    fn folders_on_a_drive_kept_quiet_arent_watched_until_it_is_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, photos, notes], [docs_on_stick, photos_on_stick]) = jobs_on_a_stick(tmp.path());
+        let (mut pilot, _changes) = pilot(&engine);
+        let jobs = engine.job_list();
+        let mut watched = || pilot.routes(&jobs, &engine.whereabouts_of(&jobs)).iter().map(|route| route.root().to_path_buf()).collect::<HashSet<_>>();
+        let all = watched();
+        assert_eq!(all.len(), 6, "every folder is watched");
+        // A list of Photos waits for the person's OK while Documents syncs.
+        let list = engine.prepare_review(&photos).unwrap();
+
+        let held = engine.hold_a_sync(&documents).unwrap();
+        let while_held = watched();
+        assert!(!while_held.contains(&docs_on_stick) && !while_held.contains(&photos_on_stick), "nothing on the stick is watched");
+        assert_eq!(while_held.len(), 4, "the folders elsewhere still are");
+        for id in [&photos, &notes] {
+            engine.just_looked_at(id);
+        }
+
+        drop(held);
+        assert_eq!(watched(), all, "watched again once the sync is done");
+        // What changed on the stick meanwhile wasn't heard. The regular look finds it, as on a
+        // network share: nothing is looked at, started or refused for it now.
+        for id in [&photos, &notes] {
+            assert!(!engine.check_due(id, Duration::from_secs(3600)), "not looked at again at once");
+        }
+        assert!(!engine.list_is_stale(&photos, &list.review_id), "the list of Photos can still be confirmed");
+        pilot.collect_changes();
+        assert!(pilot.changed.is_empty(), "nothing counts as a change heard");
+    }
+
+    #[test]
+    fn a_tick_lets_a_sync_that_keeps_a_drive_quiet_go_ahead() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, ..], [docs_on_stick, _]) = jobs_on_a_stick(tmp.path());
+        let (mut pilot, _changes) = pilot(&engine);
+        let (sender, changes) = mpsc::channel();
+        pilot.watcher = Some(FolderWatcher::new(sender).unwrap());
+        pilot.changes = changes;
+        pilot.tick();
+        let syncing = {
+            let engine = engine.clone();
+            thread::spawn(move || {
+                let started = Instant::now();
+                let held = engine.hold_a_sync(&documents).unwrap();
+                let waited = started.elapsed();
+                drop(held);
+                waited
+            })
+        };
+        // The sync waits for the folder watcher to stop watching the stick, and the next tick
+        // does, and says so: the sync doesn't wait out its time limit.
+        until("the sync's keep", || engine.kept_quiet(&docs_on_stick) || syncing.is_finished());
+        while !syncing.is_finished() {
+            pilot.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let waited = syncing.join().unwrap();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
     }
 
     /// A two-way job with full automation that syncs once changes have settled for

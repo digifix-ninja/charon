@@ -8,10 +8,11 @@
 //! job's folders waits for that sync, and is carried out as soon as it's done (unless the
 //! job changed, synced, or a drive was swapped meanwhile: then the row says why it wasn't).
 
+use crate::engine::quiet::Claimed;
 use crate::engine::runs::Crossing;
-use crate::engine::runtime::Confirmed;
+use crate::engine::runtime::{Confirmed, JobRuntime};
 use crate::engine::survey::{Purpose, Survey};
-use crate::engine::{Engine, Look};
+use crate::engine::{Engine, Look, AUTOPILOT_THREAD};
 use crate::error::{Error, Result};
 use crate::model::{
     Cluster, ConflictChoice, ConflictItem, JobId, Level, ReviewKind, Review, ReviewNote, ReviewStep, Shore, StepFilter, StepKind,
@@ -25,6 +26,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread;
 use std::time::Instant;
 
 /// How long a list can be confirmed after it was made.
@@ -47,6 +49,9 @@ pub(crate) struct StoredReview {
     pub expires_at: DateTime<Utc>,
     /// Something changed in the folders after the list was made.
     pub stale: AtomicBool,
+    /// Some of its folders weren't watched for a while after it was made (another job's sync
+    /// kept their drive quiet, see `quiet.rs`): what changed there meanwhile wasn't heard.
+    pub unheard: AtomicBool,
     /// When the job's last run had finished when the list was made.
     pub runs_seen: Option<DateTime<Utc>>,
     pub steps: Vec<ReviewStep>,
@@ -180,7 +185,7 @@ impl Engine {
         let confirmed = Confirmed { review_id: review_id.to_string(), acknowledged, pauses: self.pauses() };
         match self.carry_out(id, &confirmed, false) {
             Ok(()) => Ok(Approval::Started),
-            Err(Error::FoldersBusy(who)) => self.queue_confirmed(id, confirmed, &who),
+            Err(Error::FoldersBusy(who)) | Err(Error::DriveBusy(who)) => self.queue_confirmed(id, confirmed, &who),
             Err(e) => Err(e),
         }
     }
@@ -196,7 +201,7 @@ impl Engine {
         let Some(confirmed) = self.runtime().get(id).and_then(|rt| rt.confirmed.clone()) else { return false };
         match self.carry_out(id, &confirmed, true) {
             Ok(()) => true,
-            Err(Error::FoldersBusy(who)) => {
+            Err(Error::FoldersBusy(who)) | Err(Error::DriveBusy(who)) => {
                 self.keep_waiting(id, &confirmed, who);
                 false
             }
@@ -235,16 +240,16 @@ impl Engine {
         });
         match outcome {
             Some((true, false)) => {
-                self.inner.journal.info(id, &format!("confirmed by you; waits for “{who}” to finish syncing these folders"));
+                self.inner.journal.info(id, &format!("confirmed by you; waits until “{who}” is done"));
                 self.publish(id);
                 Ok(Approval::Waiting { waiting_for: who.to_string() })
             }
             Some((true, true)) => {
-                self.inner.journal.info(id, &format!("confirmed by you, then called off: you paused everything while “{who}” was syncing these folders"));
+                self.inner.journal.info(id, &format!("confirmed by you, then called off: you paused everything while it waited for “{who}”"));
                 // The window lets a list go once Rust refused it, and only offers to look again.
                 Err(Error::Invalid(format!(
-                    "You paused everything just as this list was about to start, and “{who}” is still syncing these folders, so the list doesn't wait for it. \
-                     Look again once that sync is done."
+                    "You paused everything just as this list was about to start, and “{who}” isn't done yet, so the list doesn't wait for it. \
+                     Look again once it's done."
                 )))
             }
             // The list was replaced or closed in between.
@@ -323,6 +328,42 @@ impl Engine {
     fn carry_out(&self, id: &JobId, confirmed: &Confirmed, waited: bool) -> Result<()> {
         let (review_id, acknowledged) = (confirmed.review_id.as_str(), confirmed.acknowledged);
         let review = self.stored_review(id, review_id)?;
+        let list_checks = |job: &crate::model::Job, rt: &mut JobRuntime| {
+            // Stopped, paused or edited while it waited: the person called it off, even if
+            // that came after `start_confirmed` picked it up.
+            if waited && !rt.confirmed.as_ref().is_some_and(|confirmed| confirmed.review_id == review_id) {
+                return Err(Error::Cancelled);
+            }
+            let current = rt.review.as_ref().filter(|r| r.id == review_id).ok_or_else(Self::gone)?;
+            if !waited && Utc::now() > current.expires_at {
+                return Err(Error::ReviewOutdated(format!("This list was made more than {VALID_FOR_MINUTES} minutes ago. Look again.")));
+            }
+            if !waited && current.stale.load(Ordering::Relaxed) {
+                return Err(Error::ReviewOutdated("Things changed in the folders since this list was made. Look again.".into()));
+            }
+            if job.setup != current.survey.setup {
+                return Err(Error::ReviewOutdated("The job's settings changed since this list was made. Look again.".into()));
+            }
+            if job.last_run.as_ref().map(|run| run.finished_at) != current.runs_seen {
+                return Err(Error::ReviewOutdated("The job synced since this list was made. Look again.".into()));
+            }
+            if let Some(blocked) = &current.blocked {
+                return Err(Error::Invalid(blocked.clone()));
+            }
+            if current.needs_tick && !acknowledged {
+                let tick = if current.steps.is_empty() { "I've read the warnings above" } else { "I've looked at the removals and replacements" };
+                return Err(Error::Invalid(format!("Tick “{tick}” first.")));
+            }
+            Ok(())
+        };
+        // While another job uses a drive of the folders that's run by an add-on driver,
+        // nothing is read there (see `quiet.rs`): the list waits for that job once its own
+        // checks pass, and its folders are looked at when it starts.
+        if let Some(name) = self.drive_used_by_another(id, false) {
+            let job = self.stored_job(id)?;
+            list_checks(&job, self.runtime().entry(id.clone()).or_default())?;
+            return Err(Error::DriveBusy(name));
+        }
         // The folders must still be the very folders the list was made from.
         for side in [Side::Source, Side::Destination] {
             let root = review.survey.setup.root(side);
@@ -357,60 +398,59 @@ impl Engine {
         }
         let mut crossing =
             Crossing { kind: review.kind, approved: true, by_hand: true, reason, resolving: review.resolving.clone(), outdated: false };
-        let (job, cancel) = self.begin_run(id, &crossing, |job, rt| {
-            // Stopped, paused or edited while it waited: the person called it off, even if
-            // that came after `start_confirmed` picked it up.
-            if waited && !rt.confirmed.as_ref().is_some_and(|confirmed| confirmed.review_id == review_id) {
-                return Err(Error::Cancelled);
-            }
-            let current = rt.review.as_ref().filter(|r| r.id == review_id).ok_or_else(Self::gone)?;
-            if !waited && Utc::now() > current.expires_at {
-                return Err(Error::ReviewOutdated(format!("This list was made more than {VALID_FOR_MINUTES} minutes ago. Look again.")));
-            }
-            if !waited && current.stale.load(Ordering::Relaxed) {
-                return Err(Error::ReviewOutdated("Things changed in the folders since this list was made. Look again.".into()));
-            }
-            if job.setup != current.survey.setup {
-                return Err(Error::ReviewOutdated("The job's settings changed since this list was made. Look again.".into()));
-            }
-            if job.last_run.as_ref().map(|run| run.finished_at) != current.runs_seen {
-                return Err(Error::ReviewOutdated("The job synced since this list was made. Look again.".into()));
-            }
-            if let Some(blocked) = &current.blocked {
-                return Err(Error::Invalid(blocked.clone()));
-            }
-            if current.needs_tick && !acknowledged {
-                let tick = if current.steps.is_empty() { "I've read the warnings above" } else { "I've looked at the removals and replacements" };
-                return Err(Error::Invalid(format!("Tick “{tick}” first.")));
-            }
-            Ok(())
-        })?;
+        let (job, cancel) = self.begin_run(id, &crossing, list_checks)?;
         // A list that waited is older than the folders: the sync it waited for changed them,
         // and Charon may not have heard of it (nobody hears what another computer writes to a
-        // network share). Those changes didn't count against the list, and aren't in it: once
-        // it's done, the folders are looked at again.
-        crossing.outdated = waited;
+        // network share). Nor is what changed in folders that weren't watched while another
+        // job's sync kept their drive quiet. Those changes didn't count against the list, and
+        // aren't in it: once it's done, the folders are looked at again.
+        crossing.outdated = waited || review.unheard.load(Ordering::Relaxed);
         #[cfg(test)]
         tests::before_the_claim();
-        // The run's busy notes go into the folders before anything changes there, and before
-        // the person is told it started.
-        let claim = match self.claim_folders(&job, &review.survey) {
+        if thread::current().name() == Some(AUTOPILOT_THREAD) {
+            // Tried again by the autopilot: the sync claims its folders on its own thread. There
+            // it waits for the autopilot to stop watching a drive it keeps quiet before it
+            // leaves its notes there (see `keep_quiet`); the autopilot can't wait for itself.
+            let confirmed = confirmed.clone();
+            return self.spawn_crossing(job, cancel, crossing, move |engine, job, cancel, crossing| {
+                match engine.claim_for_list(&job, &review, &crossing, &confirmed, waited) {
+                    Ok(claim) => {
+                        engine.publish(&job.id);
+                        engine.take_review(&job.id, &review.id);
+                        engine.cross(&job, &review.survey, &cancel, &crossing, claim);
+                    }
+                    Err(Error::FoldersBusy(who)) | Err(Error::DriveBusy(who)) => engine.keep_waiting(&job.id, &confirmed, who),
+                    Err(_) => {}
+                }
+            });
+        }
+        let claim = self.claim_for_list(&job, &review, &crossing, confirmed, waited)?;
+        self.publish(id);
+        self.spawn_crossing(job, cancel, crossing, move |engine, job, cancel, crossing| {
+            engine.take_review(&job.id, &review.id);
+            engine.cross(&job, &review.survey, &cancel, &crossing, claim);
+        })
+    }
+
+    /// Claims the folders for the sync of a confirmed list, marked as running (see
+    /// `claim_folders`): its busy notes go into the folders before anything changes there, and
+    /// before the person is told it started. Another sync at work there ends the run before it
+    /// began (`Error::FoldersBusy` or `Error::DriveBusy`: the list waits for it), unless the
+    /// person stopped it meanwhile (`Error::Cancelled`).
+    fn claim_for_list(&self, job: &crate::model::Job, review: &StoredReview, crossing: &Crossing, confirmed: &Confirmed, waited: bool) -> Result<Claimed> {
+        let claim = match self.claim_folders(job, &review.survey) {
             Ok(claim) => claim,
-            Err(who) => return Err(if self.not_begun(&job, &crossing, &who) { Error::FoldersBusy(who) } else { Error::Cancelled }),
+            Err(busy) => return Err(if self.not_begun(job, crossing, busy.waits_for().unwrap_or_default()) { busy } else { Error::Cancelled }),
         };
         // Pausing everything calls off a list that waits, even one whose sync was about to start
         // when the person paused: that pause found the job marked as running, and left it to
         // here. From here on, the sync is at work, and goes on.
         if waited && self.paused_since(confirmed) {
             drop(claim);
-            self.call_off_as_it_starts(&job, &crossing, confirmed);
+            self.call_off_as_it_starts(job, crossing, confirmed);
             return Err(Error::Cancelled);
         }
-        self.publish(id);
-        self.spawn_crossing(job, cancel, crossing, move |engine, job, cancel, crossing| {
-            engine.take_review(&job.id, &review.id);
-            engine.cross(&job, &review.survey, &cancel, &crossing, claim);
-        })
+        Ok(claim)
     }
 
     /// Prepares the list that settles one conflict the way the person chose. Nothing
@@ -473,6 +513,12 @@ impl Engine {
     /// Marks a look (a review being prepared) as started, if the job isn't busy. Returns the
     /// job, the look's stop flag, and the job's epoch when it began (see `note_look`).
     fn begin_look(&self, id: &JobId) -> Result<(crate::model::Job, Arc<AtomicBool>, u64)> {
+        // Another job uses a drive of the folders that's run by an add-on driver: nothing is
+        // asked of it, not even the busy notes on it (see `quiet.rs`). The person asked for
+        // this list: a look in the background there is stopped (below).
+        if let Some(name) = self.drive_used_by_another(id, false) {
+            return Err(Error::DriveBusy(name));
+        }
         // Both ask the disk, so they come before any lock is taken.
         let neighbours = self.neighbours(id);
         let in_use = self.folders_in_use(id);
@@ -485,13 +531,17 @@ impl Engine {
         if runtime.get(id).is_some_and(|rt| rt.is_running()) {
             return Err(Error::Busy);
         }
+        if let Some(other) = self.drive_used_among(&state.jobs, &runtime, &job, false) {
+            return Err(Error::DriveBusy(other));
+        }
         if let Some(other) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
             return Err(Error::FoldersBusy(other));
         }
-        let rt = runtime.entry(id.clone()).or_default();
-        if rt.preparing.is_some() {
+        if runtime.get(id).is_some_and(|rt| rt.preparing.is_some()) {
             return Err(Error::Invalid("Charon is already looking at this job's folders.".into()));
         }
+        self.stop_looks_sharing_a_drive(&state.jobs, &mut runtime, &job);
+        let rt = runtime.entry(id.clone()).or_default();
         // A background look at the same folders would only read them twice, and what it
         // found would be older than what this look finds.
         rt.outdate_looks();
@@ -569,6 +619,7 @@ impl Engine {
             prepared_at,
             expires_at: prepared_at + Duration::minutes(VALID_FOR_MINUTES),
             stale: AtomicBool::new(false),
+            unheard: AtomicBool::new(false),
             runs_seen: job.last_run.as_ref().map(|run| run.finished_at),
             warnings: survey.warnings.clone(),
             blocked: survey.refusal.clone(),
@@ -1138,8 +1189,8 @@ mod tests {
         let refused = approved.expect_err("the window is told it doesn't wait");
         assert_eq!(
             refused.to_string(),
-            "You paused everything just as this list was about to start, and “Charon on studio-mac” is still syncing these folders, \
-             so the list doesn't wait for it. Look again once that sync is done."
+            "You paused everything just as this list was about to start, and “Charon on studio-mac” isn't done yet, \
+             so the list doesn't wait for it. Look again once it's done."
         );
         let said = engine.log(&id, 1).first().map(|line| line.text.clone()).unwrap_or_default();
         assert!(said.contains("you paused everything"), "{said}");

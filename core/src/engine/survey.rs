@@ -712,9 +712,12 @@ impl Engine {
     /// Scans both folders at once (they're usually on different drives), each on its own
     /// thread, which never downloads files that are only in the cloud. When one side can't
     /// be scanned, the other stops too: the look fails either way, and a big folder or a
-    /// share isn't read to the end for nothing.
+    /// share isn't read to the end for nothing. Two folders on one drive run by an add-on
+    /// driver are scanned one after the other: such a driver is best given one task at a
+    /// time (see `quiet.rs`).
     fn scan_both(&self, job: &Job, filter: &ExcludeFilter, volumes: (Volume, Volume), cancel: &AtomicBool, report: bool) -> Result<(Snapshot, Snapshot)> {
         let (source_volume, destination_volume) = volumes;
+        let one_at_a_time = source_volume.run_by_an_add_on_driver() && source_volume.mount == destination_volume.mount && !source_volume.mount.is_empty();
         let failed = AtomicBool::new(false);
         let scan = |side: Side, volume: Volume| {
             let counter = |items: u64| {
@@ -732,6 +735,11 @@ impl Engine {
             }
             scanned
         };
+        if one_at_a_time {
+            let source = Self::without_downloads("The scan of the source", || scan(Side::Source, source_volume))?;
+            let destination = Self::without_downloads("The scan of the destination", || scan(Side::Destination, destination_volume))?;
+            return Ok((source, destination));
+        }
         let (source, destination) = std::thread::scope(|scope| {
             let source = std::thread::Builder::new().name("charon-scan".into()).spawn_scoped(scope, || {
                 never_download_on_this_thread();

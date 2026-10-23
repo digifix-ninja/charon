@@ -545,7 +545,8 @@ job don't start: a trigger that comes meanwhile only looks, or is dropped. Anoth
 in the job's folders doesn't refuse *Confirm*: the confirmed list waits for it (see
 *Overlapping jobs and other Charons*). Making a list and *Sync now* are refused meanwhile, with
 `Error::FoldersBusy` ("“X” is syncing one of these folders right now. Look again when it's
-done.").
+done."), or `Error::DriveBusy` when another job uses a drive of theirs that's run by an add-on driver
+(see *Drives run by other makers' drivers*).
 
 ### Carrying out a list
 
@@ -1073,8 +1074,9 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   notes away again, and the run ends before anything changed (`not_begun`). Two syncs that start
   at the same moment each find the other's note, so at most one goes ahead. The claim looks only
   this once: nothing checks again while the run lasts. Meanwhile a thread writes the notes again
-  every 20 seconds (when it can't start, the notes go stale after 2 minutes); dropping the claim
-  removes them. A refresh never makes a folder (`atomic::write_into`): a `.charon` folder that
+  every 20 seconds (when it can't start, the notes go stale after 2 minutes); on a drive the sync
+  keeps quiet, the sync's own thread does it as it goes, and the thread only once that's a
+  minute overdue (`Claim::beat`, `QUIET_OVERDUE`, see *Drives run by other makers' drivers*). Dropping the claim removes them. A refresh never makes a folder (`atomic::write_into`): a `.charon` folder that
   went away with its drive would otherwise be made again on the computer's own disk. Its note is
   written again once the folder is back. Nor does a refresh write through a folder replaced by a
   link while the sync runs. `begin_run` and `begin_look` (a list being prepared) also read the
@@ -1105,9 +1107,9 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   otherwise (`busy_with`); a note that can't be read shows as "another Charon" too.
 - **What waits.** A run the autopilot or *Sync all* started that finds its folders busy stays
   wanted (`JobRuntime::wanted`, with `waiting_for` set), and `start_wanted` tries it again at
-  every autopilot tick while the job runs by itself and no list is open; the row says *Waits for
-  “X” to finish syncing, then starts by itself*. *Sync now* is refused with `Error::FoldersBusy`
-  instead, unless the note turns up only at the claim: then its run stays wanted too. A `Wanted`
+  every autopilot tick while the job runs by itself and no list is open; the row says *Waits until
+  “X” is done, then starts by itself*. *Sync now* is refused with `Error::FoldersBusy`
+  (or `Error::DriveBusy`) instead, unless the note turns up only at the claim: then its run stays wanted too. A `Wanted`
   run keeps its reason and whether the person asked for it (`by_hand`: *Sync all*, or *Sync now*
   that met another sync). It begins only while the job still wants it as it was read, checked
   under the lock that marks the run as running (`still_asked_for`, `Wanted::asks_as`), so
@@ -1115,8 +1117,8 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   still so. Pausing the job drops it even when the person asked for it; while everything is
   paused, the autopilot drops only the runs a trigger wanted (`unwant_automatic`), so a run
   *Sync all* asked for still waits and starts once the other sync is done. A wanted run that is
-  dropped while it waited says so in the job's log ("the sync that waited for “X” to finish
-  syncing was called off: the job is paused"). A list confirmed while another sync is busy isn't
+  dropped while it waited says so in the job's log ("the sync that waited for “X” was called
+  off: the job is paused"). A list confirmed while another sync is busy isn't
   refused: `approve` returns `Approval::Waiting` (`{ kind: "waiting", waitingFor }` for the
   window) instead of `Approval::Started`, and `queue_confirmed` keeps it as
   `JobRuntime::confirmed`, with whether the tick was given. The dialog's toast says "Confirmed.
@@ -1148,7 +1150,7 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   ends up: it no longer waits for the other sync (`keep_waiting`), its sync ends before it
   changes anything (`carry_out`), or, confirmed just then, it isn't kept at all
   (`queue_confirmed`, and the window says "You paused everything just as this list was about to
-  start, and “X” is still syncing these folders, so the list doesn't wait for it. Look again
+  start, and “X” is still syncing, so the list doesn't wait for it. Look again
   once that sync is done."). It lives only in `JobRuntime`: quitting Charon drops it, and after
   a restart the job is where it was before the list was confirmed. While it waits, runs nobody
   looks at are refused, and the row (`JobView::confirmed`) has no `waiting`: it shows *Pending*
@@ -1156,7 +1158,7 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   problem or failed last run outrank it; it isn't counted as waiting for an OK in the header,
   the tray, the reminders or the quit prompt (`quit.rs` counts `Overview::lists_waiting`, so
   quitting doesn't ask about it); its main button is *Stop*, and it says *Confirmed: starts as
-  soon as “X” finishes syncing (Stop calls it off)* (`JobRow.waitsFor`).
+  soon as “X” is done (Stop calls it off)* (`JobRow.waitsFor`).
 - **Looks that came too late.** `JobRuntime::epoch` goes up whenever what a look under way would
   find becomes outdated: a run begins, the job is edited or removed, a list is being made
   (`outdate_looks`), or a folder comes back (`forget_look`). A look notes the epoch when it
@@ -1182,6 +1184,62 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   them to settle; during the sync it's also kept for its end, which then has the folders looked
   at again at once, and a run that ended without carrying anything does the same
   (`look_again_if_changed`).
+- **Drives run by other makers' drivers** (`engine/quiet.rs`). On a Mac, a drive whose file
+  system isn't one of Apple's own (Paragon's or Tuxera's NTFS, Paragon's extFS, anything through
+  macFUSE: `Volume::run_by_an_add_on_driver`, which also counts a type with a bundle in
+  `/Library/Filesystems`) is run by a driver inside the system's core, where a mistake brings
+  the whole Mac down. Paragon NTFS for Mac 17 did, a few seconds into a sync onto a USB stick:
+  "Mutex to destroy still has waiters", with only the sync's thread of Charon's in the file
+  system, Spotlight (`mds`) waiting for a lock of the driver's, and `fseventsd` at work for
+  Charon's folder watching. Charon can't fix the driver or keep the system's services away, so
+  this only lowers the odds; the cure is the driver's newer version. Charon works on one job at
+  a time on such a drive. Which drive a folder is on is known without asking, from the disk's
+  last answer about it (`whereabouts_of`, which the autopilot asks every second; a folder never
+  asked about counts as on no such drive). While a job's run (its look, then its sync) or a
+  list being made for it is going, another job with a folder there isn't looked at, listed or
+  synced (`Engine::drive_used_by_another`): `begin_run` refuses with `Error::DriveBusy` after
+  the caller's checks (so a list that can't go ahead anyway is refused, not kept waiting), the
+  run waits like one that met a busy note (*What waits*), `begin_look` refuses the same way,
+  `carry_out` runs a confirmed list's own checks and then lets it wait without reading the
+  drive, and `check` leaves the job for later (`last_checked` stays unset, so it's looked at as
+  soon as the drive is free; *Look for changes* says why, `look_now`). One look at a time: with
+  `check`, another job's background look there holds it too. A run a trigger started (neither
+  `by_hand` nor `approved`) also waits for another job's background look there, or a job that
+  syncs often could keep stopping a long look of the other's for good. A run or a list the
+  person asked for stops that look instead (`stop_looks_sharing_a_drive`; it counts for
+  nothing, and comes again). Its folders there are still asked about meanwhile (where they are,
+  and whether they overlap another job's) until a sync keeps the drive quiet. `remove_job` is
+  refused while another job's run or list uses the drive, naming it (*Remove “X” once it's
+  done*), since removing takes Charon's marker out of its folders; it doesn't wait or retry, and
+  a background look there doesn't hold it.
+
+  While a sync writes to such a drive, its thread is meant to be the only one of Charon's at
+  work there. `claim_folders` first keeps the drive quiet (`Engine::keep_quiet`, by where it's
+  mounted, or only the job's folder when that can't be told; another job's sync can't keep it
+  quiet too, even for drives mounted one inside the other), and waits at most 5 seconds for
+  looks that began before Charon knew the drive (`let_looks_end`). Meanwhile `whereabouts_of`
+  and `folders_of` answer for folders there from memory: the sync's own folders are where its
+  look found them, another job's as last asked (`Presence::There(None)` or `None`, which counts
+  as maybe one place with anything, when never asked), and saving a job checks its folders
+  against each other and against other jobs' as last found there, or waits when one was never
+  found (`resolving_for_saving`, `folders_for_saving`, `JobSetup::validate_as`). The busy notes
+  there are refreshed by the sync's thread between steps and between the pieces of a file
+  (`Claimed::beat`); the heartbeat refreshes them only when that's overdue (`QUIET_OVERDUE`, a
+  minute: a big file copied into the trash, a slow flush), so they never go stale while the sync
+  runs. The autopilot stops watching folders there (`Autopilot::routes`), and the sync waits at
+  most 3 seconds for that before it writes (`wait_until_unwatched`; a confirmed list the
+  autopilot starts itself claims its folders on its sync's own thread, so the wait works for it
+  too). When either wait runs out, the sync writes all the same, and the app's log says so.
+  What changes in the folders there meanwhile isn't heard, as on a network share, and isn't
+  counted as a change: the next regular look finds it. That look counts from when the folders
+  stopped being watched (`finish` sets the sync's own `last_checked` to the keep's start,
+  `Claimed::unwatched_since`; other jobs' looks there were held, and come once it's done if
+  they came due), so a run nobody looked at still ends as any run does: its row says what's
+  left, and a file that fails every time is tried again only at the regular look. A list of
+  another job there made before the keep can still be confirmed, as each step checks its items
+  right before it acts, but it's carried out as one that waited (`StoredReview::unheard`, set by
+  `let_looks_end`; `Crossing::outdated`): its folders are looked at again once it's done. A look
+  scans a job's two folders on one such drive one after the other (`scan_both`).
 - **An older Charon, and a state that can't be saved.** Two Charons can't work with one data
   folder (`DataLock`). Charon 0.2 doesn't know that lock, nor that its jobs moved: it writes
   `charon.json` again after a sync, and syncs by itself without these checks and without busy
@@ -1353,6 +1411,8 @@ core/                         the sync engine (crate charon-core, no interface)
       status.rs               the row the window shows for a job
       runtime.rs              each job's live state, and Missing: removals left for later
       reach.rs                Reach: questions about folders, with a time limit
+      quiet.rs                QuietDrives: drives run by other makers' drivers, kept quiet
+                              while a sync writes to them
     autopilot/                looking at jobs and running them by themselves
       mod.rs                  Autopilot: the once-a-second loop
       schedule.rs             Schedule: when an Every… or Daily job is due

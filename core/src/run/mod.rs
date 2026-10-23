@@ -26,6 +26,8 @@ mod room;
 mod trash;
 
 pub use busy::{BusyNote, BusyWatch, Claim, BUSY_EXTENSION};
+#[cfg(test)]
+pub(crate) use busy::QUIET_OVERDUE;
 pub use copier::{Copier, Written};
 pub use executor::{Care, Executor, Outcome, Refused, Shores, Spellings, Unread};
 pub use marker::{Found, Marker, Markers, Origin, PROBE_EXTENSION};

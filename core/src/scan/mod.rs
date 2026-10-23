@@ -31,3 +31,5 @@ pub use keys::Keys;
 pub use root::RootId;
 pub use scanner::{Scanner, PRIVACY_REFUSAL};
 pub use volume::{never_download_on_this_thread, FsKind, Refusal, Volume};
+#[cfg(test)]
+pub(crate) use volume::pretend;

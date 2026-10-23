@@ -14,3 +14,6 @@ pub use job::*;
 pub use review::*;
 pub use settings::*;
 pub use view::*;
+
+#[cfg(test)]
+pub(crate) use job::asking;

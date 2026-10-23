@@ -29,6 +29,12 @@ impl Route {
         Self { root: root.to_path_buf(), real: real.filter(|real| real != root), job: job.clone() }
     }
 
+    /// The folder, as the job names it.
+    #[cfg(test)]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// `path` as a path under the folder the job names, if it's in the folder under either
     /// of its paths.
     fn place(&self, path: &Path) -> Option<PathBuf> {

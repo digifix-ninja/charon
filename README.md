@@ -270,6 +270,15 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   whole list.
 - **FAT and exFAT drives** keep times in local time and less precisely; Charon allows for that,
   and *Newest wins* keeps both versions there.
+- **NTFS and ext4 drives on a Mac** need a driver of another maker (Paragon, Tuxera, or one
+  through macFUSE), which runs inside the core of macOS: a mistake there restarts the Mac.
+  Paragon NTFS for Mac 17 once did during a sync onto a USB stick, while Spotlight read the new
+  files. So Charon works on one job at a time on such a drive (other jobs there wait for it),
+  and while a sync writes to it, the rest of Charon keeps off it as far as it can: its folders
+  there aren't watched for changes until the sync is done, so what you change there meanwhile is
+  found by the next regular look. Keep the driver up to date, and consider keeping the drive out
+  of Spotlight (*System Settings > Spotlight > Search Privacy*), or use exFAT, which macOS runs
+  itself.
 - **What a drive can't hold** is left out, with a note in the job's *Not synced* tab: on
   Windows and on FAT, exFAT and NTFS drives and SMB shares, names with characters like `:` `?`
   `*`, a trailing dot or space, or names like `CON`; on any drive, names or paths too long for
@@ -355,11 +364,11 @@ Every row uses a colour *and* an icon, so it still reads for colour-blind eyes.
   the last look at the end of a sync also can't notice a drive that dropped out mid-sync and
   came back without a container's new version.
 - **When a sync waits for another one.** A sync that would start by itself while another sync
-  is at work in its folders waits, and its row says for which: *Waits for “Photos” to finish
-  syncing, then starts by itself*, naming another job, *another Charon* or *Charon on* the other
+  is at work in its folders waits, and its row says for which: *Waits until “Photos” is done,
+  then starts by itself*, naming another job, *another Charon* or *Charon on* the other
   computer. So does a list you made before that sync began and confirm while it works: Charon
   tells you *Confirmed. “Docs” syncs as soon as “Photos” is done.*, and the row says
-  *Confirmed: starts as soon as “Photos” finishes syncing*. While Charon runs, the list stays
+  *Confirmed: starts as soon as “Photos” is done*. While Charon runs, the list stays
   good however long it waits, and each step still checks the disk when its turn comes. *Stop*,
   pausing the job or everything, or editing the job calls it off, and so does quitting Charon,
   which doesn't ask first: that list is then never carried out, and the job's activity log says

@@ -52,12 +52,12 @@ export class JobRow {
       </article>`;
   }
 
-  /** A sync that's due, or that the person confirmed, waiting for another sync of its folders. */
+  /** A sync that's due, or that the person confirmed, waiting for another sync of its folders (or another job on the same drive). */
   static waitsFor(job) {
     if (!job.waitingFor) return "";
     const text = job.confirmed
-      ? `Confirmed: starts as soon as “${job.waitingFor}” finishes syncing (Stop calls it off)`
-      : `Waits for “${job.waitingFor}” to finish syncing, then starts by itself`;
+      ? `Confirmed: starts as soon as “${job.waitingFor}” is done (Stop calls it off)`
+      : `Waits until “${job.waitingFor}” is done, then starts by itself`;
     return html`<div class="waits-for"><span class="ico">${raw(Icons.pause)}</span>${text}</div>`;
   }
 

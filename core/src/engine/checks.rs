@@ -39,22 +39,49 @@ pub(crate) enum ChangeAt {
 
 impl Engine {
     /// Looks for changes in the background: scans both folders and plans, but changes
-    /// nothing. Does nothing while the job runs, is being looked at, or a look is running.
-    /// What it finds counts only if nothing outdated it meanwhile (see `note_look`).
+    /// nothing. Does nothing while the job runs, is being looked at, or a look is running,
+    /// nor while another job runs or is looked at on a drive of its folders that's run by an
+    /// add-on driver (it's looked at once that's done; see `quiet.rs`). What it finds counts
+    /// only if nothing outdated it meanwhile (see `note_look`).
     pub fn check(&self, id: &JobId) {
+        self.look_in_background(id);
+    }
+
+    /// `check`, for the person's *Look for changes*: when another job uses a drive of the
+    /// folders that's run by an add-on driver, says so, and that the look comes once it's done.
+    pub fn look_now(&self, id: &JobId) -> Result<()> {
+        match self.look_in_background(id) {
+            Some(other) => Err(Error::Invalid(format!(
+                "“{other}” is using the same drive right now. Its driver isn't Apple's own (like Paragon's NTFS), so Charon works on one \
+                 job at a time there, and looks at these folders once it's done."
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// `check`. Returns the name of the job that holds the look back, when another job uses a
+    /// drive of the folders that's run by an add-on driver.
+    fn look_in_background(&self, id: &JobId) -> Option<String> {
         let stop = Arc::new(AtomicBool::new(false));
         let quitting = self.is_shutting_down();
         // The setup and the epoch are read together, as an edit changes them together: a look
         // of the old setup with the new epoch would count.
         let (job, epoch) = {
             let state = self.state();
-            let Some(job) = state.jobs.iter().find(|job| &job.id == id).cloned() else { return };
+            let job = state.jobs.iter().find(|job| &job.id == id).cloned()?;
             let mut runtime = self.runtime();
+            // Asked with the live state locked: a run of another job that starts on the drive
+            // from now on finds this look started, and waits for it or stops it.
+            let drive_used = self.drive_used_among(&state.jobs, &runtime, &job, true);
             let rt = runtime.entry(id.clone()).or_default();
             Self::forget_own_writes(rt);
             let busy = quitting || rt.is_running() || rt.is_checking() || rt.preparing.is_some();
             if busy {
-                return;
+                return None;
+            }
+            if drive_used.is_some() {
+                rt.last_checked = None;
+                return drive_used;
             }
             rt.checking = Some(stop.clone());
             (job, rt.epoch)
@@ -82,6 +109,7 @@ impl Engine {
         if spawned.is_err() {
             self.change_runtime(id, |rt| rt.checking = None);
         }
+        None
     }
 
     /// Ends a background look that began at `epoch` with `flag` as its stop flag: what it
