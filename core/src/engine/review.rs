@@ -8,7 +8,7 @@
 //! job's folders waits for that sync, and is carried out as soon as it's done (unless the
 //! job changed, synced, or a drive was swapped meanwhile: then the row says why it wasn't).
 
-use crate::engine::quiet::Claimed;
+use crate::engine::quiet::{Asker, Claimed};
 use crate::engine::runs::Crossing;
 use crate::engine::runtime::{Confirmed, JobRuntime};
 use crate::engine::survey::{Purpose, Survey};
@@ -362,7 +362,7 @@ impl Engine {
         // While another job uses a drive of the folders that's run by an add-on driver,
         // nothing is read there (see `quiet.rs`): the list waits for that job once its own
         // checks pass, and its folders are looked at when it starts.
-        if let Some(name) = self.drive_used_by_another(id, false) {
+        if let Some(name) = self.drive_used_by_another(id, Asker::Person) {
             let job = self.stored_job(id)?;
             list_checks(&job, self.runtime().entry(id.clone()).or_default())?;
             return Err(Error::DriveBusy(name));
@@ -519,7 +519,7 @@ impl Engine {
         // Another job uses a drive of the folders that's run by an add-on driver: nothing is
         // asked of it, not even the busy notes on it (see `quiet.rs`). The person asked for
         // this list: a look in the background there is stopped (below).
-        if let Some(name) = self.drive_used_by_another(id, false) {
+        if let Some(name) = self.drive_used_by_another(id, Asker::Person) {
             return Err(Error::DriveBusy(name));
         }
         // Both ask the disk, so they come before any lock is taken.
@@ -534,7 +534,7 @@ impl Engine {
         if runtime.get(id).is_some_and(|rt| rt.is_running()) {
             return Err(Error::Busy);
         }
-        if let Some(other) = self.drive_used_among(&state.jobs, &runtime, &job, false) {
+        if let Some(other) = self.drive_used_among(&state.jobs, &runtime, &job, Asker::Person) {
             return Err(Error::DriveBusy(other));
         }
         if let Some(other) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
@@ -1126,13 +1126,23 @@ mod tests {
         }
     }
 
+    /// Waits until `done` holds: a sync's own thread says what became of its list (that it
+    /// waits on, or was called off) a moment after `wait_idle` sees its run end.
+    fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} took too long");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     /// Asserts that the job's confirmed list doesn't wait anymore, and that its log says Pause
     /// everything called it off.
     fn called_off_by_pausing_everything(engine: &Engine, id: &JobId) {
+        let called_off = "the confirmed sync that waited for another sync was called off (Pause everything)";
+        until("the log line", || engine.log(id, 1).first().is_some_and(|line| line.text == called_off));
         let row = engine.job(id).unwrap();
         assert!(!row.confirmed && row.waiting_for.is_none(), "the list no longer waits");
-        let said = engine.log(id, 1).first().map(|line| line.text.clone());
-        assert_eq!(said.as_deref(), Some("the confirmed sync that waited for another sync was called off (Pause everything)"));
     }
 
     #[test]
@@ -1172,9 +1182,8 @@ mod tests {
         // claims the folders there and meets the other sync still at work: the list waits on.
         assert!(as_the_autopilot(&engine, &id, |engine, id| engine.start_confirmed(id)), "handed to its sync's thread");
         wait_idle(&engine, &id);
-        let row = engine.job(&id).unwrap();
-        assert!(row.confirmed, "the list still waits");
-        assert_eq!(row.waiting_for.as_deref(), Some("Charon on studio-mac"));
+        until("the row", || engine.job(&id).unwrap().waiting_for.as_deref() == Some("Charon on studio-mac"));
+        assert!(engine.job(&id).unwrap().confirmed, "the list still waits");
         assert!(!dst.join("Projects/plan.txt").exists() && engine.job(&id).unwrap().job.last_run.is_none(), "nothing ran");
 
         // Once that sync is done, the next try carries it out.

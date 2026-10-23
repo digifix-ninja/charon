@@ -1,5 +1,6 @@
 //! Adding, editing, pausing and removing jobs.
 
+use crate::engine::quiet::Asker;
 use crate::engine::{Engine, EngineEvent};
 use crate::error::{Error, Result};
 use crate::model::{Folder, Job, JobId, JobSetup, JobView, SyncMode};
@@ -196,7 +197,7 @@ impl Engine {
         // Removing it takes Charon's marker out of its folders: not on a drive run by an
         // add-on driver that another job's run or list uses right now (see `quiet.rs`). A
         // look in the background there doesn't hold it up: that only reads.
-        if let Some(other) = self.drive_used_by_another(id, false) {
+        if let Some(other) = self.drive_used_by_another(id, Asker::Person) {
             return Err(Error::Invalid(format!(
                 "“{other}” is using the same drive right now. Its driver isn't Apple's own, so Charon works on one job at a time there. Remove “{name}” once it's done."
             )));

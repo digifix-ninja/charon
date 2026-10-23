@@ -159,10 +159,9 @@ impl Autopilot {
         self.collect_changes();
         let now = Utc::now();
 
-        // Runs and lists that wait go first, for every job, before any job's steps below can
-        // start a look: on a drive run by an add-on driver, a run that waited for another
-        // job's look starts once that look ends, ahead of the next job's look there (see
-        // `engine::quiet`).
+        // Runs and lists that wait are tried first, for every job, before any job's steps
+        // below start a look. On a drive run by an add-on driver, jobs take their turns in the
+        // order they began to wait, whatever their order here (see `engine::quiet`).
         let mut ready = Vec::new();
         for (job, found) in jobs.iter().zip(&whereabouts) {
             let id = &job.id;
@@ -193,6 +192,11 @@ impl Autopilot {
                 self.engine.unwant(id, "the job waits for your OK");
             } else if !automatic {
                 self.engine.unwant_automatic(id, if job.paused { "the job is paused" } else { "everything is paused" });
+            }
+            // A job whose folder is away doesn't wait for its turn on a drive meanwhile: it
+            // would hold up the other jobs there.
+            if !present || !reachable {
+                self.engine.forget_drive_wait(id);
             }
             if !present || self.engine.is_running(id) {
                 continue;
@@ -459,6 +463,8 @@ mod tests {
         let (documents, docs_on_stick) = add("Documents", home.join("docs"), stick.join("docs"));
         let (photos, photos_on_stick) = add("Photos", home.join("photos"), stick.join("photos"));
         let (notes, _) = add("Notes", home.join("notes"), home.join("copies"));
+        until("the first looks", || engine.job_list().iter().all(|job| !engine.job(&job.id).unwrap().looking));
+        engine.forget_drive_waits();
         (engine, pretending, [documents, photos, notes], [docs_on_stick, photos_on_stick])
     }
 
@@ -524,12 +530,13 @@ mod tests {
         assert!(waited < Duration::from_secs(2), "{waited:?}");
     }
 
-    #[test]
-    fn a_run_that_waited_for_a_look_on_the_drive_goes_before_the_next_look_there() {
-        let tmp = tempfile::tempdir().unwrap();
-        let (engine, _stick, [documents, photos, notes], _) = jobs_on_a_stick(tmp.path());
-        // "Backup", listed after them, syncs onto the stick by itself.
-        let (source, destination) = (tmp.path().join("home").join("backup"), tmp.path().join("stick").join("backup"));
+    /// `jobs_on_a_stick`, and "Backup", listed after them, which syncs onto the stick by
+    /// itself: its first sync is done, and a new file waits to be copied. A look at Documents
+    /// reads the stick; the other jobs were just looked at. Returns the four jobs and Backup's
+    /// folder on the stick.
+    fn a_backup_onto_the_stick(tmp: &Path) -> (Engine, crate::scan::pretend::AddOnDrive, [JobId; 4], PathBuf) {
+        let (engine, stick, [documents, photos, notes], _) = jobs_on_a_stick(tmp);
+        let (source, destination) = (tmp.join("home").join("backup"), tmp.join("stick").join("backup"));
         fs::create_dir_all(&source).unwrap();
         fs::create_dir_all(&destination).unwrap();
         fs::write(source.join("a.txt"), "a").unwrap();
@@ -550,18 +557,26 @@ mod tests {
         engine.approve(&backup, &review.review_id, true).unwrap();
         until("the first sync", || !engine.is_running(&backup));
         fs::write(source.join("b.txt"), "b").unwrap();
-
-        // Documents' look reads the stick. Photos' look waits for it, and so does Backup's run.
-        let (mut pilot, _changes) = pilot(&engine);
+        engine.forget_drive_waits();
         engine.whereabouts_of(&engine.job_list());
-        for id in [&notes, &backup] {
+        for id in [&photos, &notes, &backup] {
             engine.just_looked_at(id);
         }
         engine.begin_a_look(&documents);
-        engine.hold_back_a_look(&photos);
+        (engine, stick, [documents, photos, notes, backup], destination)
+    }
+
+    #[test]
+    fn a_run_that_waited_for_a_look_on_the_drive_goes_before_the_next_look_there() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, photos, _, backup], destination) = a_backup_onto_the_stick(tmp.path());
+        let (mut pilot, _changes) = pilot(&engine);
+        // Backup's run waits for Documents' look, and then Photos' look does too.
         engine.want(&backup, "after changes");
         engine.start_wanted(&backup);
         assert_eq!(engine.job(&backup).unwrap().waiting_for.as_deref(), Some("Documents"));
+        engine.check(&photos);
+        assert!(engine.look_held_back(&photos));
 
         // The look ends. At the next tick the run goes first, though Photos is listed before
         // it (or Photos' look would start, and Backup wait for it; then Documents' look, and so
@@ -577,6 +592,57 @@ mod tests {
             pilot.tick();
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn a_look_that_began_to_wait_on_the_drive_before_a_run_goes_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, photos, _, backup], destination) = a_backup_onto_the_stick(tmp.path());
+        let (mut pilot, _changes) = pilot(&engine);
+        // Photos' look waits for Documents' look, and then Backup's run does too.
+        engine.check(&photos);
+        assert!(engine.look_held_back(&photos));
+        engine.want(&backup, "after changes");
+        engine.start_wanted(&backup);
+        assert_eq!(engine.job(&backup).unwrap().waiting_for.as_deref(), Some("Documents"));
+
+        // The look ends. At the next tick Photos' look goes first, though the runs that wait
+        // are tried first, and the run waits for it.
+        engine.end_a_look(&documents);
+        pilot.tick();
+        assert!(!engine.look_held_back(&photos), "Photos' look came");
+        assert!(engine.run_wanted(&backup), "the run waits");
+        assert_eq!(engine.job(&backup).unwrap().waiting_for.as_deref(), Some("Photos"));
+        // The run comes once the look is done.
+        let deadline = Instant::now() + DEADLINE;
+        while engine.run_wanted(&backup) {
+            assert!(Instant::now() < deadline, "the run took too long to come");
+            pilot.tick();
+            thread::sleep(Duration::from_millis(20));
+        }
+        until("the sync", || !engine.is_running(&backup));
+        assert!(destination.join("b.txt").exists());
+    }
+
+    #[test]
+    fn a_job_whose_folder_went_away_holds_up_no_turn_on_the_drive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (engine, _stick, [documents, photos, _, backup], destination) = a_backup_onto_the_stick(tmp.path());
+        let (mut pilot, _changes) = pilot(&engine);
+        // Photos' look waits for Documents' look, and then Backup's run does too.
+        engine.check(&photos);
+        assert!(engine.look_held_back(&photos));
+        engine.want(&backup, "after changes");
+        engine.start_wanted(&backup);
+
+        // The look ends, and Photos' folder at home goes away (an unplugged drive): its look
+        // can't come, and the run doesn't wait for it.
+        engine.end_a_look(&documents);
+        fs::remove_dir_all(tmp.path().join("home").join("photos")).unwrap();
+        pilot.tick();
+        assert!(!engine.run_wanted(&backup), "the run started");
+        until("the sync", || !engine.is_running(&backup));
+        assert!(destination.join("b.txt").exists());
     }
 
     /// A two-way job with full automation that syncs once changes have settled for

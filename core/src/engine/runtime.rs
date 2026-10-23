@@ -1,5 +1,6 @@
 //! The live state of a job: everything that isn't saved to disk.
 
+use crate::engine::quiet::DriveWait;
 use crate::engine::review::StoredReview;
 use crate::model::{ConflictItem, DatedAhead, Job, JobSetup, PerSide, Place, Progress, VolumeLabel};
 use crate::plan::{Action, Plan, Side, Unit};
@@ -34,12 +35,13 @@ pub(crate) struct JobRuntime {
     /// The sync whose folders the confirmed run, or else the wanted run, waits for: another
     /// job's name, or another Charon.
     pub waiting_for: Option<String>,
+    /// Since when the job's look in the background or its wanted run waits for its turn on a
+    /// drive run by an add-on driver (see `quiet.rs`).
+    pub drive_wait: Option<DriveWait>,
     /// Set while a review is being prepared; setting it to true stops that.
     pub preparing: Option<Arc<AtomicBool>>,
     /// Set while a background check runs; setting it to true stops it.
     pub checking: Option<Arc<AtomicBool>>,
-    /// When the background check that runs now began.
-    pub checking_since: Option<Instant>,
     pub progress: Option<Progress>,
     /// What the last look found.
     pub look: Option<Look>,
@@ -99,12 +101,6 @@ impl JobRuntime {
         self.checking.is_some()
     }
 
-    /// Whether a background check runs that began less than `within` ago (or at a time not
-    /// known).
-    pub fn checking_within(&self, within: Duration) -> bool {
-        self.is_checking() && self.checking_since.is_none_or(|since| since.elapsed() < within)
-    }
-
     /// Stops the running sync, if there is one, as the person asked (Stop, pausing the job):
     /// what it already carried stays, and the job's next sync waits for their OK.
     pub fn stop_for_person(&mut self) {
@@ -148,6 +144,9 @@ impl JobRuntime {
     /// row said it waited. (What a confirmed list waits for stays: it's the list's.)
     pub fn forget_wanted(&mut self, which: impl FnOnce(&Wanted) -> bool) -> Option<String> {
         self.wanted.take_if(|wanted| which(wanted))?;
+        // It doesn't wait for its turn on a drive anymore (a look that still does says so
+        // again at its next try).
+        self.drive_wait = None;
         if self.confirmed.is_some() {
             return None;
         }

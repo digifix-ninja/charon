@@ -864,9 +864,9 @@ its folders until the person confirms a list.
 
 Each tick first starts, for every job, what waits for its turn: a list the person confirmed
 while another sync worked in its folders (`start_confirmed`), or a run nobody looks at that a
-trigger started and that waits (`start_wanted`). Only then does it go through the steps below,
-so a run that waited for another job's look gets the drive before the next look there. For each
-job whose folders are reachable (a folder now on another drive than at the last sync doesn't
+trigger started and that waits (`start_wanted`). Only then does it go through the steps below
+(on a drive run by an add-on driver, jobs take turns in the order they began to wait anyway:
+see *Drives run by other makers' drivers*). For each job whose folders are reachable (a folder now on another drive than at the last sync doesn't
 count, nor one that doesn't answer in time: see *Folders that don't answer* below) and that
 isn't syncing, in this order:
 
@@ -1206,20 +1206,25 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   run waits like one that met a busy note (*What waits*), `begin_look` refuses the same way,
   `carry_out` runs a confirmed list's own checks and then lets it wait without reading the
   drive, and `check` leaves the job for later (`last_checked` stays unset, so it's looked at as
-  soon as the drive is free; *Look for changes* says why, `look_now`). One look at a time: with
-  `check`, another job's background look there holds it too. A run a trigger started (neither
-  `by_hand` nor `approved`) also waits for another job's background look there, or a job that
-  syncs often could keep stopping a long look of the other's for good. Such a run gets the next
-  turn: each autopilot tick first tries every job's waiting runs and confirmed lists, then
-  every job's steps, so a look that ends lets the run start before the next job's look there
-  (`Autopilot::tick`; otherwise two jobs listed first whose folders keep changing could take
-  turns looking and keep the run waiting all day). A background look holds others back for ten
-  minutes at most (`LOOKS_HOLD_FOR`, `JobRuntime::checking_within`): one at it longer is most
-  likely stuck on its other folder, a share that stopped answering, and no longer reads the
-  drive. A run or a list the person asked for, or a trigger's run that met such a stuck look,
-  stops that look instead (`stop_looks_sharing_a_drive`; it counts for nothing, and comes
-  again); another job's look no longer waits for a stuck one. Its folders there are still asked about meanwhile (where they are,
-  and whether they overlap another job's) until a sync keeps the drive quiet. `remove_job` is
+  soon as the drive is free; *Look for changes* says why, `look_now`). Who asks decides what
+  holds them back (`quiet::Asker`). What Charon starts by itself, a background look (`check`)
+  or a run a trigger started (neither `by_hand` nor `approved`), also waits for another job's
+  background look there (or a job that syncs often could keep stopping a long look of the
+  other's for good), and for its turn: a job held back there notes when it began to wait
+  (`JobRuntime::drive_wait`, `note_drive_wait`), and waits for every job there that began to
+  wait before it and still asks, whether to look or to sync, whatever the order of the jobs
+  (otherwise two jobs listed first whose folders keep changing could take turns looking and
+  keep a third waiting all day). The autopilot asks again at every tick; a wait not asked for
+  30 seconds lapses (`WAITS_LAPSE`), one whose job's folder went away is forgotten at once
+  (`forget_drive_wait`), and so is a run's once it's no longer wanted (`forget_wanted`), so it
+  holds nobody up. The wait ends when the job gets the drive. A background look that's most
+  likely stuck holds nobody back: a folder of its job didn't answer in time (`stuck`,
+  `Reach::is_late`: a share that stopped answering), and the look waits for it there, not
+  reading the drive; a run that started meanwhile stops it. *Look for changes* waits for
+  another job's look too, but not for its turn. A run or a list the person asked for waits for
+  neither: it stops the background looks there instead (`stop_looks_sharing_a_drive`; they
+  count for nothing, and come again). Its folders there are still asked about meanwhile (where
+  they are, and whether they overlap another job's) until a sync keeps the drive quiet. `remove_job` is
   refused while another job's run or list uses the drive, naming it (*Remove “X” once it's
   done*), since removing takes Charon's marker out of its folders; it doesn't wait or retry, and
   a background look there doesn't hold it.
@@ -1245,7 +1250,8 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   counted as a change: the next regular look finds it. After a sync that left nothing, that
   look counts from when the folders stopped being watched (`finish` sets the sync's own
   `last_checked` to the keep's start, `Claimed::unwatched_since`); after one that left
-  something (a step failed, was skipped or waited, or the run ended on an error), it counts
+  something (a step failed, was skipped or waited, an item was left out because the drive
+  can't hold it, a file couldn't be read, or the run ended on an error), it counts
   from the sync's end, however long it kept the drive quiet, so a file that fails every time is
   tried again a whole interval later at the soonest, and the drive isn't written to again and
   again. Other jobs' looks there were held, and come once it's done if they came due. Either

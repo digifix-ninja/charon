@@ -2,6 +2,7 @@
 //! for their OK.
 
 use crate::engine::survey::{Purpose, Survey, INTERNAL_LOOK};
+use crate::engine::quiet::Asker;
 use crate::engine::{Engine, EngineEvent, FoundAhead, Moment};
 use crate::error::{Error, Result};
 use crate::model::{DatedAhead, Job, JobId, JobStatus, Trigger, WaitingJob};
@@ -44,13 +45,13 @@ impl Engine {
     /// add-on driver (it's looked at once that's done; see `quiet.rs`). What it finds counts
     /// only if nothing outdated it meanwhile (see `note_look`).
     pub fn check(&self, id: &JobId) {
-        self.look_in_background(id);
+        self.look_in_background(id, Asker::Charon);
     }
 
     /// `check`, for the person's *Look for changes*: when another job uses a drive of the
     /// folders that's run by an add-on driver, says so, and that the look comes once it's done.
     pub fn look_now(&self, id: &JobId) -> Result<()> {
-        match self.look_in_background(id) {
+        match self.look_in_background(id, Asker::PersonsLook) {
             Some(other) => Err(Error::Invalid(format!(
                 "“{other}” is using the same drive right now. Its driver isn't Apple's own (like Paragon's NTFS), so Charon works on one \
                  job at a time there, and looks at these folders once it's done."
@@ -59,9 +60,10 @@ impl Engine {
         }
     }
 
-    /// `check`. Returns the name of the job that holds the look back, when another job uses a
-    /// drive of the folders that's run by an add-on driver.
-    fn look_in_background(&self, id: &JobId) -> Option<String> {
+    /// `check`, or `look_now` (as `asker` says). Returns the name of the job that holds the look
+    /// back, when another job uses a drive of the folders that's run by an add-on driver, or
+    /// began to wait for it first (see `drive_used_among`).
+    fn look_in_background(&self, id: &JobId, asker: Asker) -> Option<String> {
         let stop = Arc::new(AtomicBool::new(false));
         let quitting = self.is_shutting_down();
         // The setup and the epoch are read together, as an edit changes them together: a look
@@ -72,7 +74,7 @@ impl Engine {
             let mut runtime = self.runtime();
             // Asked with the live state locked: a run of another job that starts on the drive
             // from now on finds this look started, and waits for it or stops it.
-            let drive_used = self.drive_used_among(&state.jobs, &runtime, &job, true);
+            let drive_used = self.drive_used_among(&state.jobs, &runtime, &job, asker);
             let rt = runtime.entry(id.clone()).or_default();
             Self::forget_own_writes(rt);
             let busy = quitting || rt.is_running() || rt.is_checking() || rt.preparing.is_some();
@@ -80,11 +82,13 @@ impl Engine {
                 return None;
             }
             if drive_used.is_some() {
+                // Looked at as soon as its turn comes.
                 rt.last_checked = None;
+                Self::note_drive_wait(rt);
                 return drive_used;
             }
             rt.checking = Some(stop.clone());
-            rt.checking_since = Some(Instant::now());
+            rt.drive_wait = None;
             (job, rt.epoch)
         };
         let engine = self.clone();

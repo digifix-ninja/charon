@@ -13,7 +13,7 @@
 use crate::engine::checks::ChangeAt;
 use crate::engine::runtime::{Moment, OwnWrites, Wanted, MISSING_FOR};
 use crate::engine::survey::{Purpose, Survey};
-use crate::engine::quiet::{Claimed, Quiet};
+use crate::engine::quiet::{Asker, Claimed, Quiet};
 use crate::engine::{Engine, EngineEvent, JobRuntime, Look};
 use crate::error::{Error, Result};
 use crate::model::{plural, Drives, Finished, Folder, Job, JobId, JobSetup, Mark, Phase, Place, Progress, ReviewKind, RunSummary, FAILED_NAMED, PLACES_SHOWN};
@@ -490,10 +490,11 @@ impl Engine {
         // uses a drive of the folders that's run by an add-on driver: nothing is asked of it
         // then, not even the busy notes on it, and the run waits for that job (below, after
         // the caller's checks, so a list that can't go ahead anyway is refused now). A run a
-        // trigger started waits for a look in the background there too: stopping it every
-        // time could keep that job from ever being looked at.
-        let unasked = !crossing.by_hand && !crossing.approved;
-        let drive_used = self.drive_used_by_another(id, unasked);
+        // trigger started waits for a look in the background there too (stopping it every
+        // time could keep that job from ever being looked at), and takes its turn after the
+        // jobs that began to wait for the drive before it.
+        let asker = if crossing.by_hand || crossing.approved { Asker::Person } else { Asker::Charon };
+        let drive_used = self.drive_used_by_another(id, asker);
         let (neighbours, in_use) = match drive_used {
             Some(_) => (Neighbours { mine: Self::nowhere(), others: HashMap::new() }, None),
             None => (self.neighbours(id), self.folders_in_use(id)),
@@ -513,9 +514,14 @@ impl Engine {
             return Err(Error::Invalid(PAUSED.into()));
         }
         check(&job, runtime.entry(id.clone()).or_default())?;
-        if let Some(name) = drive_used.or_else(|| self.drive_used_among(&state.jobs, &runtime, &job, unasked)) {
+        if let Some(name) = drive_used.or_else(|| self.drive_used_among(&state.jobs, &runtime, &job, asker)) {
+            if asker == Asker::Charon {
+                Self::note_drive_wait(runtime.entry(id.clone()).or_default());
+            }
             return Err(Error::DriveBusy(name));
         }
+        // Its turn on the drive came (whatever else may still hold it back).
+        runtime.entry(id.clone()).or_default().drive_wait = None;
         if let Some(name) = Self::busy_neighbour(&state.jobs, &runtime, &job, &neighbours).or(in_use) {
             return Err(Error::FoldersBusy(name));
         }
