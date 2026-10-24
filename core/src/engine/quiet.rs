@@ -24,9 +24,9 @@
 //!   answered from what was found before (see `Engine::whereabouts_of`, `Engine::folders_of`),
 //!   and what another job's look would ask about one isn't asked (see `Engine::ask_about`):
 //!   whether a folder there holds a copy of a marker is as the disk last told it apart (see
-//!   `QuietDrives::origin`; a run nobody looks at that can't tell waits for the sync, see
-//!   `Overlaps::waits_on`), and where a folder a sync client syncs there really is, as the
-//!   client wrote it (see `Scanner::keeping_off`);
+//!   `QuietDrives::origin`; a run nobody looks at that can't tell, and has no other reason
+//!   to hold back, waits for the sync, see `overlaps::Waiting`), and where a folder a sync
+//!   client syncs there really is, as the client wrote it (see `Scanner::keeping_off`);
 //! * a file a stopped look still holds open there is closed once the sync is done (see
 //!   `Engine::let_go`), as closing it is work for the driver too;
 //! * the autopilot stops watching the folders on the drive for changes until the sync is done.
@@ -1189,12 +1189,16 @@ mod tests {
         engine.stored_job(&books).unwrap()
     }
 
-    /// Stops the look of a job as soon as it read its first pair (it notes that it moved on
-    /// at the next one), and does `then` too.
+    /// Stops the look of a job as soon as it read a pair it hadn't read before (it notes that
+    /// it moved on at the next one: the job's reads kept are more than at its first move), and
+    /// does `then` too.
     fn stop_after_the_first_pair(engine: &Engine, stopped: &Arc<AtomicBool>, then: impl Fn() + Send + Sync + 'static) {
         let stop = stopped.clone();
+        let before = Mutex::new(HashMap::<JobId, usize>::new());
         *engine.inner.quiet.when_moved.lock().unwrap() = Some(Box::new(move |engine, id| {
-            if engine.change_known_runtime(id, |rt| rt.reads.len()).unwrap_or(0) > 0 && !stop.swap(true, Ordering::Relaxed) {
+            let kept = engine.change_known_runtime(id, |rt| rt.reads.len()).unwrap_or(0);
+            let before = *before.lock().unwrap().entry(id.clone()).or_insert(kept);
+            if kept > before && !stop.swap(true, Ordering::Relaxed) {
                 then();
             }
         }));
@@ -1234,7 +1238,7 @@ mod tests {
 
     /// A look its own job's run stopped (see `begin_run`) may still be comparing once that
     /// run's sync keeps the stick quiet: it reads no marker there either, and forgets what it
-    /// read instead.
+    /// read instead. What the sync's own look read and checked stays, for the sync to carry.
     #[test]
     fn a_comparison_stopped_by_its_own_sync_reads_no_marker_while_that_sync_keeps_the_drive_quiet() {
         let Jobs { _tmp, _stick, engine, .. } = jobs();
@@ -1242,13 +1246,19 @@ mod tests {
         let job = books(&engine, &home, &stick);
         let held = engine.hold_a_sync(&job.id).unwrap();
         assert!(engine.kept_quiet(&stick));
-        // What the sync's own look read is put aside, so the stopped look reads again.
-        engine.change_runtime(&job.id, |rt| rt.reads = Default::default());
+        let kept = |key: &str| engine.runtime()[&job.id].reads.has(key);
+        assert!(kept("a.txt") && kept("b.txt"), "the sync's own look read both pairs");
+        // A pair that came since, which the stopped look reads first.
+        for (folder, text, seconds) in [(&home, "one", 1_700_000_000), (&stick, "two", 1_700_000_100)] {
+            fs::write(folder.join("0.txt"), text).unwrap();
+            filetime::set_file_mtime(folder.join("0.txt"), filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+        }
         let stopped = Arc::new(AtomicBool::new(false));
         stop_after_the_first_pair(&engine, &stopped, || {});
         assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
         assert!(stopped.load(Ordering::Relaxed));
-        assert_eq!(engine.runtime()[&job.id].reads.len(), 0, "the markers aren't read on the stick while its own sync keeps it quiet");
+        assert!(!kept("0.txt"), "the markers aren't read on the stick while its own sync keeps it quiet");
+        assert!(kept("a.txt") && kept("b.txt"), "what the sync's own look read stays");
         drop(held);
     }
 
@@ -1324,7 +1334,7 @@ mod tests {
     #[test]
     fn a_copy_of_a_marker_is_known_for_one_while_its_drive_is_kept_quiet() {
         let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
-        let (_, on_stick, inbox, _) = a_copied_marker(&engine, _tmp.path(), false);
+        let (_, on_stick, inbox, old) = a_copied_marker(&engine, _tmp.path(), false);
         let job = engine.stored_job(&inbox).unwrap();
         let look = || engine.survey(&job, &AtomicBool::new(false), Purpose::Review).unwrap();
         let mentioned = |survey: &Survey| survey.warnings.iter().any(|warning| warning.text.contains("holds a copy of the hidden .charon folder"));
@@ -1339,7 +1349,14 @@ mod tests {
         engine.inner.quiet.known().origins.clear();
         let unknown = look();
         assert!(unknown.holds.iter().any(|hold| hold.contains("can't tell yet") && hold.contains("“Documents” is syncing on that drive")), "{:?}", unknown.holds);
-        assert_eq!(unknown.waits_on, Some((on_stick.clone(), "Documents".to_string())));
+        let waits = unknown.waits_on.clone().expect("it waits for that sync");
+        assert_eq!((&waits.folder, &waits.found, waits.whose.as_str(), waits.syncing.as_str()), (&on_stick, &old, "Pictures", "Documents"));
+        // With another reason to hold back, it doesn't wait for that sync: the clash is among
+        // the reasons, after the others.
+        let synced_before = Job { last_synced: Some(chrono::Utc::now()), ..job.clone() };
+        let held_back = engine.survey(&synced_before, &AtomicBool::new(false), Purpose::Review).unwrap();
+        assert!(held_back.waits_on.is_none(), "{:?}", held_back.holds);
+        assert!(held_back.holds.len() == 2 && held_back.holds[0].contains("no memory of this job's last sync") && held_back.holds[1].contains("can't tell yet"), "{:?}", held_back.holds);
         drop(held);
         let after = look();
         assert!(mentioned(&after) && after.holds.is_empty() && after.waits_on.is_none(), "{:?}", after.holds);
@@ -1366,6 +1383,10 @@ mod tests {
         };
         assert_eq!((waiting_for.as_deref(), waits_on.as_ref()), (Some("Documents"), Some(&on_stick)));
         assert!(wanted_still && !must_ask && !engine.stored_job(&inbox).unwrap().needs_review, "not held back");
+        // Its log says why (written once the run ended).
+        let said = |what: &str| engine.log(&inbox, 20).iter().any(|line| line.text.contains(what));
+        until(|| said("found the hidden .charon folder of “Pictures”"));
+        assert!(said("“Documents” is syncing on that drive"), "{:?}", engine.log(&inbox, 5));
         // Until that sync is done, it doesn't begin, nor look.
         let again = engine.start_unreviewed(&inbox, crate::engine::runs::Unreviewed::Wanted(&wanted));
         assert!(matches!(&again, Err(Error::DriveBusy(name)) if name == "Documents"), "{again:?}");
@@ -1377,6 +1398,47 @@ mod tests {
         let job = engine.stored_job(&inbox).unwrap();
         assert!(job.last_synced.is_some() && !job.needs_review, "{:?}", job.held);
         assert!(engine.runtime()[&inbox].waits_on.is_none());
+    }
+
+    /// A wanted run that waits for a sync before it can tell a copy of a marker is still
+    /// refused, as ever, for what else keeps it from starting: a list the person confirmed
+    /// meanwhile, which waits for another sync, stands in for it, and the row keeps saying
+    /// what that list waits for; and once the job is paused, it's called off.
+    #[test]
+    fn a_waiting_run_gives_way_to_a_list_confirmed_meanwhile() {
+        let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
+        let (_, on_stick, inbox, _) = a_copied_marker(&engine, _tmp.path(), true);
+        engine.change_job(&inbox, |job| job.needs_review = false).unwrap();
+        let held = engine.hold_a_sync(&documents).unwrap();
+        let wanted = crate::engine::runtime::Wanted { reason: "automatically after changes".into(), by_hand: false };
+        engine.change_runtime(&inbox, |rt| rt.wanted = Some(wanted.clone()));
+        engine.start_wanted(&inbox);
+        until(|| engine.runtime()[&inbox].waits_on.is_some() && !engine.runtime()[&inbox].is_running());
+        // Confirmed while another Charon was at work in the job's folders.
+        let confirmed = crate::engine::runtime::Confirmed { review_id: "a list".into(), acknowledged: true, pauses: engine.pauses() };
+        engine.change_runtime(&inbox, |rt| {
+            rt.confirmed = Some(confirmed);
+            rt.waiting_for = Some("another Charon".into());
+        });
+        engine.start_wanted(&inbox);
+        let (wanted_still, waits_on, waiting_for) = {
+            let runtime = engine.runtime();
+            let rt = &runtime[&inbox];
+            (rt.wanted.is_some(), rt.waits_on.clone(), rt.waiting_for.clone())
+        };
+        assert!(!wanted_still && waits_on.is_none(), "the confirmed list stands in for it");
+        assert_eq!(waiting_for.as_deref(), Some("another Charon"));
+        // A run a trigger started doesn't start while the job is paused.
+        engine.change_job(&inbox, |job| job.paused = true).unwrap();
+        engine.change_runtime(&inbox, |rt| {
+            rt.confirmed = None;
+            rt.waiting_for = Some("Documents".into());
+            rt.wanted = Some(wanted.clone());
+            rt.waits_on = Some(on_stick.clone());
+        });
+        engine.start_wanted(&inbox);
+        assert!(engine.runtime()[&inbox].wanted.is_none(), "called off");
+        drop(held);
     }
 
     /// The question whether a folder holds a copy of a marker, which may go on after the look
@@ -1391,6 +1453,11 @@ mod tests {
         let before = listing();
         let held = engine.hold_a_sync(&documents).unwrap();
         assert_eq!(engine.origin_unless_kept_quiet(&mirror, &on_stick, &old), crate::run::Origin::Unknown);
+        // Nor when it's the folder with the copy that's on the stick.
+        assert_eq!(engine.origin_unless_kept_quiet(&mirror, &old, &on_stick), crate::run::Origin::Unknown);
+        // It doesn't even look whether the job's folder is there.
+        let gone = _tmp.path().join("stick").join("gone");
+        assert_eq!(engine.origin_unless_kept_quiet(&mirror, &gone, &old), crate::run::Origin::Unknown);
         assert_eq!(listing(), before, "no probe on the stick");
         drop(held);
     }

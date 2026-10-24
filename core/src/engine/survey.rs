@@ -4,6 +4,7 @@
 //! Every look goes through here: the background checks, the reviews the person confirms,
 //! and the runs of jobs with full automation. Nothing in a survey changes a file.
 
+use crate::engine::overlaps::WaitsOn;
 use crate::engine::{runs, Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
@@ -261,10 +262,10 @@ pub(crate) struct Survey {
     /// Why no plan of these folders may run: one is inside the other, whatever their paths
     /// say (see `Overlaps::refusal`). It's in `refusal` too.
     pub nesting: Option<String>,
-    /// A folder whose overlap with this job's can't be told until another job's sync is done
-    /// there, with that job's name (see `Overlaps::waits_on`): a run nobody looks at waits
-    /// for it.
-    pub waits_on: Option<(std::path::PathBuf, String)>,
+    /// Where an overlap with another job's folder can't be told until another job's sync is
+    /// done, when that's all that holds a run back (see `overlaps::Waiting`): a run nobody
+    /// looks at waits for that sync.
+    pub waits_on: Option<WaitsOn>,
     pub warnings: Vec<Warning>,
     /// Why a run nobody looks at must not go ahead.
     pub holds: Vec<String>,
@@ -457,7 +458,6 @@ impl Engine {
         let overlaps = self.overlaps(job, &source, &destination, &go_on)?;
         go_on()?;
         let nesting = overlaps.refusal;
-        let waits_on = overlaps.waits_on;
         let refusal = nesting.clone().or_else(|| Guard::refusal(&plan, &source, &destination));
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
@@ -465,6 +465,13 @@ impl Engine {
         for clash in overlaps.clashes {
             holds.push(clash.clone());
             warnings.push(Warning::danger(clash));
+            needs_tick = true;
+        }
+        // Those that can't be told until another job's sync is done hold back after all the
+        // other reasons (see below).
+        let waiting = overlaps.waiting;
+        for clash in &waiting.clashes {
+            warnings.push(Warning::danger(clash.clone()));
             needs_tick = true;
         }
         warnings.extend(overlaps.copies.into_iter().map(Warning::info));
@@ -623,6 +630,10 @@ impl Engine {
                 warnings.push(Warning::caution(text));
             }
         }
+        // A run nobody looks at waits for that sync only when nothing else holds it back;
+        // otherwise those clashes are among the reasons, after the others.
+        let waits_on = waiting.on.filter(|_| holds.is_empty());
+        holds.extend(waiting.clashes);
         Ok(Survey {
             setup,
             source,
@@ -926,13 +937,14 @@ impl Engine {
         let folded = source.is_folded();
         let found_before = self.inner.same_contents.load(&job.id, &job.setup, folded, markers);
         let mut found_now = Baseline::new();
-        let mut read = false;
+        // The pairs this look read and noted.
+        let mut noted: Vec<String> = Vec::new();
         let (mut done_files, mut done_bytes, mut read_bytes) = (0u64, 0u64, 0u64);
         let mut last_sent: Option<std::time::Instant> = None;
         for candidate in candidates {
             let Candidate { key, source: s, destination: d, alike } = candidate;
             if cancel.load(Ordering::Relaxed) {
-                return Err(self.stopped_comparing(job, markers, read));
+                return Err(self.stopped_comparing(job, markers, &noted));
             }
             self.note_look_moved(&job.id);
             let pair = Pair::new(s, d);
@@ -959,10 +971,10 @@ impl Engine {
                     match same {
                         Ok(same) => {
                             self.change_known_runtime(&job.id, |rt| rt.reads.note(&key, s, d, same, markers));
-                            read = true;
+                            noted.push(key.clone());
                             Some(same)
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(self.stopped_comparing(job, markers, read)),
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(self.stopped_comparing(job, markers, &noted)),
                         // Unreadable now: the plan decides as if they differ (never a removal),
                         // for this look only. The next one reads them again.
                         Err(_) => Some(false),
@@ -995,11 +1007,11 @@ impl Engine {
         }
         // The last pair may have waited for a share while another job was given the drive.
         if cancel.load(Ordering::Relaxed) {
-            return Err(self.stopped_comparing(job, markers, read));
+            return Err(self.stopped_comparing(job, markers, &noted));
         }
         // What the look read, and the pairs it keeps, hold only for the folders it read.
         let keep = found_now != found_before;
-        if (read || keep) && !self.still_marked(job, markers, &|| !cancel.load(Ordering::Relaxed)) {
+        if (!noted.is_empty() || keep) && !self.still_marked(job, markers, &noted, &|| !cancel.load(Ordering::Relaxed)) {
             return Ok(compared);
         }
         if keep {
@@ -1008,31 +1020,53 @@ impl Engine {
         Ok(compared)
     }
 
-    /// Ends a comparison that was stopped, after it `read` some files. What it read holds only
-    /// for the folders it was read in: it's kept while both still carry `markers`. But while a
-    /// sync keeps a drive of them quiet (another job's, or the job's own, which a look it
-    /// stopped may outlive), the markers aren't read there (see `quiet.rs`), and what was
-    /// read is forgotten instead. That's asked again before each marker: the first may wait
-    /// for a share while a sync is given the other's drive.
-    fn stopped_comparing(&self, job: &Job, markers: &Markers, read: bool) -> Error {
-        if read {
-            self.still_marked(job, markers, &|| !self.kept_quiet(&job.setup.source) && !self.kept_quiet(&job.setup.destination));
+    /// Ends a comparison that was stopped, after it read and `noted` some pairs. What it read
+    /// holds only for the folders it was read in: it's kept while both still carry `markers`.
+    /// But while a sync keeps a drive of them quiet (another job's, or the job's own, which a
+    /// look it stopped may outlive), the markers aren't read there (see `quiet.rs`), and what
+    /// this look read is forgotten instead; what earlier looks read and checked stays (a sync
+    /// of the job's own carries it, see `Reads::carry`). That's asked again before each
+    /// marker: the first may wait for a share while a sync is given the other's drive.
+    fn stopped_comparing(&self, job: &Job, markers: &Markers, noted: &[String]) -> Error {
+        if !noted.is_empty() {
+            self.still_marked(job, markers, noted, &|| !self.kept_quiet(&job.setup.source) && !self.kept_quiet(&job.setup.destination));
         }
         Error::Cancelled
     }
 
-    /// Whether both folders of `job` still carry the `markers` read before the scans. If not,
-    /// a folder was replaced while the look read it (another drive under the same name, a
-    /// folder restored from a copy) and may have been read in part: what this session read
-    /// while they carried those markers is forgotten, and the look keeps nothing it found.
-    /// Each marker is read only while `go_on` says so, and when it says no, that counts as a
-    /// marker that changed.
-    fn still_marked(&self, job: &Job, markers: &Markers, go_on: &dyn Fn() -> bool) -> bool {
-        let still = [Side::Source, Side::Destination].into_iter().all(|side| go_on() && Marker::read(job.setup.root(side), &job.id) == *markers.side(side));
-        if !still {
-            self.change_known_runtime(&job.id, |rt| rt.reads.forget(markers));
+    /// Whether both folders of `job` still carry the `markers` read before the scans, after
+    /// the look read and `noted` some pairs. If not, a folder was replaced while the look read
+    /// it (another drive under the same name, a folder restored from a copy) and may have been
+    /// read in part: what this session read while they carried those markers is forgotten, and
+    /// the look keeps nothing it found. Each marker is read only while `go_on` says so; when it
+    /// says no, the look keeps nothing either, and forgets the pairs it `noted` (what earlier
+    /// looks read was checked at their end).
+    fn still_marked(&self, job: &Job, markers: &Markers, noted: &[String], go_on: &dyn Fn() -> bool) -> bool {
+        match self.markers_still(job, markers, go_on) {
+            Some(true) => true,
+            Some(false) => {
+                self.change_known_runtime(&job.id, |rt| rt.reads.forget(markers));
+                false
+            }
+            None => {
+                self.change_known_runtime(&job.id, |rt| rt.reads.forget_pairs(noted, markers));
+                false
+            }
         }
-        still
+    }
+
+    /// Whether both folders of `job` still carry `markers`: `None` when `go_on` says no before
+    /// a marker is read.
+    fn markers_still(&self, job: &Job, markers: &Markers, go_on: &dyn Fn() -> bool) -> Option<bool> {
+        for side in [Side::Source, Side::Destination] {
+            if !go_on() {
+                return None;
+            }
+            if Marker::read(job.setup.root(side), &job.id) != *markers.side(side) {
+                return Some(false);
+            }
+        }
+        Some(true)
     }
 
     /// Keeps the pairs a look found identical for the background looks after it, even after a

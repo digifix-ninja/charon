@@ -1022,8 +1022,9 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   `Marker::origin` reads both markers again: two different ones are two folders. Two identical
   ones are one folder or a copy made since the last sync, which nothing in them tells apart, so
   Charon creates a file `.charon/<uuid>.probe` in one of the two Charon folders, looks for it in
-  the other, and removes it at once (`Marker::same_place`, which never makes a folder). A look
-  stopped meanwhile leaves it, which does no harm (each probe has a name of its own, and
+  the other, and removes it at once (`Marker::same_place`, which never makes a folder). A
+  question stopped meanwhile (its look was stopped, or a sync began to keep the drive of either
+  folder quiet) leaves it, which does no harm (each probe has a name of its own, and
   `Marker::forget` removes the probes left in a `.charon` folder with its last marker). A copy is
   harmless: the list only mentions it, in an info warning saying it can be deleted. When Charon
   can't tell (neither Charon folder takes a file, or a marker can't be read), the job's own
@@ -1264,11 +1265,14 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   about a folder there (whether it holds a copy of a marker, `Engine::ask_about`) isn't asked:
   the last time the disk told them apart, a copy or the folder itself, holds
   (`QuietDrives::origin`), and a pair never told apart this session can't tell until that sync
-  is done (`Overlaps::waits_on`): the list says so, with the careful clash warning, and a run
-  nobody looks at isn't held back for the person's OK but waits for that sync without looking
-  again meanwhile (`JobRuntime::waits_on`, checked in `start_unreviewed`). A scan doesn't ask the drive where a folder a
-  sync client syncs there really is (`Scanner::keeping_off`): it's taken as the client wrote
-  it. Saving a job checks its folders
+  is done (`overlaps::Waiting`): the list says so, with the careful clash warning. A run nobody
+  looks at that has no other reason to hold back (`Survey::waits_on`) isn't held back for the
+  person's OK but waits for that sync without looking again meanwhile (`JobRuntime::waits_on`,
+  checked in `start_unreviewed`, from memory first where nothing else would refuse the run),
+  and the job's log says once what was found where and which job is syncing; with another
+  reason, it's held, these clashes coming after the other reasons. A scan doesn't ask the drive
+  where a folder a sync client syncs there really is (`Scanner::keeping_off`): it's taken as
+  the client wrote it. Saving a job checks its folders
   against each other and against other jobs' as last found there, or waits when one was never
   found (`resolving_for_saving`, `folders_for_saving`, `JobSetup::validate_as`). The busy notes
   there are refreshed by the sync's thread between steps and between the pieces of a file
@@ -1591,8 +1595,9 @@ In each synced folder, Charon keeps:
   *Overlapping jobs and other Charons*), also in the `.charon` folders of other jobs' folders
   inside the folders it syncs. One that a sync cut short left behind is removed by the
   next sync that finds it, once it counts for nothing. For an instant, `.charon/<uuid>.probe`
-  tells whether two folders holding the same marker are one folder; a look stopped at that
-  instant may leave it, and it goes with the folder's last marker.
+  tells whether two folders holding the same marker are one folder; a question stopped at that
+  instant (its look was stopped, or a sync began to keep the drive quiet) may leave it, and it
+  goes with the folder's last marker.
 - `.charon-trash/<date>_<time>_<id>/`: what a run removed or replaced, with its `.charon` list.
 - `.charon-<16 hex digits>.part`: a copy on its way (of a file or a link), an original Charon
   renamed aside for a moment while replacing or removing it, or, for an instant, a probe that

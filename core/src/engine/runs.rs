@@ -20,7 +20,7 @@ use crate::model::{plural, Drives, Finished, Folder, Job, JobId, JobSetup, Mark,
 use crate::plan::{Action, Baseline, NoteKind, Plan, Side};
 use crate::run::{BusyNote, Care, Claim, Executor, Found, Marker, Markers, Outcome, ProgressMeter, Shores, Spellings, Trash};
 use crate::scan::{never_download_on_this_thread, ExcludeFilter, Keys, Scanner, Snapshot, MARKER_FOLDER};
-use crate::store::{Landings, Memory};
+use crate::store::{Landings, Memory, StoredState};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -365,8 +365,9 @@ impl Engine {
         self.inner.journal.info(id, &format!("the sync that waited for “{who}” was called off: {why}"));
     }
 
-    /// Starts the job's wanted run, if it has one. While another sync uses the folders it
-    /// keeps waiting (the row says for which); any other refusal drops it.
+    /// Starts the job's wanted run, if it has one. While another sync uses the folders, or
+    /// another job holds a drive it needs (see `quiet.rs`), it keeps waiting (the row says for
+    /// whom); any other refusal drops it.
     pub fn start_wanted(&self, id: &JobId) {
         let Some(wanted) = self.runtime().get(id).and_then(|rt| rt.wanted.clone()) else { return };
         self.start_as_wanted(id, &wanted);
@@ -397,9 +398,12 @@ impl Engine {
     }
 
     /// Starts a run nobody looks at (full automation): it surveys first, and holds back for
-    /// the person's OK when anything about the plan needs a look. A run a trigger started
-    /// doesn't start while the job or everything is paused, and the job's wanted run only
-    /// while the job still wants it (`Cancelled` otherwise).
+    /// the person's OK when anything about the plan needs a look. When all that keeps it
+    /// from going ahead is another job's sync, which keeps a drive quiet that Charon would
+    /// ask whether two folders are one (see `overlaps::Waiting`), it waits for that sync
+    /// instead, as the job's wanted run, which doesn't look again until that sync is done. A
+    /// run a trigger started doesn't start while the job or everything is paused, and the
+    /// job's wanted run only while the job still wants it (`Cancelled` otherwise).
     pub(crate) fn start_unreviewed(&self, id: &JobId, start: Unreviewed) -> Result<()> {
         // A run whose end can't be recorded mustn't start by itself (a failed save tries
         // again at most once a minute).
@@ -407,21 +411,13 @@ impl Engine {
             return Err(Error::Invalid(CANNOT_SAVE.into()));
         }
         let crossing = start.crossing();
+        // A wanted run that waits for a sync that keeps another job's drive quiet (see the
+        // check below) is told so from memory, before anything is asked of the disk.
+        if let Some(name) = self.still_waits(id, start, &crossing) {
+            return Err(Error::DriveBusy(name));
+        }
         let (job, cancel) = self.begin_run(id, &crossing, |job, rt| {
-            // Checked where `begin_run` takes the wanted run along, so a pause that called it
-            // off either finds the run going (and stops it), or this finds it called off.
-            if !start.still_asked_for(rt) {
-                return Err(Error::Cancelled);
-            }
-            if !job.runs_by_itself() || rt.must_ask {
-                return Err(Error::Invalid("This job waits for your OK before it syncs.".into()));
-            }
-            if rt.confirmed.is_some() {
-                return Err(Error::Invalid("You confirmed a list of this job's changes, and its sync waits for another sync to finish.".into()));
-            }
-            if rt.preparing.is_some() || rt.review.as_ref().is_some_and(|review| Utc::now() < review.expires_at) {
-                return Err(Error::Invalid("A list of this job's changes is open, waiting for your OK.".into()));
-            }
+            Self::unreviewed_refusal(start, job, rt)?;
             // A wanted run that couldn't tell whether a folder on a drive kept quiet overlaps
             // with this job's waits until no sync keeps it quiet, without looking again.
             if let (Unreviewed::Wanted(_), Some(folder)) = (start, &rt.waits_on) {
@@ -435,11 +431,22 @@ impl Engine {
         self.publish(id);
         self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
             // Only another job's sync, which keeps a drive quiet, keeps this look from telling
-            // whether the job's folders overlap that job's: the run waits for it, rather than
-            // hold back for the person's OK (see `Overlaps::waits_on`).
-            Ok(Survey { waits_on: Some((folder, name)), .. }) => {
-                engine.change_runtime(&job.id, |rt| rt.waits_on = Some(folder));
-                engine.not_begun(&job, &crossing, &name);
+            // whether the job's folders overlap another job's: the run waits for that sync,
+            // rather than hold back for the person's OK (see `overlaps::Waiting`).
+            Ok(Survey { waits_on: Some(waits), .. }) => {
+                engine.change_runtime(&job.id, |rt| rt.waits_on = Some(waits.folder.clone()));
+                if engine.not_begun(&job, &crossing, &waits.syncing) {
+                    engine.inner.journal.info(
+                        &job.id,
+                        &format!(
+                            "Charon found the hidden .charon folder of “{}” in {}, and can't tell yet whether that's that job's folder or holds a copy of it: \
+                             “{}” is syncing on that drive, and Charon asks once it's done. If it's a copy, you can delete that .charon folder.",
+                            waits.whose,
+                            waits.found.display(),
+                            waits.syncing
+                        ),
+                    );
+                }
             }
             Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
             Ok(mut survey) => {
@@ -453,6 +460,45 @@ impl Engine {
             }
             Err(e) => engine.unfinished(&job, &crossing, e),
         })
+    }
+
+    /// Why a run nobody looks at can't start as the job is now (`rt`), if it can't: checked
+    /// where `begin_run` marks it as running (see `start_unreviewed`).
+    fn unreviewed_refusal(start: Unreviewed, job: &Job, rt: &JobRuntime) -> Result<()> {
+        // Checked where `begin_run` takes the wanted run along, so a pause that called it off
+        // either finds the run going (and stops it), or this finds it called off.
+        if !start.still_asked_for(rt) {
+            return Err(Error::Cancelled);
+        }
+        if !job.runs_by_itself() || rt.must_ask {
+            return Err(Error::Invalid("This job waits for your OK before it syncs.".into()));
+        }
+        if rt.confirmed.is_some() {
+            return Err(Error::Invalid("You confirmed a list of this job's changes, and its sync waits for another sync to finish.".into()));
+        }
+        if rt.preparing.is_some() || rt.review.as_ref().is_some_and(|review| Utc::now() < review.expires_at) {
+            return Err(Error::Invalid("A list of this job's changes is open, waiting for your OK.".into()));
+        }
+        Ok(())
+    }
+
+    /// The sync that the job's wanted run still waits for, as the check in
+    /// `start_unreviewed` finds it, told from memory: only where `begin_run` and that check
+    /// would get as far as the wait, so answering before them changes nothing but the disk
+    /// work it saves.
+    fn still_waits(&self, id: &JobId, start: Unreviewed, crossing: &Crossing) -> Option<String> {
+        if !matches!(start, Unreviewed::Wanted(_)) || self.older_charon_running() {
+            return None;
+        }
+        let state = self.state();
+        let job = state.jobs.iter().find(|job| &job.id == id)?;
+        let runtime = self.runtime();
+        let rt = runtime.get(id)?;
+        let folder = rt.waits_on.as_ref()?;
+        if self.may_begin(&state, &runtime, job, crossing).is_err() || Self::unreviewed_refusal(start, job, rt).is_err() {
+            return None;
+        }
+        self.inner.quiet.kept_by_another(id, &[folder])
     }
 
     /// Leaves for a later run the removals that follow an item missing for only a few
@@ -481,6 +527,23 @@ impl Engine {
             ));
         }
         self.inner.journal.info(&job.id, &line);
+    }
+
+    /// Why a run of `job` can't begin as Charon is now, if it can't (under the locks of the
+    /// stored `state` and the `runtime`).
+    fn may_begin(&self, state: &StoredState, runtime: &HashMap<JobId, JobRuntime>, job: &Job, crossing: &Crossing) -> Result<()> {
+        if self.is_shutting_down() {
+            return Err(Error::Invalid("Charon is quitting.".into()));
+        }
+        if runtime.get(&job.id).is_some_and(|rt| rt.is_running()) {
+            return Err(Error::Busy);
+        }
+        // Read where pausing saves it: a pause saved after this finds the run going, and
+        // stops it (see `set_paused`, `set_all_paused`).
+        if !crossing.by_hand && (job.paused || state.settings.paused_all) {
+            return Err(Error::Invalid(PAUSED.into()));
+        }
+        Ok(())
     }
 
     /// Marks the job as running for `crossing`, if it may run now: Charon isn't quitting, the
@@ -517,17 +580,7 @@ impl Engine {
         let state = self.state();
         let job = state.jobs.iter().find(|job| &job.id == id).cloned().ok_or_else(|| Error::UnknownJob(id.clone()))?;
         let mut runtime = self.runtime();
-        if self.is_shutting_down() {
-            return Err(Error::Invalid("Charon is quitting.".into()));
-        }
-        if runtime.get(id).is_some_and(|rt| rt.is_running()) {
-            return Err(Error::Busy);
-        }
-        // Read where pausing saves it: a pause saved after this finds the run going, and
-        // stops it (see `set_paused`, `set_all_paused`).
-        if !crossing.by_hand && (job.paused || state.settings.paused_all) {
-            return Err(Error::Invalid(PAUSED.into()));
-        }
+        self.may_begin(&state, &runtime, &job, crossing)?;
         check(&job, runtime.entry(id.clone()).or_default())?;
         if let Some(name) = drive_used.or_else(|| self.drive_used_among(&state.jobs, &runtime, &job, asker)) {
             if asker == Asker::Charon {
@@ -652,7 +705,8 @@ impl Engine {
     }
 
     /// Ends a run that found another sync (`who`) at work in its folders right before it
-    /// would have changed anything: nothing happened. A run nobody looks at is wanted again,
+    /// would have changed anything, or on a drive it had to ask about (see
+    /// `start_unreviewed`): nothing happened. A run nobody looks at is wanted again,
     /// and starts once that sync is done; a confirmed run is kept waiting by the one who
     /// started it (see `approve`). Returns false when the person stopped the run meanwhile:
     /// it then ends as stopped. (Syncs that waited for this one are started by the autopilot

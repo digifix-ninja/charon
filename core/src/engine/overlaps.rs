@@ -39,11 +39,34 @@ pub(crate) struct Overlaps {
     /// Folders holding a copy of a job's hidden `.charon` folder, each said in a sentence:
     /// harmless, and mentioned so the person can delete them.
     pub copies: Vec<String>,
-    /// A folder this look couldn't ask whether it's another job's or holds a copy of its
-    /// marker, as another job's sync keeps its drive quiet, with that job's name: what's
-    /// found there counts as maybe one place, and a run nobody looks at waits for that sync
-    /// instead of holding back for the person's OK (see `clashes_by_markers`).
-    pub waits_on: Option<(PathBuf, String)>,
+    /// What couldn't be told only because another job's sync keeps a drive quiet.
+    pub waiting: Waiting,
+}
+
+/// The clashes a look couldn't rule out only because another job's sync keeps the drive of
+/// one of the folders quiet, so the disk wasn't asked whether a marker found is a copy (see
+/// `clashes_by_markers`): they count as maybe one place until that sync is done. A run
+/// nobody looks at that has no other reason to hold back waits for that sync instead.
+#[derive(Debug, Default)]
+pub(crate) struct Waiting {
+    /// Each said in a sentence.
+    pub clashes: Vec<String>,
+    /// The first of them.
+    pub on: Option<WaitsOn>,
+}
+
+/// A marker found where the disk couldn't be asked whether it's a copy, as a sync keeps the
+/// drive quiet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WaitsOn {
+    /// The folder on the drive kept quiet: the other job's, or the one holding its marker.
+    pub folder: PathBuf,
+    /// The folder holding the other job's marker.
+    pub found: PathBuf,
+    /// The name of the job whose marker it is.
+    pub whose: String,
+    /// The name of the job whose sync keeps the drive quiet.
+    pub syncing: String,
 }
 
 /// A job's marker found around one of this job's folders.
@@ -86,9 +109,9 @@ impl Engine {
                 unseen.push(other);
             }
         }
-        let mut waits_on = None;
-        clashes.extend(self.clashes_by_markers(job, &unseen, &around, &mut copies, &mut waits_on, go_on)?);
-        Ok(Overlaps { refusal, clashes, copies: copies.into_iter().collect(), waits_on })
+        let mut waiting = Waiting::default();
+        clashes.extend(self.clashes_by_markers(job, &unseen, &around, &mut copies, &mut waiting, go_on)?);
+        Ok(Overlaps { refusal, clashes, copies: copies.into_iter().collect(), waiting })
     }
 
     /// Why the job's two folders can't be synced, if one of them carries the job's marker of
@@ -137,15 +160,15 @@ impl Engine {
     /// found around this job's folders where the two jobs would undo each other's work, each
     /// said in a sentence. Copies of their markers are added to `copies` instead. A job
     /// whose own folder is away can't sync now: it's looked at again at the next look. A
-    /// folder that couldn't be asked about only because a sync keeps its drive quiet goes in
-    /// `waits_on` (the first one).
+    /// clash that can't be ruled out only because a sync keeps a drive quiet goes in
+    /// `waiting` instead.
     fn clashes_by_markers(
         &self,
         job: &Job,
         others: &[&Job],
         around: &[MarkerAround],
         copies: &mut BTreeSet<String>,
-        waits_on: &mut Option<(PathBuf, String)>,
+        waiting: &mut Waiting,
         go_on: &dyn Fn() -> Result<()>,
     ) -> Result<Vec<String>> {
         let mut named: BTreeSet<&JobId> = BTreeSet::new();
@@ -189,9 +212,9 @@ impl Engine {
                 }
                 None | Some(Origin::Unknown) if skipped || quiet() => self.inner.quiet.origin(&other.id, root, &found.folder).unwrap_or_else(|| {
                     kept_by = self.inner.quiet.kept_by_another(&job.id, &[root, &found.folder]);
-                    if let (None, Some(name)) = (&waits_on, &kept_by) {
+                    if let (None, Some(syncing)) = (&waiting.on, &kept_by) {
                         let folder = if self.kept_quiet(root) { root } else { &found.folder };
-                        *waits_on = Some((folder.to_path_buf(), name.clone()));
+                        waiting.on = Some(WaitsOn { folder: folder.to_path_buf(), found: found.folder.clone(), whose: name.clone(), syncing: syncing.clone() });
                     }
                     Origin::Unknown
                 }),
@@ -207,14 +230,16 @@ impl Engine {
                 Origin::Away => continue,
             };
             named.insert(&other.id);
-            clashes.push(if let Some(syncing) = kept_by {
-                format!(
+            if let Some(syncing) = kept_by {
+                waiting.clashes.push(format!(
                     "This job's {mine} folder and the {theirs} folder of “{name}” may be one place, or one inside the other, though their paths differ (a drive or share reachable under two names, or a link): \
                      Charon found that job's marker in {folder}, and can't tell yet whether that folder is that job's folder or holds a copy of its hidden .charon folder: \
                      “{syncing}” is syncing on that drive, and Charon asks it once that's done. One of the two is a Mirror job, which removes what the other brings in. \
-                     Check the removals in this list, or wait until “{syncing}” is done."
-                )
-            } else if sure {
+                     Check the removals in this list, or close it and look again once “{syncing}” is done."
+                ));
+                continue;
+            }
+            clashes.push(if sure {
                 format!(
                     "This job's {mine} folder and the {theirs} folder of “{name}” are one place, or one is inside the other, though their paths differ (a drive or share reachable under two names, or a link): \
                      Charon found that job's marker in {folder}. One of the two is a Mirror job, which removes what the other brings in. \
@@ -237,7 +262,12 @@ impl Engine {
     /// either folder quiet: the question may go on after the look that asked it, and stops
     /// before its next step once a sync does (it then can't tell).
     pub(crate) fn origin_unless_kept_quiet(&self, whose: &JobId, root: &Path, found: &Path) -> Origin {
-        Marker::origin(whose, root, found, &|| !self.kept_quiet(root) && !self.kept_quiet(found))
+        let go_on = || !self.kept_quiet(root) && !self.kept_quiet(found);
+        // Asked before its first step too (whether the other job's folder is there).
+        if !go_on() {
+            return Origin::Unknown;
+        }
+        Marker::origin(whose, root, found, &go_on)
     }
 
     /// What the list says about a folder holding a copy of the hidden `.charon` folder of
@@ -439,7 +469,7 @@ mod tests {
         fs::remove_dir_all(&again).unwrap();
         std::os::unix::fs::symlink(&nas, &again).unwrap();
         let mut copies = BTreeSet::new();
-        let clashes = engine.clashes_by_markers(&inbox, &[&mirror], &found(Side::Destination, &again.join("Photos"), &mirror), &mut copies, &mut None, &|| Ok(())).unwrap();
+        let clashes = engine.clashes_by_markers(&inbox, &[&mirror], &found(Side::Destination, &again.join("Photos"), &mirror), &mut copies, &mut Waiting::default(), &|| Ok(())).unwrap();
         assert_eq!(clashes.len(), 1);
         assert!(clashes[0].contains("“Photos”") && clashes[0].contains("are one place"), "{}", clashes[0]);
         assert!(copies.is_empty());
@@ -456,13 +486,13 @@ mod tests {
         copy_charon_folder(&usb.join("Photos"), &old_photos);
         let around = found(Side::Source, &old_photos, &mirror);
         let mut copies = BTreeSet::new();
-        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut None, &|| Ok(())).unwrap().is_empty());
+        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut Waiting::default(), &|| Ok(())).unwrap().is_empty());
         let note = copies.iter().next().expect("the copy is mentioned");
         assert!(note.contains("Old photos") && note.contains("“Photos”"), "{note}");
         // The drive is unplugged: the Mirror can't sync, and nothing is said.
         move_folder(&usb, &tmp.path().join("unplugged"));
         let mut copies = BTreeSet::new();
-        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut None, &|| Ok(())).unwrap().is_empty());
+        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut Waiting::default(), &|| Ok(())).unwrap().is_empty());
         assert!(copies.is_empty());
     }
 

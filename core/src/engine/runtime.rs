@@ -32,8 +32,10 @@ pub(crate) struct JobRuntime {
     /// The person confirmed the job's list while another sync used its folders: it starts
     /// as soon as that sync is done (see `Engine::start_confirmed`).
     pub confirmed: Option<Confirmed>,
-    /// The sync whose folders the confirmed run, or else the wanted run, waits for: another
-    /// job's name, or another Charon.
+    /// Who the confirmed run, or else the wanted run, waits for, by name: another job whose
+    /// sync is at work in its folders, or whose run, list or look holds a drive of them run by
+    /// an add-on driver, or whose sync keeps quiet a drive the wanted run must ask about (see
+    /// `waits_on`); or another Charon.
     pub waiting_for: Option<String>,
     /// Since when the job's look in the background or its wanted run waits for its turn on a
     /// drive run by an add-on driver (see `quiet.rs`).
@@ -320,11 +322,27 @@ impl Reads {
         self.pairs.len()
     }
 
+    /// Whether the read of the pair at `key` is kept.
+    #[cfg(test)]
+    pub fn has(&self, key: &str) -> bool {
+        self.pairs.contains_key(key)
+    }
+
     /// Forgets what was read in folders that carried `markers`: one of them was replaced
     /// while a look read it, and may have been read in part.
     pub fn forget(&mut self, markers: &Markers) {
         if self.markers.as_ref() == Some(markers) {
             *self = Self::default();
+        }
+    }
+
+    /// Forgets the reads of the pairs at `keys` in folders that carried `markers`: a look
+    /// that read them couldn't check its folders' markers at its end.
+    pub fn forget_pairs(&mut self, keys: &[String], markers: &Markers) {
+        if self.markers.as_ref() == Some(markers) {
+            for key in keys {
+                self.pairs.remove(key);
+            }
         }
     }
 

@@ -28,7 +28,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 /// What the name of the probe file ends with that tells whether two folders are one (see
-/// `Marker::origin`). It's taken away again at once, unless a look was stopped meanwhile
+/// `Marker::origin`). It's taken away again at once, unless the question was stopped
+/// meanwhile: its look was stopped, or a sync began to keep the drive of either folder quiet
 /// (see `Marker::same_place`).
 pub const PROBE_EXTENSION: &str = ".probe";
 
