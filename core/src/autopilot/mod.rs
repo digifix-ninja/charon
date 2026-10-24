@@ -136,6 +136,7 @@ impl Autopilot {
 
     /// One look at every job.
     fn tick(&mut self) {
+        self.engine.note_a_tick();
         // After a gap (the computer slept), the shares may have gone away and come back
         // without any tick seeing it.
         let moment = Moment::now();

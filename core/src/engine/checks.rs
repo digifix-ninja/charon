@@ -42,8 +42,9 @@ impl Engine {
     /// Looks for changes in the background: scans both folders and plans, but changes
     /// nothing. Does nothing while the job runs, is being looked at, or a look is running,
     /// nor while another job runs or is looked at on a drive of its folders that's run by an
-    /// add-on driver (it's looked at once that's done; see `quiet.rs`). What it finds counts
-    /// only if nothing outdated it meanwhile (see `note_look`).
+    /// add-on driver, or began to wait for its turn there first (it's looked at in its turn;
+    /// see `quiet.rs`). What it finds counts only if nothing outdated it meanwhile (see
+    /// `note_look`).
     pub fn check(&self, id: &JobId) {
         self.look_in_background(id, Asker::Charon);
     }
@@ -84,10 +85,13 @@ impl Engine {
             if drive_used.is_some() {
                 // Looked at as soon as its turn comes.
                 rt.last_checked = None;
-                Self::note_drive_wait(rt);
+                self.note_drive_wait(rt);
                 return drive_used;
             }
+            self.stop_looks_sharing_a_drive(&state.jobs, &mut runtime, &job);
+            let rt = runtime.entry(id.clone()).or_default();
             rt.checking = Some(stop.clone());
+            rt.look_moved = Some(Instant::now());
             rt.drive_wait = None;
             (job, rt.epoch)
         };

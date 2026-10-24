@@ -10,9 +10,10 @@
 //! while a job's run (its look, then its sync) or a list being made for it reads the drive,
 //! no other job's run, list or look starts there. What Charon starts by itself (a look in the
 //! background, a run a trigger started) also waits for another job's look there, unless that
-//! look is stuck: a folder of its job didn't answer in time, and the look waits for it, not
-//! reading the drive. And it waits its turn: jobs held back there go in the order they began
-//! to wait, whatever their order in the list, so no job keeps another off the drive for good.
+//! look stopped moving on: it's most likely waiting for a folder that doesn't answer, not
+//! reading the drive, and whoever goes ahead of it stops it. And it waits its turn: jobs held
+//! back there go in the order they began to wait, whatever their order in the list, so no job
+//! keeps another off the drive for good.
 //! A run or a list the person asked for waits neither for a look nor for its turn: it stops
 //! the looks in the background there, and they come again once it's done. A run that waits
 //! says so in its row, and starts by itself in its turn. And while a sync writes to the
@@ -20,7 +21,14 @@
 //! * the sync refreshes its busy notes there itself, as it goes (see `run::Claim::beat`; the
 //!   heartbeat does only when the sync is held up so long that they'd go stale);
 //! * what the window, the autopilot and the reminders ask about folders on the drive is
-//!   answered from what was found before (see `Engine::whereabouts_of`, `Engine::folders_of`);
+//!   answered from what was found before (see `Engine::whereabouts_of`, `Engine::folders_of`),
+//!   and what another job's look would ask about one isn't asked (see `Engine::ask_about`):
+//!   whether a folder there holds a copy of a marker is as the disk last told it apart (see
+//!   `QuietDrives::origin`; a run nobody looks at that can't tell waits for the sync, see
+//!   `Overlaps::waits_on`), and where a folder a sync client syncs there really is, as the
+//!   client wrote it (see `Scanner::keeping_off`);
+//! * a file a stopped look still holds open there is closed once the sync is done (see
+//!   `Engine::let_go`), as closing it is work for the driver too;
 //! * the autopilot stops watching the folders on the drive for changes until the sync is done.
 //!   What changes there meanwhile isn't heard, as on a network share: the next regular look
 //!   finds it, at most one look interval after the folders stopped being watched, or after
@@ -28,9 +36,9 @@
 //!   still be confirmed, and its folders are looked at again once it's carried out (see
 //!   `Engine::let_looks_end`).
 //!
-//! Before it writes, the sync waits a moment for other looks there to stop and for the
-//! autopilot to stop watching; when either takes too long, it writes all the same, and the
-//! app's log says so.
+//! Before it writes, the sync waits a moment for other looks there to stop (not for one that
+//! stopped moving on, which is only stopped) and for the autopilot to stop watching; when
+//! either takes too long, it writes all the same, and the app's log says so.
 //!
 //! A drive is told by where it's mounted, as the disk last said: a folder that leads there
 //! through a link is asked about as ever, and so is one Charon knows nothing of yet. The lock
@@ -43,9 +51,10 @@ use crate::engine::Engine;
 use crate::error::{Error, Result};
 use crate::model::{Folder, Job, JobId};
 use crate::plan::Side;
-use crate::run::Claim;
+use crate::run::{Claim, Origin};
 use crate::scan::Volume;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
@@ -53,7 +62,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// How long a sync waits for the looks it stopped to end, before it writes to a drive it
-/// keeps quiet. A look stops at its next item, so this is only a bound for a slow drive.
+/// keeps quiet. A look stops before its next step, so this is only a bound for a slow drive.
 const LOOKS_END_WITHIN: Duration = Duration::from_secs(5);
 /// How long a sync waits for the autopilot to stop watching the folders on a drive it keeps
 /// quiet, before it writes there. The autopilot does at its next tick, every second, unless a
@@ -61,11 +70,13 @@ const LOOKS_END_WITHIN: Duration = Duration::from_secs(5);
 const UNWATCHED_WITHIN: Duration = Duration::from_secs(3);
 /// The name of the autopilot's thread, which follows the drives kept quiet itself.
 pub(crate) const AUTOPILOT_THREAD: &str = "charon-autopilot";
-/// How long a job that waits for its turn on a drive run by an add-on driver keeps its turn
-/// without asking again. The autopilot asks again at every tick (every second, or every few
-/// seconds while a share is slow to answer): a job that stopped asking (a folder of it went
-/// away) holds the others up no longer than this.
-const WAITS_LAPSE: Duration = Duration::from_secs(30);
+/// How long a background look that stopped moving on (no items scanned, no pair or piece of a
+/// file compared, nothing gone through in a trash, no file it couldn't read before tried again)
+/// holds a drive run by an add-on driver: one that doesn't move on for this long is most
+/// likely stuck, waiting for something that doesn't answer (a network share on its other
+/// side), not reading the drive. A slow look that keeps reading holds it however long it
+/// takes.
+const STALLED_FOR: Duration = Duration::from_secs(120);
 
 /// Who asks to work on a drive run by an add-on driver, and so what holds them back there
 /// (see `Engine::drive_used_among`).
@@ -75,26 +86,30 @@ pub(crate) enum Asker {
     /// back. It stops other jobs' looks in the background there instead.
     Person,
     /// The person's *Look for changes*: another job's look there holds it back too, unless
-    /// that look is stuck.
+    /// that look stopped moving on (see `STALLED_FOR`).
     PersonsLook,
     /// Charon by itself (a look in the background, a run a trigger started): another job's
-    /// look holds it back too, unless it's stuck, and so does a job that began to wait for the
-    /// drive before it.
+    /// look holds it back too, unless it stopped moving on, and so does a job that began to
+    /// wait for the drive before it.
     Charon,
 }
 
-/// Since when a job waits for its turn on a drive run by an add-on driver, and when it last
-/// asked for it.
+/// Since when a job waits for its turn on a drive run by an add-on driver, and in which of the
+/// autopilot's ticks it last asked for it.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DriveWait {
     since: Instant,
-    asked: Instant,
+    asked_in: u64,
 }
 
 impl DriveWait {
-    /// Whether the job still asks for its turn.
-    fn asks(&self) -> bool {
-        self.asked.elapsed() < WAITS_LAPSE
+    /// Whether the job still asks for its turn, in the autopilot's tick `tick`. The autopilot
+    /// asks again for every job that waits at every tick: one it didn't ask for in this tick
+    /// or the one before has stopped asking (a folder of it went away, its run isn't wanted
+    /// anymore), and holds nobody up. Counted in ticks, not in time: one tick can take long
+    /// while a share is slow to answer.
+    fn asks(&self, tick: u64) -> bool {
+        tick <= self.asked_in + 1
     }
 }
 
@@ -108,6 +123,15 @@ pub(crate) struct QuietDrives {
     followed: AtomicU64,
     /// Whether the autopilot follows them at all (it runs, and watches folders).
     following: std::sync::atomic::AtomicBool,
+    /// How many ticks the autopilot began (see `Engine::note_a_tick`).
+    ticks: AtomicU64,
+    /// How many times looks noted that they moved on, for tests.
+    #[cfg(test)]
+    moves: AtomicU64,
+    /// What a test does each time a look notes that it moved on.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    when_moved: Mutex<Option<Box<dyn Fn(&Engine, &JobId) + Send + Sync>>>,
 }
 
 #[derive(Default)]
@@ -117,6 +141,14 @@ struct Known {
     /// another job on a drive kept quiet.
     presences: HashMap<PathBuf, Presence>,
     folders: HashMap<PathBuf, Folder>,
+    /// Files a stopped look still had open on a drive kept quiet, with their paths: they're
+    /// closed once no sync keeps it quiet (see `Engine::let_go`).
+    left_open: Vec<(PathBuf, File)>,
+    /// Where a job's marker found around another job's folders comes from, by the job, its
+    /// folder and the folder it was found in, as the disk last told them apart (a copy, or
+    /// the folder itself): what's said while a drive of them is kept quiet (see
+    /// `Engine::clashes_by_markers`).
+    origins: HashMap<(JobId, PathBuf, PathBuf), Origin>,
 }
 
 /// A drive one sync keeps quiet.
@@ -208,6 +240,18 @@ impl QuietDrives {
         Some((known.folder(folder).flatten(), name))
     }
 
+    /// Notes where the marker of job `id` found in `found` comes from, when the job's folder
+    /// is `root`, as the disk just said.
+    pub fn remember_origin(&self, id: &JobId, root: &Path, found: &Path, origin: Origin) {
+        self.known().origins.insert((id.clone(), root.to_path_buf(), found.to_path_buf()), origin);
+    }
+
+    /// Where the marker of job `id` found in `found` came from when the disk last told it
+    /// apart (see `remember_origin`).
+    pub fn origin(&self, id: &JobId, root: &Path, found: &Path) -> Option<Origin> {
+        self.known().origins.get(&(id.clone(), root.to_path_buf(), found.to_path_buf())).copied()
+    }
+
     /// The name of the job whose sync keeps the drive of one of `folders` quiet, if it isn't
     /// the job `id`.
     pub fn kept_by_another(&self, id: &JobId, folders: &[&Path]) -> Option<String> {
@@ -275,9 +319,17 @@ impl Quiet {
 }
 
 impl Drop for Quiet {
-    /// Ends the keep.
+    /// Ends the keep, and closes the files a stopped look left open on its drives, unless
+    /// another keep holds them (outside the lock: closing a file may take a moment).
     fn drop(&mut self) {
-        self.engine.inner.quiet.known().drives.retain(|drive| drive.keep != self.keep);
+        let closing: Vec<(PathBuf, File)> = {
+            let mut known = self.engine.inner.quiet.known();
+            known.drives.retain(|drive| drive.keep != self.keep);
+            let (kept, closing) = std::mem::take(&mut known.left_open).into_iter().partition(|(path, _)| known.drive_of(path).is_some());
+            known.left_open = kept;
+            closing
+        };
+        drop(closing);
     }
 }
 
@@ -396,7 +448,8 @@ impl Engine {
     /// Stops the background looks of other jobs whose folders are on the drives `job`'s sync
     /// now keeps quiet (they count for nothing, and come again once the sync is done), and
     /// waits a moment for them and any look of the job's own (stopped as its run began) to
-    /// end. A look the person asked for isn't stopped, only waited for. Most were stopped or
+    /// end, but for a look that stopped moving on (see `stalled`). A look the person asked
+    /// for isn't stopped, only waited for. Most were stopped or
     /// waited for as the run began (see `drive_used_by_another`): this is for those that began
     /// before Charon knew the drive.
     ///
@@ -423,10 +476,12 @@ impl Engine {
                 }
             });
         }
+        // A look that stopped moving on most likely waits for its other folder (see
+        // `stalled`): stopped, it ends before its next step on either folder.
         let until = Instant::now() + LOOKS_END_WITHIN;
         let looking = || {
             let runtime = self.runtime();
-            on_drive.iter().any(|id| runtime.get(id).is_some_and(|rt| rt.checking.is_some() || rt.preparing.is_some()))
+            on_drive.iter().any(|id| runtime.get(id).is_some_and(|rt| (rt.checking.is_some() && !Self::stalled(rt)) || rt.preparing.is_some()))
         };
         while looking() {
             if Instant::now() >= until {
@@ -453,44 +508,74 @@ impl Engine {
     /// Another job on the drive holds `asker` back while its run (its look or its sync) or a
     /// list being made for it is at work there, or its sync keeps the drive quiet. Unless the
     /// person asked for a run or a list, its look in the background holds it back too, but
-    /// not one that's most likely stuck on a folder that doesn't answer (`stuck`). And Charon
-    /// by itself also waits for the jobs that began to wait for the drive before it and still
-    /// ask: turns there go in the order the waits began, whatever the order of the jobs, and
-    /// whether they wait to look or to sync (see `note_drive_wait`).
+    /// not one that stopped moving on (`stalled`). And Charon by itself also waits for the
+    /// jobs that began to wait for the drive before it and still ask: turns there go in the
+    /// order the waits began, whatever the order of the jobs, and whether they wait to look
+    /// or to sync (see `note_drive_wait`). The name is of a job at work there when there is
+    /// one, for the row that waits says it waits until that job is done.
     pub(crate) fn drive_used_among(&self, jobs: &[Job], runtime: &HashMap<JobId, JobRuntime>, job: &Job, asker: Asker) -> Option<String> {
         let mine = [job.setup.source.as_path(), job.setup.destination.as_path()];
         let looks = asker != Asker::Person;
-        let turns = asker == Asker::Charon;
-        let my_turn = runtime.get(&job.id).and_then(|rt| rt.drive_wait).filter(DriveWait::asks).map_or_else(Instant::now, |wait| wait.since);
-        jobs.iter()
-            .filter(|other| other.id != job.id)
-            .filter(|other| {
-                runtime.get(&other.id).is_some_and(|rt| {
-                    rt.is_running()
-                        || rt.preparing.is_some()
-                        || (looks && rt.is_checking() && !self.stuck(other))
-                        || (turns && rt.drive_wait.is_some_and(|wait| wait.asks() && wait.since < my_turn))
-                })
-            })
-            .find(|other| self.inner.quiet.share_an_add_on_drive(&mine, &[&other.setup.source, &other.setup.destination]))
-            .map(|other| other.setup.name.clone())
+        let tick = self.tick();
+        let my_turn = runtime.get(&job.id).and_then(|rt| rt.drive_wait).filter(|wait| wait.asks(tick)).map_or_else(Instant::now, |wait| wait.since);
+        let another_that = |holds: &dyn Fn(&JobRuntime) -> bool| {
+            jobs.iter()
+                .filter(|other| other.id != job.id && runtime.get(&other.id).is_some_and(holds))
+                .find(|other| self.inner.quiet.share_an_add_on_drive(&mine, &[&other.setup.source, &other.setup.destination]))
+                .map(|other| other.setup.name.clone())
+        };
+        another_that(&|rt| rt.is_running() || rt.preparing.is_some() || (looks && rt.is_checking() && !Self::stalled(rt)))
             .or_else(|| self.kept_quiet_by_another(job))
+            .or_else(|| {
+                let turns = asker == Asker::Charon;
+                turns.then(|| another_that(&|rt| rt.drive_wait.is_some_and(|wait| wait.asks(tick) && wait.since < my_turn))).flatten()
+            })
     }
 
-    /// Whether a look at `job` is most likely stuck: a folder of the job didn't answer a
-    /// question in time (a network share whose server stopped answering), and the look waits
-    /// for it there, not reading a drive it shares with other jobs.
-    fn stuck(&self, job: &Job) -> bool {
-        [&job.setup.source, &job.setup.destination].iter().any(|folder| self.inner.reach.is_late(folder))
+    /// Whether the look of `rt` stopped moving on for `STALLED_FOR`: it's most likely stuck,
+    /// waiting for a folder that doesn't answer, not reading a drive it shares with other
+    /// jobs. Whoever goes ahead of it there stops it (see `stop_looks_sharing_a_drive`), or it
+    /// could read the drive again once that folder answers: stopped, it ends before its next
+    /// step on either folder (see `Engine::look_at`). One stuck on the drive itself, which
+    /// then doesn't answer anyone, is let go the same way.
+    fn stalled(rt: &JobRuntime) -> bool {
+        rt.look_moved.is_some_and(|moved| moved.elapsed() >= STALLED_FOR)
     }
 
-    /// Notes that the job of `rt`, asking as Charon by itself, waits for its turn on a drive
-    /// run by an add-on driver: its turn counts from the first time it was held back there,
-    /// while it keeps asking. Called with the live state locked.
-    pub(crate) fn note_drive_wait(rt: &mut JobRuntime) {
-        let now = Instant::now();
-        let since = rt.drive_wait.filter(DriveWait::asks).map_or(now, |wait| wait.since);
-        rt.drive_wait = Some(DriveWait { since, asked: now });
+    /// Notes that the job's look moved on: it scanned more items, compared another pair or
+    /// piece of a file, went through another folder or item in a trash, or tried again a file
+    /// it couldn't read before (see `stalled`).
+    pub(crate) fn note_look_moved(&self, id: &JobId) {
+        #[cfg(test)]
+        {
+            self.inner.quiet.moves.fetch_add(1, Ordering::Relaxed);
+            if let Some(then) = &*self.inner.quiet.when_moved.lock().unwrap_or_else(|e| e.into_inner()) {
+                then(self, id);
+            }
+        }
+        self.change_known_runtime(id, |rt| rt.look_moved = Some(Instant::now()));
+    }
+
+    /// Counts the autopilot's ticks, at the start of each: a job waits for its turn on a drive
+    /// run by an add-on driver while the autopilot asks for it at every tick (see `DriveWait`).
+    pub(crate) fn note_a_tick(&self) {
+        self.inner.quiet.ticks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The autopilot's tick now (see `note_a_tick`).
+    fn tick(&self) -> u64 {
+        self.inner.quiet.ticks.load(Ordering::Relaxed)
+    }
+
+    /// Notes that the job of `rt` waits for its turn on a drive run by an add-on driver, as it
+    /// was held back there (a look in the background, a run a trigger started, or the
+    /// person's *Look for changes*, which the autopilot then takes over as a look of its own):
+    /// its turn counts from the first time it was held back, while it keeps asking. Called
+    /// with the live state locked.
+    pub(crate) fn note_drive_wait(&self, rt: &mut JobRuntime) {
+        let tick = self.tick();
+        let since = rt.drive_wait.filter(|wait| wait.asks(tick)).map_or_else(Instant::now, |wait| wait.since);
+        rt.drive_wait = Some(DriveWait { since, asked_in: tick });
     }
 
     /// Forgets that the job waits for its turn on a drive: it can't come now (a folder of it
@@ -500,8 +585,10 @@ impl Engine {
     }
 
     /// Stops the background looks of other jobs on a drive run by an add-on driver that one
-    /// of `job`'s folders is on, as its run or a list being made for it begins: they count
-    /// for nothing, and come again once it's done. Called with the live state locked.
+    /// of `job`'s folders is on, as its run, a list being made for it, or its look in the
+    /// background begins (the looks still at work there then are those that stopped moving
+    /// on): they count for nothing, and come again once it's done. Called with the live state
+    /// locked.
     pub(crate) fn stop_looks_sharing_a_drive(&self, jobs: &[Job], runtime: &mut HashMap<JobId, JobRuntime>, job: &Job) {
         let mine = [job.setup.source.as_path(), job.setup.destination.as_path()];
         for other in jobs.iter().filter(|other| other.id != job.id) {
@@ -526,6 +613,20 @@ impl Engine {
                 None => Ok(Some(Folder::of(path))),
             })
             .collect()
+    }
+
+    /// Closes the files a stopped look still had open (see `Contents::same`), but those on a
+    /// drive a sync keeps quiet only once it's done: closing a file is work for its drive's
+    /// driver too, and the look may have been stopped for that sync, waiting on a share at
+    /// its other side. (Until then, the system can't eject that drive without forcing it.)
+    pub(crate) fn let_go(&self, files: Vec<(PathBuf, File)>) {
+        let closing: Vec<(PathBuf, File)> = {
+            let mut known = self.inner.quiet.known();
+            let (kept, closing) = files.into_iter().partition(|(path, _)| known.drive_of(path).is_some());
+            known.left_open.extend(kept);
+            closing
+        };
+        drop(closing);
     }
 
     /// The name of the job whose sync keeps the drive of one of `job`'s folders quiet, if
@@ -575,8 +676,16 @@ mod testing {
         /// folders, until `end_a_look`. Returns its stop flag.
         pub(crate) fn begin_a_look(&self, id: &JobId) -> Arc<AtomicBool> {
             let flag = Arc::new(AtomicBool::new(false));
-            self.change_runtime(id, |rt| rt.checking = Some(flag.clone()));
+            self.change_runtime(id, |rt| {
+                rt.checking = Some(flag.clone());
+                rt.look_moved = Some(Instant::now());
+            });
             flag
+        }
+
+        /// Makes the look `begin_a_look` marked one that stopped moving on (see `stalled`).
+        pub(crate) fn a_look_stalls(&self, id: &JobId) {
+            self.change_runtime(id, |rt| rt.look_moved = Some(Instant::now().checked_sub(STALLED_FOR).expect("the computer has run for two minutes")));
         }
 
         /// Ends the look `begin_a_look` marked, as a look that counts.
@@ -967,9 +1076,8 @@ mod tests {
     }
 
     #[test]
-    fn a_look_stuck_on_a_folder_that_doesnt_answer_no_longer_holds_the_drive() {
+    fn a_look_that_stopped_moving_on_no_longer_holds_the_drive() {
         let Jobs { _tmp, _stick, engine, documents, photos, .. } = jobs();
-        until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
         engine.whereabouts_of(&engine.job_list());
         // A look at Photos reads the stick, however long it takes: it holds the others back.
         let looking = engine.begin_a_look(&photos);
@@ -980,23 +1088,364 @@ mod tests {
         assert!(engine.look_held_back(&documents), "a look at work holds the drive");
         let refused = engine.look_now(&documents).unwrap_err();
         assert!(refused.to_string().contains("“Photos” is using the same drive"), "{refused}");
-        engine.change_runtime(&documents, |rt| rt.drive_wait = None);
+        engine.forget_drive_waits();
 
-        // Photos' folder at home stops answering (as a network share whose server went away):
-        // the look waits there, not reading the stick. Another job's look goes ahead...
-        let home_photos = engine.stored_job(&photos).unwrap().setup.source;
-        let silenced = engine.silence(&home_photos);
+        // The look stops moving on (it waits for its folder at home, a network share whose
+        // server went away). Another job's look goes ahead, and stops it first: it would read
+        // the stick again alongside, once that folder answers.
+        engine.a_look_stalls(&photos);
         engine.check(&documents);
         assert!(!engine.look_held_back(&documents), "Documents was looked at");
-        until(|| engine.runtime().get(&documents).is_some_and(|rt| rt.checking.is_none()));
-        // ...and a run nobody asked for stops it, as one the person asked for does.
-        engine.begin_run(&documents, &after_changes, |_, _| Ok(())).unwrap();
         assert!(looking.load(Ordering::Relaxed), "the look was stopped");
+        until(|| engine.runtime().get(&documents).is_some_and(|rt| rt.checking.is_none()));
+        // A run nobody asked for goes ahead of it too.
+        engine.begin_run(&documents, &after_changes, |_, _| Ok(())).unwrap();
         engine.change_runtime(&documents, |rt| {
             Engine::unmark_run(rt);
         });
         engine.change_runtime(&photos, |rt| rt.checking = None);
-        drop(silenced);
+    }
+
+    #[test]
+    fn a_look_notes_that_it_moves_on() {
+        let Jobs { _tmp, _stick, engine, documents, on_stick: [docs_on_stick, _], .. } = jobs();
+        // An old folder in the trash on the stick, which the look goes through.
+        let old = docs_on_stick.join(crate::scan::TRASH_FOLDER).join("2000-01-01_00-00-00");
+        fs::create_dir_all(&old).unwrap();
+        for n in 0..3 {
+            fs::write(old.join(format!("{n}.txt")), "x").unwrap();
+        }
+        let job = engine.stored_job(&documents).unwrap();
+        engine.change_runtime(&documents, |rt| rt.look_moved = None);
+        let before = engine.inner.quiet.moves.load(Ordering::Relaxed);
+        engine.survey(&job, &AtomicBool::new(false), Purpose::Check).unwrap();
+        assert!(engine.runtime()[&documents].look_moved.is_some());
+        // At the end of each side's scan, then for the folder in the trash, and each item in it.
+        let moves = engine.inner.quiet.moves.load(Ordering::Relaxed) - before;
+        assert!(moves >= 2 + 1 + 3, "{moves}");
+    }
+
+    #[test]
+    fn a_two_way_look_notes_that_it_moves_on_as_it_compares() {
+        let Jobs { _tmp, _stick, engine, .. } = jobs();
+        // "Books", two-way between home and the stick, has a file on both sides of the same
+        // size but other times: the look reads both in full.
+        let (home, stick) = (_tmp.path().join("home").join("books"), _tmp.path().join("stick").join("books"));
+        let big = vec![1u8; 3 << 20];
+        for (folder, seconds) in [(&home, 1_700_000_000), (&stick, 1_700_000_100)] {
+            fs::create_dir_all(folder).unwrap();
+            fs::write(folder.join("big.bin"), &big).unwrap();
+            filetime::set_file_mtime(folder.join("big.bin"), filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+        }
+        let setup = JobSetup {
+            name: "Books".into(),
+            source: home,
+            destination: stick,
+            mode: SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        };
+        let books = engine.add_job(setup).unwrap().job.id;
+        until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
+        let job = engine.stored_job(&books).unwrap();
+        let before = engine.inner.quiet.moves.load(Ordering::Relaxed);
+        engine.survey(&job, &AtomicBool::new(false), Purpose::Check).unwrap();
+        // At the end of each side's scan, then for the pair, and for each piece of it.
+        let moves = engine.inner.quiet.moves.load(Ordering::Relaxed) - before;
+        assert!(moves >= 2 + 1 + 3, "{moves}");
+    }
+
+    /// "Books", two-way from `source` to `destination` (one at home, one on the stick), with
+    /// two pairs whose contents must be read (same size, other times), and the markers
+    /// both folders carry after a sync: what's read is kept only in folders that carry them.
+    fn books(engine: &Engine, source: &Path, destination: &Path) -> Job {
+        for (folder, text, seconds) in [(source, "one", 1_700_000_000), (destination, "two", 1_700_000_100)] {
+            fs::create_dir_all(folder).unwrap();
+            for name in ["a.txt", "b.txt"] {
+                fs::write(folder.join(name), text).unwrap();
+                filetime::set_file_mtime(folder.join(name), filetime::FileTime::from_unix_time(seconds, 0)).unwrap();
+            }
+        }
+        let setup = JobSetup {
+            name: "Books".into(),
+            source: source.to_path_buf(),
+            destination: destination.to_path_buf(),
+            mode: SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: Trigger::Manual,
+            excludes: vec![],
+            safe_delete: true,
+            full_automation: false,
+        };
+        let books = engine.add_job(setup).unwrap().job.id;
+        until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
+        engine.forget_drive_waits();
+        for (folder, side) in [(source, Side::Source), (destination, Side::Destination)] {
+            crate::run::Marker::new(&books, side, "token", 1).write(folder).unwrap();
+        }
+        engine.stored_job(&books).unwrap()
+    }
+
+    /// Stops the look of a job as soon as it read its first pair (it notes that it moved on
+    /// at the next one), and does `then` too.
+    fn stop_after_the_first_pair(engine: &Engine, stopped: &Arc<AtomicBool>, then: impl Fn() + Send + Sync + 'static) {
+        let stop = stopped.clone();
+        *engine.inner.quiet.when_moved.lock().unwrap() = Some(Box::new(move |engine, id| {
+            if engine.change_known_runtime(id, |rt| rt.reads.len()).unwrap_or(0) > 0 && !stop.swap(true, Ordering::Relaxed) {
+                then();
+            }
+        }));
+    }
+
+    /// A comparison stopped on its last pair, which it then couldn't read, ends as one
+    /// stopped on any other pair: what it read is kept while both folders still carry their
+    /// markers, but while another job's sync keeps the drive quiet, it reads no marker there
+    /// and forgets what it read instead.
+    #[test]
+    fn a_comparison_stopped_on_its_last_pair_reads_no_marker_on_a_drive_kept_quiet() {
+        let Jobs { _tmp, _stick, engine, documents, on_stick: [docs_on_stick, _], .. } = jobs();
+        let (home, stick) = (_tmp.path().join("home").join("books"), _tmp.path().join("stick").join("books"));
+        let job = books(&engine, &home, &stick);
+        // Stopped, the second pair's file at home goes away: its read fails, with no step
+        // after it that heeds the stop.
+        let gone = home.join("b.txt");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let removed = gone.clone();
+        stop_after_the_first_pair(&engine, &stopped, move || fs::remove_file(&removed).unwrap());
+        let kept = || engine.runtime()[&job.id].reads.len();
+        assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
+        assert!(stopped.load(Ordering::Relaxed) && !gone.exists());
+        assert_eq!(kept(), 1, "both folders still carry their markers");
+
+        let held = engine.hold_a_sync(&documents).unwrap();
+        assert!(engine.kept_quiet(&docs_on_stick) && engine.kept_quiet(&stick));
+        engine.change_runtime(&job.id, |rt| rt.reads = Default::default());
+        fs::write(&gone, "one").unwrap();
+        filetime::set_file_mtime(&gone, filetime::FileTime::from_unix_time(1_700_000_000, 0)).unwrap();
+        stopped.store(false, Ordering::Relaxed);
+        assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
+        assert!(stopped.load(Ordering::Relaxed) && !gone.exists());
+        assert_eq!(kept(), 0, "the markers aren't read on the stick while the sync keeps it quiet");
+        drop(held);
+    }
+
+    /// A look its own job's run stopped (see `begin_run`) may still be comparing once that
+    /// run's sync keeps the stick quiet: it reads no marker there either, and forgets what it
+    /// read instead.
+    #[test]
+    fn a_comparison_stopped_by_its_own_sync_reads_no_marker_while_that_sync_keeps_the_drive_quiet() {
+        let Jobs { _tmp, _stick, engine, .. } = jobs();
+        let (home, stick) = (_tmp.path().join("home").join("books"), _tmp.path().join("stick").join("books"));
+        let job = books(&engine, &home, &stick);
+        let held = engine.hold_a_sync(&job.id).unwrap();
+        assert!(engine.kept_quiet(&stick));
+        // What the sync's own look read is put aside, so the stopped look reads again.
+        engine.change_runtime(&job.id, |rt| rt.reads = Default::default());
+        let stopped = Arc::new(AtomicBool::new(false));
+        stop_after_the_first_pair(&engine, &stopped, || {});
+        assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
+        assert!(stopped.load(Ordering::Relaxed));
+        assert_eq!(engine.runtime()[&job.id].reads.len(), 0, "the markers aren't read on the stick while its own sync keeps it quiet");
+        drop(held);
+    }
+
+    /// A comparison stopped while it holds a file open on the stick, kept quiet by another
+    /// job's sync, doesn't close it until that sync is done: closing it is work for the drive.
+    #[test]
+    fn a_file_a_stopped_comparison_holds_open_on_a_drive_kept_quiet_is_closed_once_the_sync_is_done() {
+        let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
+        let (stick, home) = (_tmp.path().join("stick").join("books"), _tmp.path().join("home").join("books"));
+        let job = books(&engine, &stick, &home);
+        let held = engine.hold_a_sync(&documents).unwrap();
+        // The second pair's file on the stick is open when the look sees it was stopped.
+        let stopped = Arc::new(AtomicBool::new(false));
+        stop_after_the_first_pair(&engine, &stopped, || {});
+        assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
+        let left_open = || engine.inner.quiet.known().left_open.iter().map(|(path, _)| path.clone()).collect::<Vec<_>>();
+        assert_eq!(left_open(), vec![stick.join("b.txt")]);
+        drop(held);
+        assert!(left_open().is_empty(), "closed once the sync is done");
+        // Where no sync keeps the drive quiet, it's closed at once.
+        let stopped = Arc::new(AtomicBool::new(false));
+        engine.change_runtime(&job.id, |rt| rt.reads = Default::default());
+        stop_after_the_first_pair(&engine, &stopped, || {});
+        assert!(matches!(engine.survey(&job, &stopped, Purpose::Check), Err(Error::Cancelled)));
+        assert!(stopped.load(Ordering::Relaxed) && left_open().is_empty());
+    }
+
+    /// "Pictures", a Mirror from home to the stick, synced once, and "Inbox", two-way at home
+    /// (with full automation when `automatic`), into which the person copied the Mirror's
+    /// folder on the stick, hidden .charon folder and all, as "Old pictures". Returns the
+    /// Mirror's id and its folder on the stick, Inbox's id, and the folder with the copy.
+    /// Nothing is known yet of where the copy came from (as when the stick was away so far).
+    fn a_copied_marker(engine: &Engine, tmp: &Path, automatic: bool) -> (JobId, PathBuf, JobId, PathBuf) {
+        let (pictures, on_stick) = (tmp.join("home").join("pictures"), tmp.join("stick").join("pictures"));
+        let (inbox, elsewhere) = (tmp.join("home").join("inbox"), tmp.join("home").join("inbox-copy"));
+        for folder in [&pictures, &on_stick, &inbox, &elsewhere] {
+            fs::create_dir_all(folder).unwrap();
+        }
+        let add = |name: &str, mode: SyncMode, source: &PathBuf, destination: &PathBuf, full_automation: bool| {
+            let setup = JobSetup {
+                name: name.into(),
+                source: source.clone(),
+                destination: destination.clone(),
+                mode,
+                conflict: ConflictRule::Ask,
+                trigger: Trigger::Manual,
+                excludes: vec![],
+                safe_delete: true,
+                full_automation,
+            };
+            engine.add_job(setup).unwrap().job.id
+        };
+        // "Pictures" synced once: its marker in its folder on the stick, as it remembers it.
+        let mirror = add("Pictures", SyncMode::Mirror, &pictures, &on_stick, false);
+        engine.change_job(&mirror, |job| job.destination_token = Some("token".into())).unwrap();
+        crate::run::Marker::new(&mirror, Side::Destination, "token", 0).write(&on_stick).unwrap();
+        let old = inbox.join("Old pictures");
+        fs::create_dir_all(old.join(crate::scan::MARKER_FOLDER)).unwrap();
+        let marker = format!("{mirror}.json");
+        fs::copy(on_stick.join(crate::scan::MARKER_FOLDER).join(&marker), old.join(crate::scan::MARKER_FOLDER).join(&marker)).unwrap();
+        let inbox = add("Inbox", SyncMode::TwoWay, &inbox, &elsewhere, automatic);
+        until(|| engine.runtime().values().all(|rt| rt.checking.is_none()));
+        engine.forget_drive_waits();
+        engine.inner.quiet.known().origins.clear();
+        (mirror, on_stick, inbox, old)
+    }
+
+    /// A copy of the hidden .charon folder of a Mirror's folder on the stick, inside a folder
+    /// another job writes to, is only mentioned. While a sync keeps the stick quiet, the stick
+    /// isn't asked whether it's a copy: the last time it told them apart holds. A copy never
+    /// told apart can't be told then, and counts as maybe one place until that sync is done,
+    /// the careful direction.
+    #[test]
+    fn a_copy_of_a_marker_is_known_for_one_while_its_drive_is_kept_quiet() {
+        let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
+        let (_, on_stick, inbox, _) = a_copied_marker(&engine, _tmp.path(), false);
+        let job = engine.stored_job(&inbox).unwrap();
+        let look = || engine.survey(&job, &AtomicBool::new(false), Purpose::Review).unwrap();
+        let mentioned = |survey: &Survey| survey.warnings.iter().any(|warning| warning.text.contains("holds a copy of the hidden .charon folder"));
+        let first = look();
+        assert!(mentioned(&first) && first.holds.is_empty() && first.waits_on.is_none(), "{:?}", first.holds);
+
+        let held = engine.hold_a_sync(&documents).unwrap();
+        assert!(engine.kept_quiet(&on_stick));
+        let during = look();
+        assert!(mentioned(&during) && during.holds.is_empty() && during.waits_on.is_none(), "{:?}", during.holds);
+        // Never told apart before, it can't be told while the stick is kept quiet.
+        engine.inner.quiet.known().origins.clear();
+        let unknown = look();
+        assert!(unknown.holds.iter().any(|hold| hold.contains("can't tell yet") && hold.contains("“Documents” is syncing on that drive")), "{:?}", unknown.holds);
+        assert_eq!(unknown.waits_on, Some((on_stick.clone(), "Documents".to_string())));
+        drop(held);
+        let after = look();
+        assert!(mentioned(&after) && after.holds.is_empty() && after.waits_on.is_none(), "{:?}", after.holds);
+    }
+
+    /// A run nobody looks at that can't tell whether a folder holds a copy of a marker, only
+    /// because another job's sync keeps the stick quiet, isn't held back for the person's OK:
+    /// it waits for that sync, without looking again meanwhile, and goes ahead once it's done.
+    #[test]
+    fn a_run_nobody_looks_at_waits_for_the_sync_that_keeps_it_from_telling_a_copy() {
+        let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
+        let (_, on_stick, inbox, _) = a_copied_marker(&engine, _tmp.path(), true);
+        // Its first list was confirmed: it runs by itself.
+        engine.change_job(&inbox, |job| job.needs_review = false).unwrap();
+        let held = engine.hold_a_sync(&documents).unwrap();
+        let wanted = crate::engine::runtime::Wanted { reason: "automatically after changes".into(), by_hand: false };
+        engine.change_runtime(&inbox, |rt| rt.wanted = Some(wanted.clone()));
+        engine.start_wanted(&inbox);
+        until(|| engine.runtime()[&inbox].waiting_for.is_some() && !engine.runtime()[&inbox].is_running());
+        let (waiting_for, waits_on, wanted_still, must_ask) = {
+            let runtime = engine.runtime();
+            let rt = &runtime[&inbox];
+            (rt.waiting_for.clone(), rt.waits_on.clone(), rt.wanted.is_some(), rt.must_ask)
+        };
+        assert_eq!((waiting_for.as_deref(), waits_on.as_ref()), (Some("Documents"), Some(&on_stick)));
+        assert!(wanted_still && !must_ask && !engine.stored_job(&inbox).unwrap().needs_review, "not held back");
+        // Until that sync is done, it doesn't begin, nor look.
+        let again = engine.start_unreviewed(&inbox, crate::engine::runs::Unreviewed::Wanted(&wanted));
+        assert!(matches!(&again, Err(Error::DriveBusy(name)) if name == "Documents"), "{again:?}");
+        assert!(!engine.runtime()[&inbox].is_running());
+
+        drop(held);
+        engine.start_wanted(&inbox);
+        until(|| engine.runtime()[&inbox].wanted.is_none() && !engine.runtime()[&inbox].is_running());
+        let job = engine.stored_job(&inbox).unwrap();
+        assert!(job.last_synced.is_some() && !job.needs_review, "{:?}", job.held);
+        assert!(engine.runtime()[&inbox].waits_on.is_none());
+    }
+
+    /// The question whether a folder holds a copy of a marker, which may go on after the look
+    /// that asked it, stops before its next step once a sync keeps the drive of either folder
+    /// quiet: it then can't tell, and leaves nothing on the stick.
+    #[test]
+    fn the_question_whether_a_marker_is_a_copy_stops_once_its_drive_is_kept_quiet() {
+        let Jobs { _tmp, _stick, engine, documents, .. } = jobs();
+        let (mirror, on_stick, _, old) = a_copied_marker(&engine, _tmp.path(), false);
+        let listing = || fs::read_dir(on_stick.join(crate::scan::MARKER_FOLDER)).unwrap().count();
+        assert_eq!(engine.origin_unless_kept_quiet(&mirror, &on_stick, &old), crate::run::Origin::Copy);
+        let before = listing();
+        let held = engine.hold_a_sync(&documents).unwrap();
+        assert_eq!(engine.origin_unless_kept_quiet(&mirror, &on_stick, &old), crate::run::Origin::Unknown);
+        assert_eq!(listing(), before, "no probe on the stick");
+        drop(held);
+    }
+
+    /// While a sync keeps the stick quiet, nothing is asked about a folder there (whether it
+    /// holds a copy of another job's marker, see `overlaps.rs`, which then says what the disk
+    /// told before): like a folder that doesn't answer, it can't tell.
+    #[test]
+    fn nothing_is_asked_about_a_folder_on_a_drive_kept_quiet() {
+        let Jobs { _tmp, _stick, engine, documents, on_stick: [_, photos_on_stick], .. } = jobs();
+        let asked = Arc::new(AtomicU64::new(0));
+        let ask = |folder: &Path| {
+            let asked = asked.clone();
+            engine.ask_about(folder, move |_| asked.fetch_add(1, Ordering::Relaxed))
+        };
+        let held = engine.hold_a_sync(&documents).unwrap();
+        assert!(ask(&photos_on_stick).is_none());
+        assert_eq!(asked.load(Ordering::Relaxed), 0);
+        assert!(ask(&_tmp.path().join("home").join("photos")).is_some(), "a folder elsewhere is asked about");
+        drop(held);
+        assert!(ask(&photos_on_stick).is_some());
+        assert_eq!(asked.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_sync_doesnt_wait_for_a_look_that_stopped_moving_on() {
+        let Jobs { _tmp, _stick, engine, documents, photos, .. } = jobs();
+        engine.whereabouts_of(&engine.job_list());
+        let looking = engine.begin_a_look(&photos);
+        engine.a_look_stalls(&photos);
+        // The sync stops the look, and doesn't wait for it to end: it waits for its folder at
+        // home, and never reads the stick again.
+        let began = Instant::now();
+        let held = engine.hold_a_sync(&documents).unwrap();
+        assert!(began.elapsed() < LOOKS_END_WITHIN, "{:?}", began.elapsed());
+        assert!(looking.load(Ordering::Relaxed), "the look was stopped");
+        drop(held);
+        engine.change_runtime(&photos, |rt| rt.checking = None);
+    }
+
+    #[test]
+    fn a_list_the_person_asks_for_ends_the_jobs_wait_for_its_turn() {
+        let Jobs { _tmp, _stick, engine, documents, photos, .. } = jobs();
+        engine.whereabouts_of(&engine.job_list());
+        // Photos' look waits for Documents' look.
+        engine.begin_a_look(&documents);
+        engine.check(&photos);
+        assert!(engine.look_held_back(&photos));
+        // The person asks for Photos' list: it stops Documents' look, and Photos' turn came.
+        engine.prepare_review(&photos).unwrap();
+        // Documents' look comes again at once: Photos, its list made, waits for nothing.
+        engine.change_runtime(&documents, |rt| rt.checking = None);
+        engine.check(&documents);
+        assert!(!engine.look_held_back(&documents), "Documents was looked at");
+        until(|| engine.runtime().get(&documents).is_some_and(|rt| rt.checking.is_none()));
     }
 
     #[test]
@@ -1039,6 +1488,10 @@ mod tests {
         assert!(matches!(run(&documents), Err(Error::DriveBusy(name)) if name == "Music"));
         run(&music).unwrap();
         assert!(matches!(run(&documents), Err(Error::DriveBusy(name)) if name == "Music"));
+        // What holds Photos back is named for its row: Music, at work, though Documents
+        // (listed first) began to wait before it.
+        assert!(matches!(run(&photos), Err(Error::DriveBusy(name)) if name == "Music"));
+        engine.forget_drive_wait(&photos);
         unmark(&music);
         run(&documents).unwrap();
         unmark(&documents);
@@ -1051,12 +1504,12 @@ mod tests {
         assert!(matches!(run(&music), Err(Error::DriveBusy(name)) if name == "Photos"));
         engine.begin_run(&music, &Crossing::unattended("started by hand", true), |_, _| Ok(())).unwrap();
         unmark(&music);
-        // A job Charon stopped asking for holds nobody up once its wait has lapsed...
+        // A job Charon stopped asking for holds nobody up once its wait has lapsed: the
+        // autopilot didn't ask for it in its last two ticks...
         assert!(matches!(run(&documents), Err(Error::DriveBusy(name)) if name == "Photos"));
-        engine.change_runtime(&photos, |rt| {
-            let wait = rt.drive_wait.as_mut().unwrap();
-            wait.asked = wait.asked.checked_sub(WAITS_LAPSE).unwrap();
-        });
+        engine.note_a_tick();
+        assert!(matches!(run(&documents), Err(Error::DriveBusy(name)) if name == "Photos"));
+        engine.note_a_tick();
         run(&documents).unwrap();
         engine.check(&photos);
         assert!(engine.look_held_back(&photos));

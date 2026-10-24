@@ -20,10 +20,11 @@
 //! harmless, and is only mentioned, so it can be deleted (see `Marker::origin`).
 
 use crate::engine::Engine;
+use crate::error::Result;
 use crate::model::{Job, JobId, JobSetup, SyncMode};
 use crate::plan::Side;
 use crate::run::{Found, Marker, Origin};
-use crate::scan::{RootId, Snapshot};
+use crate::scan::{Place, Snapshot};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,11 @@ pub(crate) struct Overlaps {
     /// Folders holding a copy of a job's hidden `.charon` folder, each said in a sentence:
     /// harmless, and mentioned so the person can delete them.
     pub copies: Vec<String>,
+    /// A folder this look couldn't ask whether it's another job's or holds a copy of its
+    /// marker, as another job's sync keeps its drive quiet, with that job's name: what's
+    /// found there counts as maybe one place, and a run nobody looks at waits for that sync
+    /// instead of holding back for the person's OK (see `clashes_by_markers`).
+    pub waits_on: Option<(PathBuf, String)>,
 }
 
 /// A job's marker found around one of this job's folders.
@@ -51,15 +57,22 @@ struct MarkerAround {
 
 impl Engine {
     /// Checks the job's folders against each other and against every other job's (asks the
-    /// disk). `source` and `destination` are this look's scans.
-    pub(crate) fn overlaps(&self, job: &Job, source: &Snapshot, destination: &Snapshot) -> Overlaps {
+    /// disk). `source` and `destination` are this look's scans. `go_on` is asked before each
+    /// step on a folder: a look that was stopped ends before its next step (see `look_at`).
+    /// Only the question whether another job's folder holds a copy of its marker, which has a
+    /// time limit, may go on after it (see `clashes_by_markers`).
+    pub(crate) fn overlaps(&self, job: &Job, source: &Snapshot, destination: &Snapshot, go_on: &dyn Fn() -> Result<()>) -> Result<Overlaps> {
         let others: Vec<Job> = self.job_list().into_iter().filter(|other| other.id != job.id).collect();
-        let around = Self::markers_around(job, source, destination);
+        let around = Self::markers_around(job, source, destination, go_on)?;
         let mut copies = BTreeSet::new();
-        let refusal = Self::nested(&job.setup).or_else(|| self.nested_by_markers(job, &around, &mut copies));
+        let refusal = match Self::nested(&job.setup, go_on)? {
+            Some(refusal) => Some(refusal),
+            None => self.nested_by_markers(job, &around, &mut copies, go_on)?,
+        };
         let mut clashes = Vec::new();
         let mut unseen: Vec<&Job> = Vec::new();
         for other in &others {
+            go_on()?;
             // Asked with a time limit. A folder that doesn't answer (a share whose server is
             // away) isn't one of this job's folders, which this look just read: it's compared
             // again at a later look.
@@ -73,8 +86,9 @@ impl Engine {
                 unseen.push(other);
             }
         }
-        clashes.extend(self.clashes_by_markers(job, &unseen, &around, &mut copies));
-        Overlaps { refusal, clashes, copies: copies.into_iter().collect() }
+        let mut waits_on = None;
+        clashes.extend(self.clashes_by_markers(job, &unseen, &around, &mut copies, &mut waits_on, go_on)?);
+        Ok(Overlaps { refusal, clashes, copies: copies.into_iter().collect(), waits_on })
     }
 
     /// Why the job's two folders can't be synced, if one of them carries the job's marker of
@@ -83,42 +97,57 @@ impl Engine {
     /// twice). Only the markers the job left at its last finished sync count. A copy of the
     /// marker (in a copy of the other folder) is added to `copies` instead; when Charon can't
     /// tell whether it is one, it refuses, and says so.
-    fn nested_by_markers(&self, job: &Job, around: &[MarkerAround], copies: &mut BTreeSet<String>) -> Option<String> {
+    fn nested_by_markers(&self, job: &Job, around: &[MarkerAround], copies: &mut BTreeSet<String>, go_on: &dyn Fn() -> Result<()>) -> Result<Option<String>> {
         for found in around.iter().filter(|found| found.job == job.id) {
+            go_on()?;
             let Found::Marker(marker) = Marker::read(&found.folder, &job.id) else { continue };
             if marker.side == found.side || !self.left_by(job, &marker) {
                 continue;
             }
             let side = marker.side.word();
-            match Marker::origin(&job.id, job.setup.root(marker.side), &found.folder) {
+            go_on()?;
+            let origin = Marker::origin(&job.id, job.setup.root(marker.side), &found.folder, &|| go_on().is_ok());
+            // Stopped partway, the look ends, whatever the question could tell.
+            go_on()?;
+            match origin {
                 Origin::SameFolder => {
-                    return Some(format!(
+                    return Ok(Some(format!(
                         "This job's folders are one place, or one is inside the other, under names that don't show it (a drive or share reachable under two names): \
                          Charon found the {side}'s marker in {}. Syncing would copy the job's own copies into themselves. Choose other folders.",
                         found.folder.display()
-                    ))
+                    )))
                 }
                 Origin::Copy => {
                     copies.insert(Self::copy_note(&found.folder, &format!("this job's {side} folder")));
                 }
                 Origin::Away | Origin::Unknown => {
-                    return Some(format!(
+                    return Ok(Some(format!(
                         "Charon found the marker of this job's {side} folder in {}, and couldn't tell whether that folder is the {side} folder under another name \
                          (a drive or share reachable under two names), or holds a copy of its hidden .charon folder. Until it can tell, nothing syncs. \
                          If it's a copy, delete that .charon folder; otherwise, choose other folders.",
                         found.folder.display()
-                    ))
+                    )))
                 }
             }
         }
-        None
+        Ok(None)
     }
 
     /// The other jobs (of `others`, whose paths don't show an overlap) whose markers are
     /// found around this job's folders where the two jobs would undo each other's work, each
     /// said in a sentence. Copies of their markers are added to `copies` instead. A job
-    /// whose own folder is away can't sync now: it's looked at again at the next look.
-    fn clashes_by_markers(&self, job: &Job, others: &[&Job], around: &[MarkerAround], copies: &mut BTreeSet<String>) -> Vec<String> {
+    /// whose own folder is away can't sync now: it's looked at again at the next look. A
+    /// folder that couldn't be asked about only because a sync keeps its drive quiet goes in
+    /// `waits_on` (the first one).
+    fn clashes_by_markers(
+        &self,
+        job: &Job,
+        others: &[&Job],
+        around: &[MarkerAround],
+        copies: &mut BTreeSet<String>,
+        waits_on: &mut Option<(PathBuf, String)>,
+        go_on: &dyn Fn() -> Result<()>,
+    ) -> Result<Vec<String>> {
         let mut named: BTreeSet<&JobId> = BTreeSet::new();
         let mut clashes = Vec::new();
         for found in around {
@@ -126,6 +155,7 @@ impl Engine {
             if named.contains(&other.id) {
                 continue;
             }
+            go_on()?;
             let Found::Marker(marker) = Marker::read(&found.folder, &other.id) else { continue };
             // Jobs that can't undo each other's work need no more looking (nor reading the
             // other job's memory, which can be large).
@@ -134,10 +164,40 @@ impl Engine {
             }
             let (mine, theirs, name, folder) = (found.side.word(), marker.side.word(), &other.setup.name, found.folder.display());
             // The other job's folder is asked about with a time limit: one that doesn't answer
-            // can't tell, the careful direction.
-            let (whose, here) = (other.id.clone(), found.folder.clone());
-            let origin = self.ask_about(other.setup.root(marker.side), move |root| Marker::origin(&whose, root, &here));
-            let sure = match origin.unwrap_or(Origin::Unknown) {
+            // can't tell, the careful direction. The question goes on by itself when it's late
+            // (whether the look ends or is stopped meanwhile), but it stops before it would
+            // work on a drive a sync keeps quiet. While a sync keeps the drive of either folder
+            // quiet, they aren't asked at all: the last time the disk told them apart holds (a
+            // copy doesn't turn into the folder itself meanwhile), and a pair never told apart
+            // this session can't tell until that sync is done (see `quiet.rs`).
+            go_on()?;
+            let root = other.setup.root(marker.side);
+            let quiet = || self.kept_quiet(root) || self.kept_quiet(&found.folder);
+            let skipped = quiet();
+            let asked = if skipped {
+                None
+            } else {
+                let (whose, here, engine) = (other.id.clone(), found.folder.clone(), self.clone());
+                self.ask_about(root, move |root| engine.origin_unless_kept_quiet(&whose, root, &here))
+            };
+            // Who keeps the drive quiet, when that's all that keeps this pair from being told apart.
+            let mut kept_by = None;
+            let origin = match asked {
+                Some(origin @ (Origin::SameFolder | Origin::Copy)) => {
+                    self.inner.quiet.remember_origin(&other.id, root, &found.folder, origin);
+                    origin
+                }
+                None | Some(Origin::Unknown) if skipped || quiet() => self.inner.quiet.origin(&other.id, root, &found.folder).unwrap_or_else(|| {
+                    kept_by = self.inner.quiet.kept_by_another(&job.id, &[root, &found.folder]);
+                    if let (None, Some(name)) = (&waits_on, &kept_by) {
+                        let folder = if self.kept_quiet(root) { root } else { &found.folder };
+                        *waits_on = Some((folder.to_path_buf(), name.clone()));
+                    }
+                    Origin::Unknown
+                }),
+                asked => asked.unwrap_or(Origin::Unknown),
+            };
+            let sure = match origin {
                 Origin::SameFolder => true,
                 Origin::Unknown => false,
                 Origin::Copy => {
@@ -147,7 +207,14 @@ impl Engine {
                 Origin::Away => continue,
             };
             named.insert(&other.id);
-            clashes.push(if sure {
+            clashes.push(if let Some(syncing) = kept_by {
+                format!(
+                    "This job's {mine} folder and the {theirs} folder of “{name}” may be one place, or one inside the other, though their paths differ (a drive or share reachable under two names, or a link): \
+                     Charon found that job's marker in {folder}, and can't tell yet whether that folder is that job's folder or holds a copy of its hidden .charon folder: \
+                     “{syncing}” is syncing on that drive, and Charon asks it once that's done. One of the two is a Mirror job, which removes what the other brings in. \
+                     Check the removals in this list, or wait until “{syncing}” is done."
+                )
+            } else if sure {
                 format!(
                     "This job's {mine} folder and the {theirs} folder of “{name}” are one place, or one is inside the other, though their paths differ (a drive or share reachable under two names, or a link): \
                      Charon found that job's marker in {folder}. One of the two is a Mirror job, which removes what the other brings in. \
@@ -162,7 +229,15 @@ impl Engine {
                 )
             });
         }
-        clashes
+        Ok(clashes)
+    }
+
+    /// Where the marker of job `whose` found in `found` comes from, when that job's folder is
+    /// `root` (see `Marker::origin`), asking the disk only while no sync keeps the drive of
+    /// either folder quiet: the question may go on after the look that asked it, and stops
+    /// before its next step once a sync does (it then can't tell).
+    pub(crate) fn origin_unless_kept_quiet(&self, whose: &JobId, root: &Path, found: &Path) -> Origin {
+        Marker::origin(whose, root, found, &|| !self.kept_quiet(root) && !self.kept_quiet(found))
     }
 
     /// What the list says about a folder holding a copy of the hidden `.charon` folder of
@@ -175,10 +250,13 @@ impl Engine {
     }
 
     /// Why the job's two folders can't be synced, if one is inside the other (or they are
-    /// one folder), whatever their paths say.
-    pub(crate) fn nested(setup: &JobSetup) -> Option<String> {
-        let (source, destination) = (&setup.source, &setup.destination);
-        match (RootId::is_within(source, destination), RootId::is_within(destination, source)) {
+    /// one folder), whatever their paths say. `go_on` is asked before each folder.
+    pub(crate) fn nested(setup: &JobSetup, go_on: &dyn Fn() -> Result<()>) -> Result<Option<String>> {
+        go_on()?;
+        let source = Place::of(&setup.source);
+        go_on()?;
+        let destination = Place::of(&setup.destination);
+        Ok(match (source.is_within(&destination), destination.is_within(&source)) {
             (true, true) => Some(
                 "The source and the destination are the same folder, reached under two names (through a link, or a drive mounted in two places). Choose other folders."
                     .into(),
@@ -189,12 +267,13 @@ impl Engine {
                     .into(),
             ),
             (false, false) => None,
-        }
+        })
     }
 
     /// The markers in this job's folders (met by the scans), at their top, and in the
-    /// folders above them: other jobs', and this job's own.
-    fn markers_around(job: &Job, source: &Snapshot, destination: &Snapshot) -> Vec<MarkerAround> {
+    /// folders above them: other jobs', and this job's own. `go_on` is asked before each
+    /// folder's look above it.
+    fn markers_around(job: &Job, source: &Snapshot, destination: &Snapshot, go_on: &dyn Fn() -> Result<()>) -> Result<Vec<MarkerAround>> {
         let mut found = Vec::new();
         for (side, snapshot) in [(Side::Source, source), (Side::Destination, destination)] {
             let root = job.setup.root(side);
@@ -204,11 +283,12 @@ impl Engine {
                     found.push(MarkerAround { side, folder: folder.clone(), job: other.clone() });
                 }
             }
+            go_on()?;
             for (folder, other) in Self::markers_above(root) {
                 found.push(MarkerAround { side, folder, job: other });
             }
         }
-        found
+        Ok(found)
     }
 
     /// The markers in the folders above `root`, with the folder each is in.
@@ -328,7 +408,7 @@ mod tests {
         fs::create_dir_all(nas.join("Docs/Backup")).unwrap();
         Marker::new(&job.id, Side::Destination, "token", 1).write(&again.join("Docs/Backup")).unwrap();
         let mut copies = BTreeSet::new();
-        let refusal = engine.nested_by_markers(&job, &found(Side::Source, &nas.join("Docs/Backup"), &job), &mut copies);
+        let refusal = engine.nested_by_markers(&job, &found(Side::Source, &nas.join("Docs/Backup"), &job), &mut copies, &|| Ok(())).unwrap();
         assert!(refusal.is_some_and(|text| text.contains("under names that don't show it")));
         assert!(copies.is_empty());
     }
@@ -343,7 +423,7 @@ mod tests {
         let restored = documents.join("From the USB backup");
         copy_charon_folder(&usb, &restored);
         let mut copies = BTreeSet::new();
-        assert_eq!(engine.nested_by_markers(&job, &found(Side::Source, &restored, &job), &mut copies), None);
+        assert_eq!(engine.nested_by_markers(&job, &found(Side::Source, &restored, &job), &mut copies, &|| Ok(())).unwrap(), None);
         let note = copies.into_iter().next().expect("the copy is mentioned");
         assert!(note.contains("From the USB backup") && note.contains("this job's destination folder"), "{note}");
     }
@@ -359,7 +439,7 @@ mod tests {
         fs::remove_dir_all(&again).unwrap();
         std::os::unix::fs::symlink(&nas, &again).unwrap();
         let mut copies = BTreeSet::new();
-        let clashes = engine.clashes_by_markers(&inbox, &[&mirror], &found(Side::Destination, &again.join("Photos"), &mirror), &mut copies);
+        let clashes = engine.clashes_by_markers(&inbox, &[&mirror], &found(Side::Destination, &again.join("Photos"), &mirror), &mut copies, &mut None, &|| Ok(())).unwrap();
         assert_eq!(clashes.len(), 1);
         assert!(clashes[0].contains("“Photos”") && clashes[0].contains("are one place"), "{}", clashes[0]);
         assert!(copies.is_empty());
@@ -376,14 +456,67 @@ mod tests {
         copy_charon_folder(&usb.join("Photos"), &old_photos);
         let around = found(Side::Source, &old_photos, &mirror);
         let mut copies = BTreeSet::new();
-        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies).is_empty());
+        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut None, &|| Ok(())).unwrap().is_empty());
         let note = copies.iter().next().expect("the copy is mentioned");
         assert!(note.contains("Old photos") && note.contains("“Photos”"), "{note}");
         // The drive is unplugged: the Mirror can't sync, and nothing is said.
         move_folder(&usb, &tmp.path().join("unplugged"));
         let mut copies = BTreeSet::new();
-        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies).is_empty());
+        assert!(engine.clashes_by_markers(&docs, &[&mirror], &around, &mut copies, &mut None, &|| Ok(())).unwrap().is_empty());
         assert!(copies.is_empty());
+    }
+
+    /// A look stopped while it checks the folders ends before its next step on either
+    /// folder, or on another job's: it may have waited for a share while a sync was given the
+    /// other's drive (see `quiet.rs`).
+    #[test]
+    fn a_look_stopped_while_it_checks_the_folders_ends_before_its_next_step() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = engine(tmp.path());
+        let docs = synced(&engine, "Docs", SyncMode::Mirror, &tmp.path().join("Docs"), &tmp.path().join("USB/Docs"));
+        synced(&engine, "Photos", SyncMode::Mirror, &tmp.path().join("Photos"), &tmp.path().join("USB/Photos"));
+        // Copies of both jobs' markers in the folder above all of theirs: each is read, and
+        // asked whether it's a copy.
+        copy_charon_folder(&tmp.path().join("USB/Docs"), tmp.path());
+        copy_charon_folder(&tmp.path().join("USB/Photos"), tmp.path());
+        let scans = (Snapshot::default(), Snapshot::default());
+        // Above each folder, and each folder itself. The job's own marker above its source:
+        // read, asked about (both markers, then the probe left, looked for in the other
+        // folder and taken away), and the answer. The same marker above its destination,
+        // read. The other job, by its paths; its marker above this job's source, read (the
+        // two jobs can't undo each other's work there); and above this job's destination,
+        // read and asked about.
+        let steps = 2 + 2 + (1 + 1 + 5 + 1) + 1 + 1 + 1 + (1 + 1);
+        for stop_at in 1..=steps + 1 {
+            let asked = std::cell::Cell::new(0);
+            // Once stopped, it stays stopped.
+            let go_on = || {
+                asked.set(asked.get() + 1);
+                if asked.get() >= stop_at {
+                    Err(crate::error::Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            };
+            let looked = engine.overlaps(&docs, &scans.0, &scans.1, &go_on);
+            if stop_at <= steps {
+                assert!(matches!(looked, Err(crate::error::Error::Cancelled)), "stopped at step {stop_at}");
+                // Stopped while it asks whether the marker is a copy, the question ends at
+                // once (only, once it left the probe, it asks whether to take it away), and
+                // the look at the step after it.
+                let ended = match stop_at {
+                    7..=9 => stop_at + 1,
+                    10 | 11 => 12,
+                    _ => stop_at,
+                };
+                assert_eq!(asked.get(), ended, "stopped at step {stop_at}");
+            } else {
+                let overlaps = looked.unwrap();
+                assert!(overlaps.refusal.is_none() && overlaps.clashes.is_empty(), "{overlaps:?}");
+                assert_eq!(overlaps.copies.len(), 2, "{overlaps:?}");
+                assert_eq!(asked.get(), steps);
+            }
+        }
     }
 
     #[test]
@@ -409,10 +542,10 @@ mod tests {
         std::fs::create_dir_all(dropbox.join("Backup")).unwrap();
         std::os::unix::fs::symlink(&dropbox, tmp.path().join("Dropbox")).unwrap();
         let nested = setup(SyncMode::Mirror, &dropbox, &tmp.path().join("Dropbox/Backup"));
-        assert!(Engine::nested(&nested).is_some_and(|text| text.contains("inside the other")));
+        assert!(Engine::nested(&nested, &|| Ok(())).unwrap().is_some_and(|text| text.contains("inside the other")));
         let same = setup(SyncMode::TwoWay, &dropbox, &tmp.path().join("Dropbox"));
-        assert!(Engine::nested(&same).is_some_and(|text| text.contains("same folder")));
+        assert!(Engine::nested(&same, &|| Ok(())).unwrap().is_some_and(|text| text.contains("same folder")));
         std::fs::create_dir_all(tmp.path().join("Elsewhere")).unwrap();
-        assert!(Engine::nested(&setup(SyncMode::Mirror, &dropbox, &tmp.path().join("Elsewhere"))).is_none());
+        assert!(Engine::nested(&setup(SyncMode::Mirror, &dropbox, &tmp.path().join("Elsewhere")), &|| Ok(())).unwrap().is_none());
     }
 }

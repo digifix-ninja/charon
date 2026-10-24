@@ -38,10 +38,16 @@ pub(crate) struct JobRuntime {
     /// Since when the job's look in the background or its wanted run waits for its turn on a
     /// drive run by an add-on driver (see `quiet.rs`).
     pub drive_wait: Option<DriveWait>,
+    /// A folder on a drive another job's sync keeps quiet, which the job's last run nobody
+    /// looks at couldn't ask whether it overlaps with this job's (see `Survey::waits_on`):
+    /// the wanted run waits until no sync keeps it quiet, and doesn't look again meanwhile.
+    pub waits_on: Option<PathBuf>,
     /// Set while a review is being prepared; setting it to true stops that.
     pub preparing: Option<Arc<AtomicBool>>,
     /// Set while a background check runs; setting it to true stops it.
     pub checking: Option<Arc<AtomicBool>>,
+    /// When the job's look last moved on (see `Engine::note_look_moved`).
+    pub look_moved: Option<Instant>,
     pub progress: Option<Progress>,
     /// What the last look found.
     pub look: Option<Look>,
@@ -145,8 +151,9 @@ impl JobRuntime {
     pub fn forget_wanted(&mut self, which: impl FnOnce(&Wanted) -> bool) -> Option<String> {
         self.wanted.take_if(|wanted| which(wanted))?;
         // It doesn't wait for its turn on a drive anymore (a look that still does says so
-        // again at its next try).
+        // again at its next try), nor for a sync on another job's.
         self.drive_wait = None;
+        self.waits_on = None;
         if self.confirmed.is_some() {
             return None;
         }
@@ -168,6 +175,7 @@ impl JobRuntime {
         self.tried = None;
         self.wanted = None;
         self.waiting_for = None;
+        self.waits_on = None;
         self.folders_inside.clear();
     }
 }
@@ -304,6 +312,12 @@ impl Reads {
             self.markers = Some(markers.clone());
         }
         self.pairs.insert(key.to_string(), (source, destination, same));
+    }
+
+    /// How many pairs' reads are kept.
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.pairs.len()
     }
 
     /// Forgets what was read in folders that carried `markers`: one of them was replaced

@@ -8,7 +8,7 @@ use crate::engine::{runs, Engine, EngineEvent, Moment};
 use crate::error::{Error, Result};
 use crate::model::{human_bytes, human_count, plural, ConflictRule, Job, JobSetup, Warning};
 use crate::plan::{self, Action, Baseline, Guard, NoteKind, OneWayPlanner, Pair, Plan, Recent, Side, Unit};
-use crate::run::{Copier, Found, KeptCopies, Markers, Refused, Room, Trash, TrashLook, Unread};
+use crate::run::{Copier, Found, KeptCopies, Marker, Markers, Refused, Room, Trash, TrashLook, Unread};
 use crate::scan::{
     is_legacy_partial, is_partial, never_download_on_this_thread, partial_started, Contents, Entry, EntryKind, ExcludeFilter, Keys, Refusal, Scanner, Snapshot,
     Volume,
@@ -258,6 +258,13 @@ pub(crate) struct Survey {
     pub uncompared: BTreeSet<String>,
     /// Why this plan must not run at all.
     pub refusal: Option<String>,
+    /// Why no plan of these folders may run: one is inside the other, whatever their paths
+    /// say (see `Overlaps::refusal`). It's in `refusal` too.
+    pub nesting: Option<String>,
+    /// A folder whose overlap with this job's can't be told until another job's sync is done
+    /// there, with that job's name (see `Overlaps::waits_on`): a run nobody looks at waits
+    /// for it.
+    pub waits_on: Option<(std::path::PathBuf, String)>,
     pub warnings: Vec<Warning>,
     /// Why a run nobody looks at must not go ahead.
     pub holds: Vec<String>,
@@ -320,13 +327,25 @@ impl Engine {
 
     fn look_at(&self, job: &Job, cancel: &AtomicBool, purpose: Purpose) -> Result<Survey> {
         let setup = job.setup.clone();
+        // A look that was stopped ends before its next step on either folder: it may have
+        // waited for one of them (a share that didn't answer) while another job was given the
+        // other's drive (see `quiet.rs`).
+        let go_on = || if cancel.load(Ordering::Relaxed) { Err(Error::Cancelled) } else { Ok(()) };
         for root in [&setup.source, &setup.destination] {
+            go_on()?;
             if !root.is_dir() {
                 return Err(Error::Offline(root.clone()));
             }
         }
-        let markers = Markers::read(&setup.source, &setup.destination, &job.id);
-        let volumes = (Self::drive_of(job, Side::Source), Self::drive_of(job, Side::Destination));
+        go_on()?;
+        let source_marker = Marker::read(&setup.source, &job.id);
+        go_on()?;
+        let markers = Markers { source: source_marker, destination: Marker::read(&setup.destination, &job.id) };
+        go_on()?;
+        let source_volume = Self::drive_of(job, Side::Source);
+        go_on()?;
+        let volumes = (source_volume, Self::drive_of(job, Side::Destination));
+        go_on()?;
         let folded = !(volumes.0.case_sensitive && volumes.1.case_sensitive);
         let filter = ExcludeFilter::new(&setup.excludes, folded)?;
         // The folder watcher tells the changes that matter with the same filter.
@@ -357,8 +376,8 @@ impl Engine {
         if no_destination_links || refused_before(Side::Destination, &volumes.1) {
             destination.refuse_links();
         }
-        self.apply_refusals(job, &mut source, &mut destination);
-        self.apply_unread(job, &mut source, &mut destination)?;
+        self.apply_refusals(job, &mut source, &mut destination, &go_on)?;
+        self.apply_unread(job, &mut source, &mut destination, &go_on)?;
 
         let mut warnings = Vec::new();
         let mut holds = Vec::new();
@@ -416,6 +435,7 @@ impl Engine {
             Compared::default()
         };
         let agreed = compared.agreed;
+        go_on()?;
 
         let record = if setup.mode.is_two_way() { &baseline } else { &landed };
         let plan = plan::plan_for(&setup, &source, &destination, record, &compared.different);
@@ -433,8 +453,12 @@ impl Engine {
         }
         // The folders themselves first: one inside the other (whatever the paths say), and
         // other jobs that would undo this one's work.
-        let overlaps = self.overlaps(job, &source, &destination);
-        let refusal = overlaps.refusal.or_else(|| Guard::refusal(&plan, &source, &destination));
+        go_on()?;
+        let overlaps = self.overlaps(job, &source, &destination, &go_on)?;
+        go_on()?;
+        let nesting = overlaps.refusal;
+        let waits_on = overlaps.waits_on;
+        let refusal = nesting.clone().or_else(|| Guard::refusal(&plan, &source, &destination));
         if let Some(refusal) = &refusal {
             holds.push(refusal.clone());
         }
@@ -564,7 +588,8 @@ impl Engine {
             warnings.push(Warning::info(text));
         }
 
-        let housekeeping = self.housekeeping(&setup, &source, &destination, purpose);
+        let housekeeping = self.housekeeping(job, &source, &destination, purpose, cancel);
+        go_on()?;
         for (side, look) in &housekeeping.trash {
             if let Some(text) = Self::revived_warning(*side, look) {
                 holds.push(text.clone());
@@ -586,6 +611,7 @@ impl Engine {
             if bytes == 0 {
                 continue;
             }
+            go_on()?;
             if let Some(why) = Room::shortage(setup.root(side), bytes, &format!("the {}'s drive", side.word())) {
                 let text = format!(
                     "{}{}. Copies that don't fit will fail, and while copies to the {} fail, nothing is removed there. Make room on the drive first.",
@@ -614,6 +640,8 @@ impl Engine {
             different: compared.different,
             uncompared: compared.uncompared,
             refusal,
+            nesting,
+            waits_on,
             warnings,
             holds,
             needs_tick,
@@ -721,6 +749,7 @@ impl Engine {
         let failed = AtomicBool::new(false);
         let scan = |side: Side, volume: Volume| {
             let counter = |items: u64| {
+                self.note_look_moved(&job.id);
                 if report {
                     self.emit(EngineEvent::ScanProgress { id: job.id.clone(), side, items });
                 }
@@ -729,7 +758,9 @@ impl Engine {
                 Side::Source => &job.setup.source,
                 Side::Destination => &job.setup.destination,
             };
-            let scanned = Scanner::new(filter).cancellable(cancel).cancellable(&failed).counting(&counter).scan(root, volume);
+            let quiet = |folder: &std::path::Path| self.kept_quiet(folder);
+            let scanner = Scanner::new(filter).cancellable(cancel).cancellable(&failed).counting(&counter).keeping_off(&quiet);
+            let scanned = scanner.scan(root, volume);
             if scanned.is_err() {
                 failed.store(true, Ordering::Relaxed);
             }
@@ -900,6 +931,10 @@ impl Engine {
         let mut last_sent: Option<std::time::Instant> = None;
         for candidate in candidates {
             let Candidate { key, source: s, destination: d, alike } = candidate;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(self.stopped_comparing(job, markers, read));
+            }
+            self.note_look_moved(&job.id);
             let pair = Pair::new(s, d);
             let cached = self.change_known_runtime(&job.id, |rt| rt.reads.verdict(&key, &s, &d, markers)).flatten();
             let same = match cached {
@@ -918,19 +953,16 @@ impl Engine {
                     let a = job.setup.source.join(source.spelling(&key));
                     let b = job.setup.destination.join(destination.spelling(&key));
                     read_bytes += s.size;
-                    match Contents::same(&a, &b, Some(cancel)) {
+                    let mut left = Vec::new();
+                    let same = Contents::same(&a, &b, Some(cancel), &|| self.note_look_moved(&job.id), &mut left);
+                    self.let_go(left);
+                    match same {
                         Ok(same) => {
                             self.change_known_runtime(&job.id, |rt| rt.reads.note(&key, s, d, same, markers));
                             read = true;
                             Some(same)
                         }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                            // What was read before the stop holds only for the folders it was read in.
-                            if read {
-                                self.still_marked(job, markers);
-                            }
-                            return Err(Error::Cancelled);
-                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => return Err(self.stopped_comparing(job, markers, read)),
                         // Unreadable now: the plan decides as if they differ (never a removal),
                         // for this look only. The next one reads them again.
                         Err(_) => Some(false),
@@ -961,9 +993,13 @@ impl Engine {
                 self.emit(EngineEvent::CompareProgress { id: job.id.clone(), files: done_files, total_files, bytes: done_bytes, total_bytes });
             }
         }
+        // The last pair may have waited for a share while another job was given the drive.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(self.stopped_comparing(job, markers, read));
+        }
         // What the look read, and the pairs it keeps, hold only for the folders it read.
         let keep = found_now != found_before;
-        if (read || keep) && !self.still_marked(job, markers) {
+        if (read || keep) && !self.still_marked(job, markers, &|| !cancel.load(Ordering::Relaxed)) {
             return Ok(compared);
         }
         if keep {
@@ -972,17 +1008,31 @@ impl Engine {
         Ok(compared)
     }
 
+    /// Ends a comparison that was stopped, after it `read` some files. What it read holds only
+    /// for the folders it was read in: it's kept while both still carry `markers`. But while a
+    /// sync keeps a drive of them quiet (another job's, or the job's own, which a look it
+    /// stopped may outlive), the markers aren't read there (see `quiet.rs`), and what was
+    /// read is forgotten instead. That's asked again before each marker: the first may wait
+    /// for a share while a sync is given the other's drive.
+    fn stopped_comparing(&self, job: &Job, markers: &Markers, read: bool) -> Error {
+        if read {
+            self.still_marked(job, markers, &|| !self.kept_quiet(&job.setup.source) && !self.kept_quiet(&job.setup.destination));
+        }
+        Error::Cancelled
+    }
+
     /// Whether both folders of `job` still carry the `markers` read before the scans. If not,
     /// a folder was replaced while the look read it (another drive under the same name, a
     /// folder restored from a copy) and may have been read in part: what this session read
     /// while they carried those markers is forgotten, and the look keeps nothing it found.
-    fn still_marked(&self, job: &Job, markers: &Markers) -> bool {
-        let now = Markers::read(&job.setup.source, &job.setup.destination, &job.id);
-        if now.changed_since(markers).is_none() {
-            return true;
+    /// Each marker is read only while `go_on` says so, and when it says no, that counts as a
+    /// marker that changed.
+    fn still_marked(&self, job: &Job, markers: &Markers, go_on: &dyn Fn() -> bool) -> bool {
+        let still = [Side::Source, Side::Destination].into_iter().all(|side| go_on() && Marker::read(job.setup.root(side), &job.id) == *markers.side(side));
+        if !still {
+            self.change_known_runtime(&job.id, |rt| rt.reads.forget(markers));
         }
-        self.change_known_runtime(&job.id, |rt| rt.reads.forget(markers));
-        false
+        still
     }
 
     /// Keeps the pairs a look found identical for the background looks after it, even after a
@@ -1035,7 +1085,9 @@ impl Engine {
     /// the next sync carries the item: it would otherwise stay out for the whole session
     /// while the job looks in sync. Likewise, a conflict copy that couldn't be made only
     /// matters while both versions are there.
-    fn apply_refusals(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) {
+    ///
+    /// `go_on` is asked before each place it looks at (see `look_at`).
+    fn apply_refusals(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot, go_on: &dyn Fn() -> Result<()>) -> Result<()> {
         let refusals: Vec<_> = self.change_known_runtime(&job.id, |rt| rt.refused.values().cloned().collect()).unwrap_or_default();
         let mut lapsed = Vec::new();
         for (refused, drive) in refusals {
@@ -1044,7 +1096,10 @@ impl Engine {
                 Side::Destination => (&*source, &mut *destination),
             };
             let over = match refused.why {
-                Refusal::TakenName => Self::name_freed(&refused, here),
+                Refusal::TakenName => {
+                    go_on()?;
+                    Self::name_freed(&refused, here)
+                }
                 Refusal::ConflictCopy => !here.contains(&refused.key),
                 _ => false,
             };
@@ -1072,6 +1127,7 @@ impl Engine {
                 }
             });
         }
+        Ok(())
     }
 
     /// Whether the name a drive found another item under is free again: nothing is at the
@@ -1092,8 +1148,9 @@ impl Engine {
     /// one open may go on writing to it). The plan then leaves each alone on both sides, as
     /// it leaves alone a place a scan can't read, instead of trying it again on every sync,
     /// and removes nothing on the side it should be copied to (see `Snapshot::freeze_unread`).
-    /// A file that can be read now is tried again.
-    fn apply_unread(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot) -> Result<()> {
+    /// A file that can be read now is tried again. `go_on` is asked before each file (see
+    /// `look_at`), and the look moves on with each.
+    fn apply_unread(&self, job: &Job, source: &mut Snapshot, destination: &mut Snapshot, go_on: &(dyn Fn() -> Result<()> + Sync)) -> Result<()> {
         let unread: Vec<Unread> = self.change_known_runtime(&job.id, |rt| rt.unread.values().cloned().collect()).unwrap_or_default();
         if unread.is_empty() {
             return Ok(());
@@ -1108,6 +1165,8 @@ impl Engine {
                 if !snapshot.get(&item.key).is_some_and(Entry::is_file) {
                     continue;
                 }
+                go_on()?;
+                self.note_look_moved(&job.id);
                 let path = job.setup.root(item.side).join(snapshot.spelling(&item.key));
                 if let Some(reason) = Copier::read_refusal(&path, item.at) {
                     snapshot.freeze_unread(&item.key, reason);
@@ -1120,16 +1179,26 @@ impl Engine {
     /// Old trash to empty and leftovers of interrupted syncs to tidy, on the sides the job
     /// writes to. A background look only looks into the trash folders old enough to be
     /// emptied.
-    fn housekeeping(&self, setup: &JobSetup, source: &Snapshot, destination: &Snapshot, purpose: Purpose) -> Housekeeping {
+    fn housekeeping(&self, job: &Job, source: &Snapshot, destination: &Snapshot, purpose: Purpose, cancel: &AtomicBool) -> Housekeeping {
+        let setup = &job.setup;
         let trash_days = self.settings().trash_days;
         let now = Utc::now().timestamp_millis();
         let mut housekeeping = Housekeeping::default();
+        // The trash look moves on as the look does, and ends when it's stopped (what it found
+        // then counts for nothing: `look_at` ends too).
+        let go_on = || {
+            let going = !cancel.load(Ordering::Relaxed);
+            if going {
+                self.note_look_moved(&job.id);
+            }
+            going
+        };
         for &side in Survey::written_sides(setup) {
             let (root, snapshot) = match side {
                 Side::Source => (&setup.source, source),
                 Side::Destination => (&setup.destination, destination),
             };
-            housekeeping.trash.push((side, Trash::look(root, trash_days, purpose != Purpose::Check, snapshot.shifts_times())));
+            housekeeping.trash.push((side, Trash::look_going_on(root, trash_days, purpose != Purpose::Check, snapshot.shifts_times(), &go_on)));
             housekeeping.leftovers.push((side, Housekeeping::leftovers(snapshot, now, purpose)));
         }
         housekeeping
@@ -1335,6 +1404,70 @@ mod tests {
         fs::write(dst.join("REPORT~1.PDF"), "ours").unwrap();
         engine.survey(&job, &cancel, Purpose::Check).unwrap();
         assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()));
+    }
+
+    /// A look stopped while it heeds what a sync of this session couldn't do (names a drive
+    /// found another item under, files it couldn't read) ends before its next place or file:
+    /// a sync may have been given the drive meanwhile (see `quiet.rs`). Each file it reads
+    /// again moves the look on.
+    #[test]
+    fn a_look_stopped_while_it_heeds_what_a_sync_couldnt_do_ends_before_its_next_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (src, dst) = (tmp.path().join("src"), tmp.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        for name in ["a.txt", "b.txt"] {
+            fs::write(src.join(name), name).unwrap();
+        }
+        let engine = Engine::open(tmp.path().join("data"), std::sync::Arc::new(|_: EngineEvent| {})).unwrap();
+        let setup = JobSetup {
+            name: String::new(),
+            source: src,
+            destination: dst.clone(),
+            mode: crate::model::SyncMode::TwoWay,
+            conflict: ConflictRule::Ask,
+            trigger: crate::model::Trigger::Manual,
+            excludes: Vec::new(),
+            safe_delete: true,
+            full_automation: false,
+        };
+        let id = engine.add_job(setup).unwrap().job.id;
+        while engine.runtime().values().any(|rt| rt.checking.is_some()) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let job = engine.stored_job(&id).unwrap();
+        let first = engine.survey(&job, &AtomicBool::new(false), Purpose::Review).unwrap();
+        engine.change_runtime(&id, |rt| {
+            for name in ["a.txt", "b.txt"] {
+                let key = first.source.key_for(name);
+                let item = *first.source.get(&key).unwrap();
+                let refused = Refused { side: Side::Destination, key: key.clone(), why: Refusal::TakenName, item, at: dst.join(format!("{name} (theirs)")) };
+                rt.refused.insert((Side::Destination, key.clone()), (refused, None));
+                rt.unread.insert((Side::Source, key.clone()), Unread { side: Side::Source, key, reason: "in use".into(), at: 0 });
+            }
+        });
+        let (mut source, mut destination) = (first.source.clone(), first.destination.clone());
+        // Whether it went through, and how many times it asked whether to go on. Once
+        // stopped, it stays stopped.
+        let mut heed = |unread: bool, stop_at: usize| {
+            let asked = std::sync::atomic::AtomicUsize::new(0);
+            let go_on = || if asked.fetch_add(1, Ordering::Relaxed) + 1 >= stop_at { Err(Error::Cancelled) } else { Ok(()) };
+            let heeded = if unread {
+                engine.apply_unread(&job, &mut source, &mut destination, &go_on)
+            } else {
+                engine.apply_refusals(&job, &mut source, &mut destination, &go_on)
+            };
+            (heeded.is_ok(), asked.into_inner())
+        };
+        for stop_at in 1..=2 {
+            assert_eq!(heed(false, stop_at), (false, stop_at), "names refused, stopped at {stop_at}");
+            engine.change_runtime(&id, |rt| rt.look_moved = None);
+            assert_eq!(heed(true, stop_at), (false, stop_at), "files unread, stopped at {stop_at}");
+            assert_eq!(engine.runtime()[&id].look_moved.is_some(), stop_at == 2, "only the file read moved the look on");
+        }
+        assert_eq!(heed(true, 3), (true, 2));
+        assert_eq!(heed(false, 3), (true, 2));
+        assert!(engine.change_runtime(&id, |rt| rt.refused.is_empty()), "both names are free");
     }
 
     /// A look that ends after the job's folders or mode changed, or after the job was

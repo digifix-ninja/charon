@@ -13,11 +13,13 @@ use crate::scan::{
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 /// How often (in items) a scan reports how far it got.
 const COUNT_EVERY: u64 = 500;
+/// How often a scan that sees items more slowly reports how far it got, at the least.
+const COUNT_WITHIN: Duration = Duration::from_secs(5);
 
 /// Reads folders into snapshots. Symbolic links are recorded as links, never followed.
 pub struct Scanner<'a> {
@@ -25,13 +27,17 @@ pub struct Scanner<'a> {
     /// The scan stops early as soon as one of these becomes true.
     stops: Vec<&'a AtomicBool>,
     counter: Option<&'a (dyn Fn(u64) + Sync)>,
+    /// How often `counter` is called at the least, while items come (`COUNT_WITHIN`).
+    count_within: Duration,
+    /// Folders elsewhere whose drive the scan doesn't ask about (see `keeping_off`).
+    keep_off: Option<&'a (dyn Fn(&Path) -> bool + Sync)>,
     /// Where the Nextcloud and ownCloud clients keep their settings.
     clients: ClientSettings,
 }
 
 impl<'a> Scanner<'a> {
     pub fn new(filter: &'a ExcludeFilter) -> Self {
-        Self { filter, stops: Vec::new(), counter: None, clients: ClientSettings::here() }
+        Self { filter, stops: Vec::new(), counter: None, count_within: COUNT_WITHIN, keep_off: None, clients: ClientSettings::here() }
     }
 
     /// Stops the scan early when `cancel` becomes true (any of them, when called again).
@@ -40,16 +46,41 @@ impl<'a> Scanner<'a> {
         self
     }
 
-    /// Calls `counter` with the number of items seen so far, now and then.
+    /// Calls `counter` with the number of items seen so far, now and then: every
+    /// `COUNT_EVERY` items, and at least every few seconds while items come, then at the end
+    /// (unless it just said that many).
     pub fn counting(mut self, counter: &'a (dyn Fn(u64) + Sync)) -> Self {
         self.counter = Some(counter);
         self
+    }
+
+    /// Doesn't ask the drive of a folder elsewhere that `keep_off` names, when the scan would
+    /// only ask it where that folder really is (a folder a sync client syncs, see `cloud`):
+    /// it's taken as written. For a drive a sync keeps quiet (see `engine::quiet`).
+    pub fn keeping_off(mut self, keep_off: &'a (dyn Fn(&Path) -> bool + Sync)) -> Self {
+        self.keep_off = Some(keep_off);
+        self
+    }
+
+    /// `counting`, at least every `within` (a test's own pace).
+    #[cfg(test)]
+    fn counting_within(mut self, within: Duration) -> Self {
+        self.count_within = within;
+        self
+    }
+
+    /// Whether one of the stop flags is set.
+    fn stopped(&self) -> bool {
+        self.stops.iter().any(|stop| stop.load(Ordering::Relaxed))
     }
 
     /// Every item under `root`, on the drive `volume`. Fails if `root` isn't reachable or
     /// can't be read. Places inside it that can't be read are recorded as frozen, so
     /// nothing there is touched.
     pub fn scan(&self, root: &Path, volume: Volume) -> Result<Snapshot> {
+        if self.stopped() {
+            return Err(Error::Cancelled);
+        }
         Self::check_root(root)?;
         let root_id = RootId::of(root).map_err(|e| Error::Unreadable { path: root.to_path_buf(), reason: Self::io_reason(&e) })?;
         let mut snapshot = Snapshot::new();
@@ -59,19 +90,20 @@ impl<'a> Scanner<'a> {
         let drive_top = Self::top_of_drive(root);
         let mut walker = WalkDir::new(root).follow_links(false).min_depth(1).into_iter();
         let mut seen: u64 = 0;
-        let mut cloud = CloudFolders::of(root, &self.clients);
+        // When the counter was last called, and with how many.
+        let (mut counted, mut said) = (Instant::now(), 0);
+        let mut cloud = CloudFolders::of(root, &self.clients, &|folder| self.keep_off.is_some_and(|keep_off| keep_off(folder)));
         // Files a cloud service freed up, by their keys, with why each is left alone.
         let mut freed_up: Vec<(String, String)> = Vec::new();
 
         while let Some(item) = walker.next() {
-            if self.stops.iter().any(|stop| stop.load(Ordering::Relaxed)) {
+            if self.stopped() {
                 return Err(Error::Cancelled);
             }
             seen += 1;
-            if seen.is_multiple_of(COUNT_EVERY) {
-                if let Some(counter) = self.counter {
-                    counter(seen);
-                }
+            if let Some(counter) = self.counter.filter(|_| seen.is_multiple_of(COUNT_EVERY) || counted.elapsed() >= self.count_within) {
+                (counted, said) = (Instant::now(), seen);
+                counter(seen);
             }
             let item = match item {
                 Ok(item) => item,
@@ -250,7 +282,7 @@ impl<'a> Scanner<'a> {
             }
         }
         snapshot.facts_mut().clouds = cloud.places();
-        if let Some(counter) = self.counter {
+        if let Some(counter) = self.counter.filter(|_| seen == 0 || said != seen) {
             counter(seen);
         }
         Ok(snapshot)
@@ -685,7 +717,15 @@ mod tests {
         let counter = |n: u64| seen.lock().unwrap().push(n);
         let filter = ExcludeFilter::none();
         Scanner::new(&filter).counting(&counter).scan(tmp.path(), Volume::of(tmp.path())).unwrap();
-        assert_eq!(*seen.lock().unwrap(), vec![500, 1000, 1200]);
+        // (A slow machine may count in between too.)
+        let seen = seen.into_inner().unwrap();
+        assert!(seen.windows(2).all(|pair| pair[0] < pair[1]) && seen.contains(&500) && seen.contains(&1000), "{seen:?}");
+        assert_eq!(seen.last(), Some(&1200));
+        // Seeing items slowly, it counts by the time that went by too, and says the end once.
+        let seen = std::sync::Mutex::new(Vec::new());
+        let counter = |n: u64| seen.lock().unwrap().push(n);
+        Scanner::new(&filter).counting(&counter).counting_within(Duration::ZERO).scan(tmp.path(), Volume::of(tmp.path())).unwrap();
+        assert_eq!(seen.into_inner().unwrap(), (1..=1200).collect::<Vec<u64>>());
     }
 
     #[test]
@@ -787,6 +827,26 @@ mod tests {
         let why = s.frozen("Docs/Report.pdf").unwrap();
         assert!(why.contains("“Report.pdf.nextcloud”") && why.contains("remove it") && !why.contains("journal"), "{why}");
         assert_eq!(s.paths().collect::<Vec<_>>(), vec!["Docs"]);
+    }
+
+    /// While a sync keeps a drive quiet, the scan doesn't ask it where a folder a client
+    /// syncs really is (see `keeping_off`): the folder is taken as written, so one written
+    /// through a link isn't known for the scanned one.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_a_client_syncs_is_taken_as_written_where_its_drive_isnt_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (synced, link) = (tmp.path().join("Nextcloud"), tmp.path().join("Link"));
+        fs::create_dir_all(&synced).unwrap();
+        std::os::unix::fs::symlink(&synced, &link).unwrap();
+        let settings = tmp.path().join("settings/nextcloud.cfg");
+        write(&settings, &format!("[Accounts]\n0\\Folders\\1\\localPath={}/\n", link.display()));
+        let filter = ExcludeFilter::new(&[], false).unwrap();
+        let scan = |keep_off: &(dyn Fn(&Path) -> bool + Sync)| {
+            Scanner { clients: ClientSettings::at(vec![settings.clone()]), ..Scanner::new(&filter) }.keeping_off(keep_off).scan(&synced, Volume::of(&synced)).unwrap()
+        };
+        assert!(scan(&|_| false).placeholder_service("New.txt.nextcloud").is_some(), "the link is followed");
+        assert!(scan(&|folder| folder.starts_with(&link)).placeholder_service("New.txt.nextcloud").is_none());
     }
 
     /// A Nextcloud or ownCloud client's journal, and the files that go with it, are the

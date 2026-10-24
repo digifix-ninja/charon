@@ -58,9 +58,7 @@ impl RootId {
     /// folders themselves rather than their paths, so a link, a bind mount or another
     /// spelling of a name can't hide it. `false` where the system can't tell.
     pub fn is_within(inner: &Path, outer: &Path) -> bool {
-        let Ok(Some(outer)) = RootId::of(outer) else { return false };
-        let Ok(inner) = std::fs::canonicalize(inner) else { return false };
-        inner.ancestors().any(|folder| matches!(RootId::of(folder), Ok(Some(id)) if id.same_place(&outer)))
+        Place::of(inner).is_within(&Place::of(outer))
     }
 
     /// Whether `self` and `other` are the same folder at one moment, through whichever
@@ -115,6 +113,30 @@ impl RootId {
 
     pub fn device(&self) -> u64 {
         self.device
+    }
+}
+
+/// A folder as `RootId::is_within` judges it, found out at one moment: what it is, and the
+/// folders its real path goes through, itself first. Each folder is found out by itself, so a
+/// look can stop before it asks about the next (see `Engine::nested`).
+pub struct Place {
+    id: Option<RootId>,
+    through: Vec<RootId>,
+}
+
+impl Place {
+    pub fn of(path: &Path) -> Place {
+        let id = RootId::of(path).ok().flatten();
+        let through = std::fs::canonicalize(path)
+            .map(|real| real.ancestors().filter_map(|folder| RootId::of(folder).ok().flatten()).collect())
+            .unwrap_or_default();
+        Place { id, through }
+    }
+
+    /// Whether this folder is the folder `outer` or somewhere inside it (see
+    /// `RootId::is_within`).
+    pub fn is_within(&self, outer: &Place) -> bool {
+        outer.id.is_some_and(|outer| self.through.iter().any(|id| id.same_place(&outer)))
     }
 }
 

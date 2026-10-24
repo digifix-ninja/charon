@@ -170,8 +170,12 @@ impl Engine {
         self.inner.quiet.folders(paths, |asked| self.inner.reach.ask_each(asked, Folder::of))
     }
 
-    /// Asks `question` about `folder` with the time limit: `None` when it doesn't answer.
+    /// Asks `question` about `folder` with the time limit: `None` when it doesn't answer. One
+    /// on a drive a sync keeps quiet isn't asked, and is `None` too (see `quiet.rs`).
     pub(crate) fn ask_about<T: Send + 'static>(&self, folder: &Path, question: impl FnOnce(&Path) -> T + Send + 'static) -> Option<T> {
+        if self.kept_quiet(folder) {
+            return None;
+        }
         self.inner.reach.ask(folder, question)
     }
 }

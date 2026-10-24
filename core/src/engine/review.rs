@@ -490,7 +490,7 @@ impl Engine {
         survey.plan = plan;
         // Folders one inside the other can't settle anything either, whether their paths
         // show it or only Charon's markers do.
-        survey.refusal = self.overlaps(&job, &survey.source, &survey.destination).refusal;
+        survey.refusal = survey.nesting.clone();
         survey.holds.clear();
         survey.needs_tick = false;
         survey.agreed = 0;
@@ -550,6 +550,8 @@ impl Engine {
         rt.outdate_looks();
         let stop = Arc::new(AtomicBool::new(false));
         rt.preparing = Some(stop.clone());
+        // Its turn on the drive came, if it waited for one.
+        rt.drive_wait = None;
         Ok((job, stop, rt.epoch))
     }
 
@@ -1103,8 +1105,13 @@ mod tests {
     /// folder inside the job's folders that had no Charon folder when they were looked at, only
     /// a sync's claim meets it, once the job is marked as running (see `claim_folders`).
     fn another_charon_syncs(folder: &Path) -> PathBuf {
+        another_charon_syncs_on(folder, "studio-mac")
+    }
+
+    /// `another_charon_syncs`, from the computer named `host`.
+    fn another_charon_syncs_on(folder: &Path, host: &str) -> PathBuf {
         let mut note = BusyNote::new(&"elsewhere".to_string(), "Projects", "another-charon");
-        note.host = "studio-mac".into();
+        note.host = host.into();
         let file = folder.join(".charon").join(format!("another-charon{BUSY_EXTENSION}"));
         fs::create_dir_all(file.parent().unwrap()).unwrap();
         fs::write(&file, serde_json::to_vec(&note).unwrap()).unwrap();
@@ -1180,9 +1187,11 @@ mod tests {
 
         // The autopilot tries the list again. It hands the sync to a thread of its own, which
         // claims the folders there and meets the other sync still at work: the list waits on.
+        // (That sync now says it's on another computer, so the row shows what this try found.)
+        another_charon_syncs_on(&dst.join("Projects"), "laptop");
         assert!(as_the_autopilot(&engine, &id, |engine, id| engine.start_confirmed(id)), "handed to its sync's thread");
         wait_idle(&engine, &id);
-        until("the row", || engine.job(&id).unwrap().waiting_for.as_deref() == Some("Charon on studio-mac"));
+        until("the row", || engine.job(&id).unwrap().waiting_for.as_deref() == Some("Charon on laptop"));
         assert!(engine.job(&id).unwrap().confirmed, "the list still waits");
         assert!(!dst.join("Projects/plan.txt").exists() && engine.job(&id).unwrap().job.last_run.is_none(), "nothing ran");
 

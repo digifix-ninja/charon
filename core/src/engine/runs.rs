@@ -422,10 +422,25 @@ impl Engine {
             if rt.preparing.is_some() || rt.review.as_ref().is_some_and(|review| Utc::now() < review.expires_at) {
                 return Err(Error::Invalid("A list of this job's changes is open, waiting for your OK.".into()));
             }
+            // A wanted run that couldn't tell whether a folder on a drive kept quiet overlaps
+            // with this job's waits until no sync keeps it quiet, without looking again.
+            if let (Unreviewed::Wanted(_), Some(folder)) = (start, &rt.waits_on) {
+                match self.inner.quiet.kept_by_another(id, &[folder]) {
+                    Some(name) => return Err(Error::DriveBusy(name)),
+                    None => rt.waits_on = None,
+                }
+            }
             Ok(())
         })?;
         self.publish(id);
         self.spawn_crossing(job, cancel, crossing, |engine, job, cancel, crossing| match engine.survey(&job, &cancel, Purpose::Automatic) {
+            // Only another job's sync, which keeps a drive quiet, keeps this look from telling
+            // whether the job's folders overlap that job's: the run waits for it, rather than
+            // hold back for the person's OK (see `Overlaps::waits_on`).
+            Ok(Survey { waits_on: Some((folder, name)), .. }) => {
+                engine.change_runtime(&job.id, |rt| rt.waits_on = Some(folder));
+                engine.not_begun(&job, &crossing, &name);
+            }
             Ok(survey) if !survey.holds.is_empty() => engine.hold(&job, &survey),
             Ok(mut survey) => {
                 engine.hold_back_recent_removals(&job, &mut survey, Moment::now());
@@ -516,7 +531,7 @@ impl Engine {
         check(&job, runtime.entry(id.clone()).or_default())?;
         if let Some(name) = drive_used.or_else(|| self.drive_used_among(&state.jobs, &runtime, &job, asker)) {
             if asker == Asker::Charon {
-                Self::note_drive_wait(runtime.entry(id.clone()).or_default());
+                self.note_drive_wait(runtime.entry(id.clone()).or_default());
             }
             return Err(Error::DriveBusy(name));
         }
@@ -536,6 +551,7 @@ impl Engine {
         // This run does what a wanted run would have done.
         rt.wanted = None;
         rt.waiting_for = None;
+        rt.waits_on = None;
         // A look at folders that are about to change would be wrong at once.
         rt.outdate_looks();
         // From now on, changes in the folders are told apart from the run's own writes.
@@ -1493,6 +1509,8 @@ impl Survey {
             different: BTreeSet::new(),
             uncompared: BTreeSet::new(),
             refusal: None,
+            nesting: None,
+            waits_on: None,
             warnings: Vec::new(),
             holds: Vec::new(),
             needs_tick: false,

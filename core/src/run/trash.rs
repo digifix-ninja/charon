@@ -421,18 +421,31 @@ impl Trash {
     /// look checks the younger folders too (a background look leaves them for a review).
     /// `shifting` says the drive keeps local times (see `Volume::shifts_times`).
     pub fn look(root: &Path, days: u32, thorough: bool, shifting: bool) -> TrashLook {
+        Self::look_going_on(root, days, thorough, shifting, &|| true)
+    }
+
+    /// `look`, asking `go_on` before it looks at the trash, and before each folder and item
+    /// in it, which may note that the look moves on: when it says no, the look ends there,
+    /// and a folder it didn't look at in full is never taken for one to empty.
+    pub fn look_going_on(root: &Path, days: u32, thorough: bool, shifting: bool, go_on: &dyn Fn() -> bool) -> TrashLook {
         let mut look = TrashLook::default();
+        if !go_on() {
+            return look;
+        }
         let Ok(trash) = Self::real_trash(root, false) else { return look };
         let Ok(items) = fs::read_dir(&trash) else { return look };
         let cutoff = Self::cutoff(days);
         for item in items.flatten().filter(|item| item.file_type().is_ok_and(|t| t.is_dir())) {
+            if !go_on() {
+                break;
+            }
             let Some(name) = item.file_name().to_str().map(str::to_owned) else { continue };
             let Some(stamp) = Self::parse_stamp(&name) else { continue };
             let expired = cutoff.is_some_and(|cutoff| stamp < cutoff);
             if !expired && !thorough {
                 continue;
             }
-            let contents = Self::look_into(&item.path(), stamp, expired, shifting);
+            let contents = Self::look_into(&item.path(), stamp, expired, shifting, go_on);
             look.bytes += contents.bytes;
             look.revived.extend(contents.revived.iter().map(|path| format!("{TRASH_FOLDER}/{name}/{path}")));
             if expired && contents.revived.is_empty() && !contents.unreadable {
@@ -446,17 +459,22 @@ impl Trash {
 
     /// What the dated `folder` (made at `stamp`) holds. With a list and no `walk`, only the
     /// listed files are looked at; otherwise everything in it is.
-    fn look_into(folder: &Path, stamp: DateTime<Local>, walk: bool, shifting: bool) -> Contents {
+    /// `go_on` is asked before each item (see `look_going_on`).
+    fn look_into(folder: &Path, stamp: DateTime<Local>, walk: bool, shifting: bool, go_on: &dyn Fn() -> bool) -> Contents {
         let list = Self::read_list(folder);
         match &list {
-            Some(list) if !walk => Self::look_at_listed(folder, list, shifting),
-            _ => Self::walk(folder, stamp, list.as_ref(), shifting),
+            Some(list) if !walk => Self::look_at_listed(folder, list, shifting, go_on),
+            _ => Self::walk(folder, stamp, list.as_ref(), shifting, go_on),
         }
     }
 
-    fn look_at_listed(folder: &Path, list: &Listed, shifting: bool) -> Contents {
+    fn look_at_listed(folder: &Path, list: &Listed, shifting: bool, go_on: &dyn Fn() -> bool) -> Contents {
         let mut contents = Contents::default();
         for (path, listed) in list {
+            if !go_on() {
+                contents.unreadable = true;
+                break;
+            }
             match fs::symlink_metadata(folder.join(path)) {
                 Ok(meta) => {
                     contents.items += 1;
@@ -476,11 +494,15 @@ impl Trash {
         contents
     }
 
-    fn walk(folder: &Path, stamp: DateTime<Local>, list: Option<&Listed>, shifting: bool) -> Contents {
+    fn walk(folder: &Path, stamp: DateTime<Local>, list: Option<&Listed>, shifting: bool, go_on: &dyn Fn() -> bool) -> Contents {
         let mut contents = Contents::default();
         let made = stamp.timestamp_millis();
         let now = Local::now().timestamp_millis();
         for inner in walkdir::WalkDir::new(folder).min_depth(1).follow_links(false) {
+            if !go_on() {
+                contents.unreadable = true;
+                break;
+            }
             let inner = match inner {
                 Ok(inner) => inner,
                 Err(e) => {
@@ -598,7 +620,7 @@ impl Trash {
             if !fs::symlink_metadata(&folder).is_ok_and(|m| m.is_dir()) {
                 continue;
             }
-            let contents = Self::look_into(&folder, stamp, true, shifting);
+            let contents = Self::look_into(&folder, stamp, true, shifting, &|| true);
             if !contents.revived.is_empty() || contents.unreadable {
                 log::warn!("kept {}: something in it changed after it went into the trash, or can't be read", folder.display());
                 continue;
@@ -871,6 +893,42 @@ mod tests {
         assert!(!trash.join("2000-01-01_00-00-00").exists());
         assert!(trash.join("not-a-stamp").exists());
         assert!(trash.join(fresh).exists());
+    }
+
+    #[test]
+    fn a_look_told_to_stop_takes_no_folder_for_one_to_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = tmp.path().join(TRASH_FOLDER).join("2000-01-01_00-00-00");
+        fs::create_dir_all(&old).unwrap();
+        for n in 0..3 {
+            let file = old.join(format!("{n}.txt"));
+            fs::write(&file, "x").unwrap();
+            set_time(&file, Local.with_ymd_and_hms(1999, 12, 31, 0, 0, 0).unwrap());
+        }
+        // It asks before the trash, the folder and each item in it. Told to stop partway, it
+        // ends there.
+        let asked = std::cell::Cell::new(0);
+        let look = Trash::look_going_on(tmp.path(), 30, false, false, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() <= 3
+        });
+        assert!(look.expired.is_empty(), "{look:?}");
+        assert_eq!(asked.get(), 4);
+        let asked = std::cell::Cell::new(0);
+        let look = Trash::look_going_on(tmp.path(), 30, false, false, &|| {
+            asked.set(asked.get() + 1);
+            true
+        });
+        assert_eq!(look.expired.len(), 1);
+        assert_eq!(asked.get(), 5);
+        // Told to stop before it began, it doesn't even list the trash.
+        fs::remove_dir_all(&old).unwrap();
+        let asked = std::cell::Cell::new(0);
+        let look = Trash::look_going_on(tmp.path(), 30, false, false, &|| {
+            asked.set(asked.get() + 1);
+            false
+        });
+        assert_eq!((look.expired.len(), asked.get()), (0, 1));
     }
 
     /// An app that had the file open goes on saving into the trash: that folder is never

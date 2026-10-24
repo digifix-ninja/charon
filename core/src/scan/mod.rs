@@ -28,7 +28,7 @@ pub use filter::{
     CLAIM_MODIFIED_MS, MARKER_FOLDER, PARTIAL_EXTENSION, PARTIAL_PREFIX, PARTIAL_SUFFIX, TRASH_FOLDER,
 };
 pub use keys::Keys;
-pub use root::RootId;
+pub use root::{Place, RootId};
 pub use scanner::{Scanner, PRIVACY_REFUSAL};
 pub use volume::{never_download_on_this_thread, FsKind, Refusal, Volume};
 #[cfg(test)]

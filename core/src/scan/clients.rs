@@ -12,7 +12,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Each client's folder and settings file in the folder for settings, and its name as a
 /// Flatpak.
@@ -35,10 +35,11 @@ impl ClientSettings {
         Self(files)
     }
 
-    /// The folders the clients sync, by their real paths. `None` when Charon can't tell:
-    /// no client's settings can be read, or none lists a folder, or one client's settings
-    /// are there but can't be read.
-    pub fn synced_folders(&self) -> Option<Vec<PathBuf>> {
+    /// The folders the clients sync, by their real paths, but for those `keep_off` names, which
+    /// are as written: their drive isn't asked (see `Scanner::keeping_off`). `None` when
+    /// Charon can't tell: no client's settings can be read, or none lists a folder, or one
+    /// client's settings are there but can't be read.
+    pub fn synced_folders(&self, keep_off: &dyn Fn(&Path) -> bool) -> Option<Vec<PathBuf>> {
         let mut folders = Vec::new();
         for file in &self.0 {
             match fs::read(file) {
@@ -50,7 +51,8 @@ impl ClientSettings {
                 }
             }
         }
-        (!folders.is_empty()).then(|| folders.into_iter().map(|folder| fs::canonicalize(&folder).unwrap_or(folder)).collect())
+        let real = |folder: PathBuf| if keep_off(&folder) { folder } else { fs::canonicalize(&folder).unwrap_or(folder) };
+        (!folders.is_empty()).then(|| folders.into_iter().map(real).collect())
     }
 
     /// The settings files in the folders for settings on this computer.
@@ -257,8 +259,8 @@ mod tests {
         assert_eq!(ClientSettings::local_paths(b"[Accounts]\n0\\Folders\\1\\localPath=/a\\xd800\n"), None);
     }
 
-    /// The folders the clients sync are told by their real paths, from every client's
-    /// settings. Where no settings can be read, or none lists a folder, or one client's
+    /// The folders the clients sync are told by their real paths (but for those whose drive
+    /// isn't to be asked), from every client's settings. Where no settings can be read, or none lists a folder, or one client's
     /// can't be read, Charon can't tell.
     #[test]
     fn the_folders_the_clients_sync_are_read_from_each_ones_settings() {
@@ -279,10 +281,12 @@ mod tests {
 
         let both = ClientSettings::at(vec![nextcloud_cfg.clone(), missing.clone(), owncloud_cfg]);
         let not_there = PathBuf::from(written(&owncloud));
-        assert_eq!(both.synced_folders(), Some(vec![fs::canonicalize(&nextcloud).unwrap(), not_there]), "a folder that isn't there is kept as written");
-        assert_eq!(ClientSettings::at(vec![missing]).synced_folders(), None);
-        assert_eq!(ClientSettings::at(vec![settings("empty.cfg", "[General]\nversion=2\n")]).synced_folders(), None);
+        let as_written = PathBuf::from(format!("{}Docs/../", written(&nextcloud)));
+        assert_eq!(both.synced_folders(&|folder| folder.starts_with(&nextcloud)), Some(vec![as_written, not_there.clone()]), "a folder whose drive isn't asked is kept as written");
+        assert_eq!(both.synced_folders(&|_| false), Some(vec![fs::canonicalize(&nextcloud).unwrap(), not_there]), "a folder that isn't there is kept as written");
+        assert_eq!(ClientSettings::at(vec![missing]).synced_folders(&|_| false), None);
+        assert_eq!(ClientSettings::at(vec![settings("empty.cfg", "[General]\nversion=2\n")]).synced_folders(&|_| false), None);
         // A folder where a settings file should be can't be read as one.
-        assert_eq!(ClientSettings::at(vec![nextcloud_cfg, nextcloud]).synced_folders(), None);
+        assert_eq!(ClientSettings::at(vec![nextcloud_cfg, nextcloud]).synced_folders(&|_| false), None);
     }
 }

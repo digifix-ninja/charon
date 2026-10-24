@@ -1022,7 +1022,9 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   `Marker::origin` reads both markers again: two different ones are two folders. Two identical
   ones are one folder or a copy made since the last sync, which nothing in them tells apart, so
   Charon creates a file `.charon/<uuid>.probe` in one of the two Charon folders, looks for it in
-  the other, and removes it at once (`Marker::same_place`, which never makes a folder). A copy is
+  the other, and removes it at once (`Marker::same_place`, which never makes a folder). A look
+  stopped meanwhile leaves it, which does no harm (each probe has a name of its own, and
+  `Marker::forget` removes the probes left in a `.charon` folder with its last marker). A copy is
   harmless: the list only mentions it, in an info warning saying it can be deleted. When Charon
   can't tell (neither Charon folder takes a file, or a marker can't be read), the job's own
   marker of its other folder means a refusal; another job's marker means a clash warning that
@@ -1214,17 +1216,39 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   (`JobRuntime::drive_wait`, `note_drive_wait`), and waits for every job there that began to
   wait before it and still asks, whether to look or to sync, whatever the order of the jobs
   (otherwise two jobs listed first whose folders keep changing could take turns looking and
-  keep a third waiting all day). The autopilot asks again at every tick; a wait not asked for
-  30 seconds lapses (`WAITS_LAPSE`), one whose job's folder went away is forgotten at once
-  (`forget_drive_wait`), and so is a run's once it's no longer wanted (`forget_wanted`), so it
-  holds nobody up. The wait ends when the job gets the drive. A background look that's most
-  likely stuck holds nobody back: a folder of its job didn't answer in time (`stuck`,
-  `Reach::is_late`: a share that stopped answering), and the look waits for it there, not
-  reading the drive; a run that started meanwhile stops it. *Look for changes* waits for
-  another job's look too, but not for its turn. A run or a list the person asked for waits for
-  neither: it stops the background looks there instead (`stop_looks_sharing_a_drive`; they
-  count for nothing, and come again). Its folders there are still asked about meanwhile (where
-  they are, and whether they overlap another job's) until a sync keeps the drive quiet. `remove_job` is
+  keep a third waiting all day). The autopilot asks again at every tick, and counts its ticks
+  (`note_a_tick`): a wait it didn't ask for in this tick or the one before lapses
+  (`DriveWait::asks`; in ticks, not time, since one tick can take long while a share is slow
+  to answer), one whose job's folder went away is forgotten at once (`forget_drive_wait`), and
+  so is a run's once it's no longer wanted (`forget_wanted`), so it holds nobody up. The wait
+  ends when the job gets the drive (`begin_run`, `begin_look`, `look_in_background`). A
+  refused *Look for changes* starts a wait too, which the autopilot takes over as its own
+  look's; it waits for another job's look, but never for its turn. A job held back is told
+  the name of a job at work there before that of a job that only waits (the row says it waits
+  until that job is done). A background look that stopped moving on holds nobody back: one
+  that scanned no item, compared no pair or piece of a file, went through nothing in a trash
+  and tried no file it couldn't read before again for two minutes (`STALLED_FOR`,
+  `JobRuntime::look_moved`, `note_look_moved`; the scanner says how far it got at least every
+  5 seconds while items come) is most likely waiting for a folder that doesn't answer, not
+  reading the drive. Whoever goes ahead of it stops it, or it could read the drive again once
+  that folder answers: a stopped look ends before its next step on either folder, or on
+  another job's (`look_at` asks before each, and so do `Contents::same`, `compare_contents`,
+  `apply_refusals`, `apply_unread`, `overlaps` with `Marker::origin`, and
+  `Trash::look_going_on`; only a step under way when it was stopped finishes). A stopped
+  comparison keeps what it read while both folders still carry their markers, but reads no
+  marker while another job's sync keeps the drive quiet, and forgets it instead
+  (`stopped_comparing`, asked again before each marker; the job's own sync counts too, which a
+  look it stopped may outlive); the files it still has open there are
+  closed once that sync is done (`Engine::let_go`, as closing one is work for the driver too).
+  Whether another job's folder holds a copy of its marker is asked with a time limit
+  (`Engine::ask_about`), and that question goes on by itself when it's late, after the look
+  ends or is stopped, but stops before its next step once a sync keeps the drive of either
+  folder quiet. A sync doesn't wait for a stalled look to end (`let_looks_end`). A slow
+  look that keeps reading holds the drive however long it takes. A
+  run or a list the person asked for waits for no look and no turn: it stops the background
+  looks there instead (`stop_looks_sharing_a_drive`; they count for nothing, and come again).
+  Its folders there are still asked about meanwhile (where they are, and whether they overlap
+  another job's) until a sync keeps the drive quiet. `remove_job` is
   refused while another job's run or list uses the drive, naming it (*Remove “X” once it's
   done*), since removing takes Charon's marker out of its folders; it doesn't wait or retry, and
   a background look there doesn't hold it.
@@ -1236,7 +1260,15 @@ them (`engine/overlaps.rs`, `Engine::overlaps`).
   looks that began before Charon knew the drive (`let_looks_end`). Meanwhile `whereabouts_of`
   and `folders_of` answer for folders there from memory: the sync's own folders are where its
   look found them, another job's as last asked (`Presence::There(None)` or `None`, which counts
-  as maybe one place with anything, when never asked), and saving a job checks its folders
+  as maybe one place with anything, when never asked), what another job's look would ask
+  about a folder there (whether it holds a copy of a marker, `Engine::ask_about`) isn't asked:
+  the last time the disk told them apart, a copy or the folder itself, holds
+  (`QuietDrives::origin`), and a pair never told apart this session can't tell until that sync
+  is done (`Overlaps::waits_on`): the list says so, with the careful clash warning, and a run
+  nobody looks at isn't held back for the person's OK but waits for that sync without looking
+  again meanwhile (`JobRuntime::waits_on`, checked in `start_unreviewed`). A scan doesn't ask the drive where a folder a
+  sync client syncs there really is (`Scanner::keeping_off`): it's taken as the client wrote
+  it. Saving a job checks its folders
   against each other and against other jobs' as last found there, or waits when one was never
   found (`resolving_for_saving`, `folders_for_saving`, `JobSetup::validate_as`). The busy notes
   there are refreshed by the sync's thread between steps and between the pieces of a file
@@ -1559,7 +1591,8 @@ In each synced folder, Charon keeps:
   *Overlapping jobs and other Charons*), also in the `.charon` folders of other jobs' folders
   inside the folders it syncs. One that a sync cut short left behind is removed by the
   next sync that finds it, once it counts for nothing. For an instant, `.charon/<uuid>.probe`
-  tells whether two folders holding the same marker are one folder.
+  tells whether two folders holding the same marker are one folder; a look stopped at that
+  instant may leave it, and it goes with the folder's last marker.
 - `.charon-trash/<date>_<time>_<id>/`: what a run removed or replaced, with its `.charon` list.
 - `.charon-<16 hex digits>.part`: a copy on its way (of a file or a link), an original Charon
   renamed aside for a moment while replacing or removing it, or, for an instant, a probe that

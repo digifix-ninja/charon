@@ -156,9 +156,10 @@ enum Journal {
 
 impl CloudFolders {
     /// Where cloud services keep files in the folder `root`, as far as can be told before
-    /// looking inside it, with the sync clients' settings in `clients`.
-    pub fn of(root: &Path, clients: &ClientSettings) -> Self {
-        Self::with(root, Self::icloud_folders(), clients.synced_folders())
+    /// looking inside it, with the sync clients' settings in `clients`. The folders they list
+    /// that `keep_off` names are taken as written (see `ClientSettings::synced_folders`).
+    pub fn of(root: &Path, clients: &ClientSettings, keep_off: &dyn Fn(&Path) -> bool) -> Self {
+        Self::with(root, Self::icloud_folders(), clients.synced_folders(keep_off))
     }
 
     /// `of`, with iCloud Drive's folders on this computer, and the folders sync clients sync,
