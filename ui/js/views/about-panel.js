@@ -8,7 +8,7 @@ import { Sheet } from "./sheet.js";
 
 const { html, raw } = Dom;
 
-/** "https://github.com/steanart/charon" → "github.com/steanart/charon" */
+/** "https://github.com/digifix-ninja/charon" → "github.com/digifix-ninja/charon" */
 const bare = url => url.replace(/^[a-z]+:(\/\/)?/, "").replace(/\/$/, "");
 
 export class AboutPanel extends Sheet {
@@ -69,7 +69,7 @@ export class AboutPanel extends Sheet {
         <section class="links">
           <span class="eyebrow">Developer</span>
           ${raw(link("person", "Made by", a.developerWebsite, a.developer))}
-          ${raw(link("globe", "Website", a.developerWebsite))}
+          ${raw(link("globe", "Website", a.developerWebsite, a.developerBrand))}
           ${raw(link("mail", "E-mail", `mailto:${a.developerEmail}`, a.developerEmail))}
         </section>
 

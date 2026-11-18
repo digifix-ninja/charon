@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.90"
 description = "Charon ferries your files between folders: mirror, backup or two-way sync"
 license = "MIT"
-authors = ["stean.ART"]
+authors = ["DigiFix S.à r.l.-S."]
 homepage = "https://charonsync.app"
 default-run = "charon"
 

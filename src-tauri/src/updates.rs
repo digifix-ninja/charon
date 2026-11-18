@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_notification::NotificationExt;
 
 /// GitHub's answer for the newest published release (drafts and pre-releases never show here).
-const LATEST_RELEASE: &str = "https://api.github.com/repos/steanart/charon/releases/latest";
+const LATEST_RELEASE: &str = "https://api.github.com/repos/digifix-ninja/charon/releases/latest";
 /// Gives the app a moment to settle before the first check.
 const FIRST_CHECK_AFTER: Duration = Duration::from_secs(10);
 const CHECK_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
@@ -187,7 +187,7 @@ mod tests {
     fn release(tag: &str) -> Release {
         Release {
             tag_name: tag.into(),
-            html_url: format!("https://github.com/steanart/charon/releases/tag/{tag}"),
+            html_url: format!("https://github.com/digifix-ninja/charon/releases/tag/{tag}"),
             assets: vec![],
         }
     }

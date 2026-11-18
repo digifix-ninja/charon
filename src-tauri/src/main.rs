@@ -155,7 +155,7 @@ fn main() {
         .run(on_run_event);
 }
 
-/// Logs go to a file in the system's log folder (macOS: ~/Library/Logs/dev.stean.charon/),
+/// Logs go to a file in the system's log folder (macOS: ~/Library/Logs/ninja.digifix.charon/),
 /// kept across restarts, and to the terminal in development builds.
 fn logger() -> tauri::plugin::TauriPlugin<tauri::Wry> {
     let mut targets = vec![Target::new(TargetKind::LogDir { file_name: Some(DataFolder::log_name().into()) })];
