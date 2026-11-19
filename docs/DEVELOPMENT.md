@@ -32,7 +32,7 @@ cargo test -p charon           # the app's own unit tests
 cargo tauri build              # installers for the system you're on
 ```
 
-A development build keeps its own data folder (`dev.stean.charon-dev`, next to the installed
+A development build keeps its own data folder (`ninja.digifix.charon-dev`, next to the installed
 app's), so trying something out never touches the real jobs or their two-way memory. It never
 changes launch at login, and it can run next to the installed app: only an installed build
 brings the running Charon's window up when it's launched a second time. Its log file is
@@ -162,7 +162,7 @@ Silicon and Intel), Windows and Linux. Each build first runs the engine's tests
 makes the installers and gives them fixed names without the version:
 `Charon-macOS-Apple-Silicon.dmg`, `Charon-macOS-Intel.dmg`, `Charon-Windows-Setup.exe`,
 `Charon-Windows.msi`, `Charon-Linux.AppImage`, `Charon-Linux.deb` and `Charon-Linux.rpm`. So
-`https://github.com/steanart/charon/releases/latest/download/<name>` always gives the newest
+`https://github.com/digifix-ninja/charon/releases/latest/download/<name>` always gives the newest
 published version. Every run keeps the installers as downloadable artifacts of the run.
 
 The workflow starts in two ways:
@@ -1491,7 +1491,7 @@ src-tauri/                    the desktop app (crate charon)
     data_folder.rs            DataFolder: the data folder, a dev build's own, the move from 0.1.0
   capabilities/default.json   what the window may do
   icons/                      app and tray icons
-  tauri.conf.json             app configuration (identifier dev.stean.charon)
+  tauri.conf.json             app configuration (identifier ninja.digifix.charon)
 ui/                           the interface (plain HTML, CSS and JavaScript modules)
   index.html
   css/                        base (tokens), controls, layout, overlays, review, rows
@@ -1538,11 +1538,11 @@ Code style: small objects with one job each, and a short comment on every functi
 
 In the app's data folder:
 
-- macOS: `~/Library/Application Support/dev.stean.charon/`
-- Windows: `%APPDATA%\dev.stean.charon\`
-- Linux: `~/.local/share/dev.stean.charon/`
+- macOS: `~/Library/Application Support/ninja.digifix.charon/`
+- Windows: `%APPDATA%\ninja.digifix.charon\`
+- Linux: `~/.local/share/ninja.digifix.charon/`
 
-A development build uses `dev.stean.charon-dev` next to it instead.
+A development build uses `ninja.digifix.charon-dev` next to it instead.
 
 | File | What's in it |
 |---|---|
@@ -1564,15 +1564,19 @@ the files found identical are saved under a temporary name next to them
 The job logs are added to as they go.
 
 The app's own log is `charon.log` (`charon-dev.log` for a development build), started afresh at
-5 MB with a few older ones kept: in `~/Library/Logs/dev.stean.charon/` on macOS,
-`%LOCALAPPDATA%\dev.stean.charon\logs\` on Windows, and `~/.local/share/dev.stean.charon/logs/` on
+5 MB with a few older ones kept: in `~/Library/Logs/ninja.digifix.charon/` on macOS,
+`%LOCALAPPDATA%\ninja.digifix.charon\logs\` on Windows, and `~/.local/share/ninja.digifix.charon/logs/` on
 Linux (next to the job logs).
 
-**From 0.1.0.** Charon 0.1.0 used the identifier `ninja.digifix.charon`. The first time an
-installed 0.1.1 or later starts, it moves that folder's items into the new data folder when the
-new one holds no jobs yet and the old one does. Nothing already there is replaced, and the
-files with the jobs move last, so a move cut off halfway is finished at the next start. The old
-folder is removed once it's empty.
+**From 0.1.1 to 0.3.** Charon 0.1.0 used the identifier `ninja.digifix.charon`, versions 0.1.1
+to 0.3 used `dev.stean.charon`, and since the move back to DigiFix it is `ninja.digifix.charon`
+again. The first time an installed build with the DigiFix identifier starts, it moves the items
+of the `dev.stean.charon` data folder into the current one when the current one holds no jobs
+yet and the old one does. Nothing already there is replaced, and the files with the jobs move
+last, so a move cut off halfway is finished at the next start. The old folder is removed once
+it's empty. Someone who never left 0.1.0 already has their data in the right folder, so nothing
+moves for them. The app's own logs and a development build's data folder
+(`dev.stean.charon-dev`) are not moved: they stay where they were and can be deleted.
 
 **From 0.2.** Charon 0.2 kept its settings and jobs in `charon.json`. When `charon-state.json`
 doesn't exist yet, 0.3 takes them over: every job comes over with full automation off and its
@@ -1624,7 +1628,7 @@ too. The licence text is in `LICENSE`.
 
 ## How the update check works
 
-`src-tauri/src/updates.rs` reads `https://api.github.com/repos/steanart/charon/releases/latest`
+`src-tauri/src/updates.rs` reads `https://api.github.com/repos/digifix-ninja/charon/releases/latest`
 ten seconds after start-up and then once a day while Charon runs, each time only if *Look for
 new versions* is on in Settings. *Check for updates* in the About panel and *Check for Updates…*
 in the tray menu ask at any time. GitHub's latest release never includes drafts or pre-releases,

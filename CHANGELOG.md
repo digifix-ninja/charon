@@ -2,6 +2,14 @@
 
 All notable changes to Charon are listed here.
 
+## Unreleased
+
+### Charon is a DigiFix app
+
+- **Made by DigiFix:** the About panel, the installers, the licence and the copyright now say **DigiFix S.à r.l.-S.** The developer's website is [DigiFix.Ninja](https://digifix.ninja), and its e-mail is [dojo@digifix.ninja](mailto:dojo@digifix.ninja).
+- **A new GitHub home:** the source, the releases and the update check live at [github.com/digifix-ninja/charon](https://github.com/digifix-ninja/charon). GitHub forwards the old address, so earlier versions still find new releases.
+- **The app identifier is `ninja.digifix.charon` again**, as in 0.1.0. The first time this version starts, it moves your jobs, settings and two-way memory over from the `dev.stean.charon` folder that 0.1.1 to 0.3 used. Nothing already in the new folder is replaced. On a Mac, Charon is now signed by DigiFix too, so macOS asks once more whether it may send notifications, and Full Disk Access has to be given to Charon again in *Privacy & Security* if you had given it before.
+
 ## 0.3.0
 
 In Charon 0.3.0 a sync no longer changes your files by itself: Charon shows you the list of changes first, and carries them out only after you confirm it. If you want a job to sync on its own, you can turn on **Full automation** for it, behind two clear warnings that data can be lost. This release also closes the ways Charon 0.2 could lose data that a safety review found, and adds tests for them that run against real folders.

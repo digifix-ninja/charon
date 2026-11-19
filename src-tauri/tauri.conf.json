@@ -2,7 +2,7 @@
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Charon",
   "version": "0.3.0",
-  "identifier": "dev.stean.charon",
+  "identifier": "ninja.digifix.charon",
   "build": {
     "frontendDist": "../ui"
   },
@@ -30,8 +30,8 @@
     "active": true,
     "targets": "all",
     "category": "Utility",
-    "publisher": "stean.ART",
-    "copyright": "© 2026 stean.ART · MIT licence",
+    "publisher": "DigiFix S.à r.l.-S.",
+    "copyright": "© 2026 DigiFix S.à r.l.-S. · MIT licence",
     "shortDescription": "Ferries your files between folders: mirror, backup or two-way sync",
     "icon": [
       "icons/32x32.png",

@@ -6,11 +6,13 @@ use tauri::AppHandle;
 /// The app's own website.
 pub const APP_WEBSITE: &str = "https://charonsync.app";
 /// Public source code and releases on GitHub.
-pub const SOURCE_CODE: &str = "https://github.com/steanart/charon";
-/// Who makes Charon, their website and how to write to them.
-pub const DEVELOPER: &str = "stean.DEV";
-pub const DEVELOPER_WEBSITE: &str = "https://stean.dev";
-pub const DEVELOPER_EMAIL: &str = "a.s@stean.dev";
+pub const SOURCE_CODE: &str = "https://github.com/digifix-ninja/charon";
+/// Who makes Charon (the legal name, used in the copyright line), the name its website goes
+/// by, the website itself and how to write to them.
+pub const DEVELOPER: &str = "DigiFix S.à r.l.-S.";
+pub const DEVELOPER_BRAND: &str = "DigiFix.Ninja";
+pub const DEVELOPER_WEBSITE: &str = "https://digifix.ninja";
+pub const DEVELOPER_EMAIL: &str = "dojo@digifix.ninja";
 pub const LICENCE: &str = "MIT";
 pub const COPYRIGHT_YEAR: &str = "2026";
 
@@ -23,6 +25,7 @@ pub struct About {
     app_website: &'static str,
     source_code: &'static str,
     developer: &'static str,
+    developer_brand: &'static str,
     developer_website: &'static str,
     developer_email: &'static str,
     licence: &'static str,
@@ -39,6 +42,7 @@ impl About {
             app_website: APP_WEBSITE,
             source_code: SOURCE_CODE,
             developer: DEVELOPER,
+            developer_brand: DEVELOPER_BRAND,
             developer_website: DEVELOPER_WEBSITE,
             developer_email: DEVELOPER_EMAIL,
             licence: LICENCE,

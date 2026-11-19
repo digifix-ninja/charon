@@ -4,7 +4,7 @@ version = "0.3.0"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"
-authors = ["stean.ART"]
+authors = ["DigiFix S.à r.l.-S."]
 description = "Sync engine for Charon: scans two folders, plans the crossing and carries files over safely"
 
 [dependencies]

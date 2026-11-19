@@ -3,9 +3,10 @@
 use std::path::{Path, PathBuf};
 use tauri::{AppHandle, Manager};
 
-/// The app's identifier before 0.1.1, when Charon was published by DigiFix.
+/// The app's identifier from 0.1.1 to 0.3, when Charon was published as stean.ART. (0.1.0
+/// already used today's DigiFix identifier, so its data is in the right folder.)
 #[cfg_attr(debug_assertions, allow(dead_code))]
-const OLD_IDENTIFIER: &str = "ninja.digifix.charon";
+const OLD_IDENTIFIER: &str = "dev.stean.charon";
 
 /// The files that hold Charon's jobs and settings (since 0.3, and before it). A data folder
 /// holding one of them is Charon's; one without them holds no jobs yet.
@@ -15,14 +16,14 @@ const STATE_FILES: [&str; 2] = ["charon-state.json", "charon.json"];
 /// A development build (`cargo tauri dev`) keeps its own data next to the installed app's,
 /// so trying something out never touches the real jobs and their two-way memory.
 #[cfg(debug_assertions)]
-const DEV_FOLDER: &str = "dev.stean.charon-dev";
+const DEV_FOLDER: &str = "ninja.digifix.charon-dev";
 
 pub struct DataFolder;
 
 impl DataFolder {
-    /// The data folder (macOS: ~/Library/Application Support/dev.stean.charon/).
-    /// The first time 0.1.1 or later starts, it moves the data of 0.1.0 into place, so jobs
-    /// and settings carry over to the new identifier.
+    /// The data folder (macOS: ~/Library/Application Support/ninja.digifix.charon/).
+    /// The first time a build with the DigiFix identifier starts, it moves the data of 0.1.1
+    /// to 0.3 into place, so jobs and settings carry over to the identifier.
     #[cfg(not(debug_assertions))]
     pub fn open(app: &AppHandle) -> tauri::Result<PathBuf> {
         let folder = app.path().app_data_dir()?;
@@ -33,14 +34,14 @@ impl DataFolder {
     }
 
     /// A development build's own data folder (macOS:
-    /// ~/Library/Application Support/dev.stean.charon-dev/). Nothing is moved into it.
+    /// ~/Library/Application Support/ninja.digifix.charon-dev/). Nothing is moved into it.
     #[cfg(debug_assertions)]
     pub fn open(app: &AppHandle) -> tauri::Result<PathBuf> {
         let installed = app.path().app_data_dir()?;
         Ok(installed.parent().map(|parent| parent.join(DEV_FOLDER)).unwrap_or(installed))
     }
 
-    /// Moves the data of Charon 0.1.0 from `old` into `folder`. The new folder may exist
+    /// Moves the data of Charon 0.1.1 to 0.3 from `old` into `folder`. The new folder may exist
     /// already: on Linux the log and the window's own storage live inside it and are made
     /// before Charon gets here. So what counts is whether it holds jobs yet; when it does,
     /// nothing is moved.
@@ -62,8 +63,8 @@ impl DataFolder {
         Self::move_items(old, folder, &|name| !STATE_FILES.contains(&name));
         Self::move_items(old, folder, &|name| STATE_FILES.contains(&name));
         match std::fs::remove_dir(old) {
-            Ok(()) => log::info!("moved the data of Charon 0.1.0 from {}", old.display()),
-            Err(_) => log::warn!("moved the jobs of Charon 0.1.0; what couldn't move is still in {}", old.display()),
+            Ok(()) => log::info!("moved the data of Charon 0.1.1 to 0.3 from {}", old.display()),
+            Err(_) => log::warn!("moved the jobs of Charon 0.1.1 to 0.3; what couldn't move is still in {}", old.display()),
         }
     }
 
@@ -124,9 +125,9 @@ mod tests {
     }
 
     #[test]
-    fn the_jobs_of_0_1_0_move_into_a_folder_the_log_made_first() {
+    fn the_jobs_of_0_3_move_into_a_folder_the_log_made_first() {
         let tmp = tempfile::tempdir().unwrap();
-        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("dev.stean.charon"));
+        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("ninja.digifix.charon"));
         write(&old.join("charon.json"), "jobs");
         write(&old.join("baselines").join("job.json"), "memory");
         write(&old.join("logs").join("job.log"), "old journal");
@@ -145,7 +146,7 @@ mod tests {
     #[test]
     fn nothing_moves_into_a_folder_that_holds_jobs_already() {
         let tmp = tempfile::tempdir().unwrap();
-        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("dev.stean.charon"));
+        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("ninja.digifix.charon"));
         write(&old.join("charon.json"), "old jobs");
         write(&old.join("baselines").join("job.json"), "old memory");
         write(&new.join("charon-state.json"), "new jobs");
@@ -158,7 +159,7 @@ mod tests {
     #[test]
     fn the_jobs_move_after_their_memory() {
         let tmp = tempfile::tempdir().unwrap();
-        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("dev.stean.charon"));
+        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("ninja.digifix.charon"));
         write(&old.join("charon.json"), "jobs");
         write(&old.join("baselines").join("job.json"), "memory");
         // The memory can't move (something of that name is in the way): the jobs wait with it.
@@ -168,7 +169,7 @@ mod tests {
 
         // Interrupted before the jobs moved: the next start moves the rest.
         let tmp = tempfile::tempdir().unwrap();
-        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("dev.stean.charon"));
+        let (old, new) = (tmp.path().join(OLD_IDENTIFIER), tmp.path().join("ninja.digifix.charon"));
         write(&old.join("charon.json"), "jobs");
         write(&new.join("baselines").join("job.json"), "memory moved before the stop");
         DataFolder::carry_over(&old, &new);
