@@ -167,19 +167,19 @@ published version. Every run keeps the installers as downloadable artifacts of t
 
 The workflow starts in two ways:
 
-- **Push a version tag** (`git tag v0.3.0 && git push origin v0.3.0`). Once every build has
+- **Push a version tag** (`git tag v1.0.0 && git push origin v1.0.0`). Once every build has
   succeeded, a release job puts all the installers into a **draft** release for that tag.
   Nothing is public yet.
 - **Start it by hand** under *Actions → Build Charon → Run workflow*. With the version left
   empty it's a test build: the installers are only kept as artifacts of the run. With a version
-  (`v0.3.0`), the same draft release is made for the built commit, and GitHub creates the tag
+  (`v1.0.0`), the same draft release is made for the built commit, and GitHub creates the tag
   when the release is published (handy when git can't push tags).
 
 If a release with that tag exists already, the release job leaves it as it is. (Publishing a
 draft creates its tag, which can start the workflow again.)
 
 `.github/workflows/publish.yml` (*Publish Charon*) makes a draft public. Start it by hand under
-*Actions → Publish Charon → Run workflow* with the version of the draft (`v0.3.0`) and, if you
+*Actions → Publish Charon → Run workflow* with the version of the draft (`v1.0.0`) and, if you
 like, release notes in Markdown (left empty, the draft's notes stay). It sets the notes, publishes
 the release and marks it as the latest. From then on `releases/latest` points to it, and the
 copies of Charon already out there see it as an update. A draft can also be published by hand
@@ -1632,7 +1632,7 @@ too. The licence text is in `LICENSE`.
 ten seconds after start-up and then once a day while Charon runs, each time only if *Look for
 new versions* is on in Settings. *Check for updates* in the About panel and *Check for Updates…*
 in the tray menu ask at any time. GitHub's latest release never includes drafts or pre-releases,
-so a new version reaches people only once its release is **published**. The tag (`v0.3.0`) is
+so a new version reaches people only once its release is **published**. The tag (`v1.0.0`) is
 compared with the app's own version; a tag that isn't a version never counts as newer.
 
 When a newer version is out, the title bar shows an *Update* button, the tray item becomes

@@ -6,7 +6,7 @@ body:
     id: version
     attributes:
       label: Charon version and system
-      placeholder: "0.1.0 on macOS 15 (Apple Silicon)"
+      placeholder: "1.0.0 on macOS 15 (Apple Silicon)"
     validations:
       required: true
   - type: dropdown

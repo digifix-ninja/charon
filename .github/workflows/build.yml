@@ -1,10 +1,10 @@
 # Builds Charon for macOS (Apple Silicon and Intel), Windows and Linux on GitHub's servers.
 #
 # Two ways it runs:
-#   * Version tag pushed (git tag v0.1.0 && git push origin v0.1.0): installers are attached
+#   * Version tag pushed (git tag v1.0.0 && git push origin v1.0.0): installers are attached
 #     to a *draft* release, so nothing is public until you press "Publish" on GitHub.
 #   * Started by hand (Actions → Build Charon → Run workflow): installers are kept as downloadable
-#     "artifacts" of the run. If a version is filled in (e.g. v0.1.0), the same draft release is
+#     "artifacts" of the run. If a version is filled in (e.g. v1.0.0), the same draft release is
 #     made and GitHub creates that tag on the built commit (handy when git can't push tags).
 #
 # The installers get fixed names without the version (Charon-macOS-Apple-Silicon.dmg, …), so
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Make a draft release with this tag (e.g. v0.1.0). Leave empty for a test build."
+        description: "Make a draft release with this tag (e.g. v1.0.0). Leave empty for a test build."
         required: false
         default: ""
 

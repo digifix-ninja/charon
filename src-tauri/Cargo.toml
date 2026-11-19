@@ -1,6 +1,6 @@
 [package]
 name = "charon"
-version = "0.3.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.90"
 description = "Charon ferries your files between folders: mirror, backup or two-way sync"
