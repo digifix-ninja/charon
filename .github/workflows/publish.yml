@@ -1,6 +1,6 @@
 # Publishes a draft release made by "Build Charon": sets its notes and makes it public.
 #
-# Started by hand (Actions → Publish Charon → Run workflow) with the version (e.g. v0.2.0) and,
+# Started by hand (Actions → Publish Charon → Run workflow) with the version (e.g. v1.0.0) and,
 # if wanted, the release notes in Markdown. Publishing creates the tag, so from then on
 # https://github.com/digifix-ninja/charon/releases/latest points to this version and the apps
 # already out there see it as an update.
@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "The draft release to publish (e.g. v0.2.0)"
+        description: "The draft release to publish (e.g. v1.0.0)"
         required: true
       notes:
         description: "Release notes in Markdown (leave empty to keep the draft's notes)"

@@ -2,7 +2,9 @@
 
 All notable changes to Charon are listed here.
 
-## Unreleased
+## 1.0.0
+
+Charon 1.0.0 is the first official release by DigiFix S.à r.l.-S. It carries everything from 0.3.0 (nothing changes without your OK, full automation behind clear warnings, and the safety fixes), now under DigiFix's name, with a new app identifier and a new GitHub home.
 
 ### Charon is a DigiFix app
 

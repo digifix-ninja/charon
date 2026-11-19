@@ -798,19 +798,19 @@ export class DemoBackend {
       case "get_state":
         this.lookAtEverything();
         return structuredClone({ jobs: this.jobs, settings: this.settings, overview: this.overview(), defaultExcludes: DEFAULT_EXCLUDES });
-      case "about": return { name: "Charon", version: "0.3.0", appWebsite: "https://charonsync.app", sourceCode: "https://github.com/digifix-ninja/charon", developer: "DigiFix S.à r.l.-S.", developerBrand: "DigiFix.Ninja", developerWebsite: "https://digifix.ninja", developerEmail: "dojo@digifix.ninja", licence: "MIT", copyrightYear: "2026" };
+      case "about": return { name: "Charon", version: "1.0.0", appWebsite: "https://charonsync.app", sourceCode: "https://github.com/digifix-ninja/charon", developer: "DigiFix S.à r.l.-S.", developerBrand: "DigiFix.Ninja", developerWebsite: "https://digifix.ninja", developerEmail: "dojo@digifix.ninja", licence: "MIT", copyrightYear: "2026" };
       case "update_info": return null;
       case "check_updates": {
         // Pretends GitHub has a newer version, to show how it looks.
         await wait(900);
-        const info = { current: "0.3.0", latest: "0.3.1", available: true, page: "https://github.com/digifix-ninja/charon/releases/tag/v0.3.1", download: null };
+        const info = { current: "1.0.0", latest: "1.0.1", available: true, page: "https://github.com/digifix-ninja/charon/releases/tag/v1.0.1", download: null };
         this.emit("update", info);
         return info;
       }
       case "upgrade_notice": {
         if (this.noticeSeen || readFlag("charon-demo-notice-seen")) return null;
         return {
-          version: "0.3.0",
+          version: "1.0.0",
           jobs: ["projects", "documents", "archive"].map(id => {
             const j = this.find(id);
             return { id, name: j.name, trigger: j.trigger };
